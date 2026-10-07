@@ -7,14 +7,31 @@
 #   every process in the group, wait TimeoutStopSec, then cgroup.kill (SIGKILL to all).
 #   This proves the cgroup mechanics, NOT systemd's own behavior; results from this mode
 #   are labelled "cgroup-emulated" in the evidence.
+# RUNNER=template: the proposed design from the findings: instances of the pre-installed
+#   template spikes/s07-polkit/upwell-eng@.service (install it first). The engine binary
+#   is fixed by the template; its arguments go to /var/lib/upwell/runs/<instance>/engine.env.
 RUNNER="${RUNNER:-$( [[ "$(ps -p 1 -o comm=)" == systemd ]] && echo systemd || echo cgroup )}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
 CGROOT="${CGROOT:-$( [[ -d /sys/fs/cgroup/unified ]] && echo /sys/fs/cgroup/unified || echo /sys/fs/cgroup )}/upwell-spike"
 UNIT_STATE="${SPIKE_ROOT}/units"; mkdir -p "$UNIT_STATE"
 
+svc() { # unit -> systemd service name
+  if [[ $RUNNER == template ]]; then echo "upwell-eng@${1#upwell-eng-}.service"; else echo "$1.service"; fi
+}
+
 unit_start() { # unit logfile cmd...
   local unit=$1 logf=$2; shift 2
-  if [[ $RUNNER == systemd ]]; then
+  if [[ $RUNNER == template ]]; then
+    local inst=${unit#upwell-eng-} dir=/var/lib/upwell/runs/${unit#upwell-eng-}
+    install -d -o upwell -g upwell "$dir"
+    install -m 0600 -o upwell -g upwell "$PGPASSFILE" "$dir/pgpass"
+    { printf 'UPWELL_ENGINE_ARGS=%s\n' "${*:2}"; printf 'PGPASSFILE=%s\n' "$dir/pgpass"; } >"$dir/engine.env"
+    chown upwell:upwell "$dir/engine.env"; chmod 0600 "$dir/engine.env"
+    # Work directories passed in the arguments must be writable by the upwell user.
+    chown -R upwell:upwell "$SPIKE_ROOT/runs" 2>/dev/null || true
+    touch "$dir/engine.log"; chown upwell:upwell "$dir/engine.log"; ln -sf "$dir/engine.log" "$logf"
+    systemctl start "upwell-eng@$inst.service"
+  elif [[ $RUNNER == systemd ]]; then
     systemd-run --quiet --unit="$unit" --collect \
       --property=KillMode=control-group --property=TimeoutStopSec="$STOP_TIMEOUT" \
       --property=StandardOutput=append:"$logf" --property=StandardError=append:"$logf" \
@@ -32,8 +49,8 @@ unit_start() { # unit logfile cmd...
 
 unit_pids() { # unit -> pids in the unit's cgroup
   local unit=$1
-  if [[ $RUNNER == systemd ]]; then
-    local cg; cg=$(systemctl show -P ControlGroup "$unit.service" 2>/dev/null)
+  if [[ $RUNNER != cgroup ]]; then
+    local cg; cg=$(systemctl show -P ControlGroup "$(svc "$unit")" 2>/dev/null)
     [[ -n "$cg" && -f "/sys/fs/cgroup$cg/cgroup.procs" ]] && cat "/sys/fs/cgroup$cg/cgroup.procs"
   else
     [[ -f "$CGROOT/$unit/cgroup.procs" ]] && cat "$CGROOT/$unit/cgroup.procs"
@@ -47,11 +64,11 @@ unit_live_count() { local n=0 p; for p in $(unit_pids "$1"); do
 unit_empty() { [[ "$(unit_live_count "$1")" == 0 ]]; }
 
 unit_mainpid() {
-  if [[ $RUNNER == systemd ]]; then systemctl show -P MainPID "$1.service"; else cat "$UNIT_STATE/$1.mainpid"; fi
+  if [[ $RUNNER != cgroup ]]; then systemctl show -P MainPID "$(svc "$1")"; else cat "$UNIT_STATE/$1.mainpid"; fi
 }
 
 unit_state() {
-  if [[ $RUNNER == systemd ]]; then systemctl show -P ActiveState,SubState,ExecMainStatus "$1.service" | paste -sd' '
+  if [[ $RUNNER != cgroup ]]; then systemctl show -P ActiveState,SubState,ExecMainStatus "$(svc "$1")" | paste -sd' '
   else unit_empty "$1" && echo "inactive" || echo "active"; fi
 }
 
@@ -59,10 +76,10 @@ unit_state() {
 # or kill (SIGKILL after the stop timeout was needed).
 unit_stop() {
   local unit=$1 t0; t0=$(now_ms)
-  if [[ $RUNNER == systemd ]]; then
-    systemctl stop "$unit.service"
+  if [[ $RUNNER != cgroup ]]; then
+    systemctl stop "$(svc "$unit")"
     local how=term
-    journalctl -u "$unit.service" --since "@$((t0/1000))" 2>/dev/null | grep -q "Killing process" && how=kill
+    journalctl -u "$(svc "$unit")" --since "@$((t0/1000))" 2>/dev/null | grep -q "Killing process" && how=kill
     echo "$(( $(now_ms) - t0 )) $how"
   else
     local p; for p in $(unit_pids "$unit"); do kill -TERM "$p" 2>/dev/null || true; done
@@ -74,7 +91,7 @@ unit_stop() {
 }
 
 unit_reset() { # forget a stopped unit
-  if [[ $RUNNER == systemd ]]; then systemctl reset-failed "$1.service" 2>/dev/null || true
+  if [[ $RUNNER != cgroup ]]; then systemctl reset-failed "$(svc "$1")" 2>/dev/null || true
   else [[ -d "$CGROOT/$1" ]] && { echo 1 >"$CGROOT/$1/cgroup.kill" 2>/dev/null || true; sleep 0.3; rmdir "$CGROOT/$1" 2>/dev/null || true; }
        rm -f "$UNIT_STATE/$1.mainpid"; fi
 }

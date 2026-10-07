@@ -29,7 +29,7 @@ clone_cmd() { # extra args... -> sets CMD array
 }
 in_cdc() { [[ "$(sentinel_field "$DB" "$RUN/clone" apply)" == enabled ]]; }
 procs_named() { pgrep -f "^pgcopydb: $1" | wc -l; }
-cleanup() { [[ -n "${WRITER:-}" ]] && stop_writer "$WRITER" 2>/dev/null || true; unit_stop "$UNIT" >/dev/null 2>&1 || true; unit_reset "$UNIT"; }
+cleanup() { [[ -n "${WRITER:-}" ]] && stop_writer "$WRITER" 2>/dev/null || true; unit_stop "$UNIT" >/dev/null 2>&1 || true; unit_reset "$UNIT"; drop_slot "$DB" "$NAME"; }
 trap cleanup EXIT
 
 log "runner=$RUNNER pgcopydb=$($PGCOPYDB --version 2>/dev/null | sed -n 1p) server=$(src defaultdb -c 'show server_version')"
@@ -63,7 +63,7 @@ before=$(unit_live_count "$UNIT")
 kill -KILL "$main"; sleep 10
 survivors=$(unit_live_count "$UNIT"); still_active=$(slot_active "$DB" "$NAME" && echo true || echo false)
 recv=$(procs_named "follow receive"); appl=$(procs_named "follow apply")
-if [[ $RUNNER == systemd ]]; then
+if [[ $RUNNER != cgroup ]]; then
   auto_ms=$(wait_for 60 unit_empty "$UNIT" || echo -1); manual='null'
   state=$(unit_state "$UNIT")
 else

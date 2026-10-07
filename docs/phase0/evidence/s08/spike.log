@@ -1,0 +1,36 @@
+20:13:42.433 writing 14 batches of ~100 MB
+20:13:43.312 batch 1: cdc=930752 bytes, files=1, behind=110130576
+20:13:52.010 batch 2: cdc=21405592 bytes, files=1, behind=206116896
+20:14:51.802 batch 3: cdc=276366992 bytes, files=1, behind=196985816
+20:15:42.025 batch 4: cdc=479350920 bytes, files=1, behind=206795608
+20:16:41.864 batch 5: cdc=699605176 bytes, files=1, behind=200926816
+20:17:41.980 batch 6: cdc=920731832 bytes, files=1, behind=193789600
+20:18:41.945 batch 7: cdc=1137610936 bytes, files=1, behind=190626384
+20:19:33.161 batch 8: cdc=1337491640 bytes, files=1, behind=202985656
+20:20:34.750 batch 9: cdc=1550708920 bytes, files=1, behind=203534152
+20:21:34.588 batch 10: cdc=1771548856 bytes, files=1, behind=196423528
+20:22:26.908 batch 11: cdc=1981534392 bytes, files=1, behind=198365624
+20:23:26.795 batch 12: cdc=2174619288 bytes, files=2, behind=192925984
+20:24:18.217 batch 13: cdc=2412783472 bytes, files=2, behind=200194640
+20:25:07.999 batch 14: cdc=2614624328 bytes, files=2, behind=209517504
+20:25:08.017 RESULT {"step":"rotation","output_files":2,"ms_waited":8,"rotated_log_lines":1}
+20:25:08.062 RESULT {"step":"wait_until_prunable","ms":39}
+20:25:08.116 RESULT {"step":"P1_coordinator_dry_run","out":"    DRY RUN: would remove 1 CDC file pair(s), freeing 2035 MB (replay_lsn 0/0)","bytes_unchanged":false}
+20:25:08.785 RESULT {"step":"P2_coordinator_prune","out":"    Removed 1 CDC file pair(s), freed 2035 MB (replay_lsn 0/0)","bytes_before":2614919240,"bytes_after":480530504,"unit_still_running":true}
+20:26:07.997 batch 15: cdc=706580552 bytes, files=1, behind=199387808
+20:27:08.147 batch 16: cdc=931897416 bytes, files=1, behind=188476032
+20:27:58.047 batch 17: cdc=1133199432 bytes, files=1, behind=197385080
+20:28:48.093 batch 18: cdc=1336242248 bytes, files=1, behind=207532656
+20:29:48.271 batch 19: cdc=1561579592 bytes, files=1, behind=197662504
+20:30:48.034 batch 20: cdc=1782657096 bytes, files=1, behind=192336248
+20:31:38.810 batch 21: cdc=1985269832 bytes, files=1, behind=201726904
+20:32:38.730 batch 22: cdc=2177851032 bytes, files=2, behind=188534040
+20:33:29.537 batch 23: cdc=2411759424 bytes, files=2, behind=199598024
+20:34:29.361 batch 24: cdc=499732504 bytes, files=1, behind=190460504
+20:35:20.169 batch 25: cdc=704401432 bytes, files=1, behind=204060528
+20:36:20.208 batch 26: cdc=930181144 bytes, files=1, behind=192622904
+20:37:10.276 batch 27: cdc=1133821976 bytes, files=1, behind=197282272
+20:38:00.332 batch 28: cdc=1337610264 bytes, files=1, behind=206586336
+20:47:53.335 RESULT {"step":"P3_direct_prune_while_running","out":"    Removed CDC replay file: /var/tmp/upwell-spike/runs/s08/clone/cdc/00000001-00000001-30D6A8D8-replay.db","bytes_before":2140430744,"bytes_after":4379032,"unit_still_running":true}
+20:50:30.065 RESULT {"step":"drain_and_compare","drain_ms":149951,"source":"3000000/2880000000","target":"2700000/2592000000","match":false,"engine_log_errors":0}
+20:50:30.069 done

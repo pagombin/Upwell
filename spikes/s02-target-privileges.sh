@@ -79,4 +79,5 @@ for level in none origin full; do
   cp "$RUN/engine.log" "$OUT/engine-$level.log"
 done
 set_privs full
+for level in none origin full; do drop_slot "$DB" "upwell_s02_${level}"; done
 log "done"

@@ -98,3 +98,12 @@ reset_run() {
   dst defaultdb -c "drop database if exists \"$db\" with (force)" >/dev/null
   dst defaultdb -c "create database \"$db\"" >/dev/null
 }
+
+# Drop the slot and publication a spike created (leaves the target untouched). Every spike
+# calls this on exit so no slot keeps retaining WAL on the source between spikes.
+drop_slot() { # db name
+  src "$1" -c "select pg_terminate_backend(active_pid) from pg_replication_slots where slot_name='$2' and active_pid is not null" >/dev/null 2>&1 || true
+  sleep 0.3
+  src "$1" -c "select pg_drop_replication_slot('$2') from pg_replication_slots where slot_name='$2'" >/dev/null 2>&1 || true
+  src "$1" -c "drop publication if exists \"$2\"" >/dev/null 2>&1 || true
+}

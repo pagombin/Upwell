@@ -20,7 +20,9 @@ export SPIKE_LOG="$OUT/spike.log"; : >"$SPIKE_LOG"
 record() { printf '%s\n' "$1" >>"$EVID"; log "RESULT $1"; }
 DB=${DB:-prune}; NAME=upwell_s08_prune; UNIT=upwell-eng-s08-prune; RUN="$SPIKE_ROOT/runs/s08"
 COORD_PORT=${COORD_PORT:-57001}; BATCHES=${BATCHES:-14}
-cleanup() { unit_stop "$UNIT" >/dev/null 2>&1 || true; unit_reset "$UNIT"; }
+RATE="$OUT/cdc-rate.csv"
+SAMPLER=""
+cleanup() { [[ -n "$SAMPLER" ]] && kill "$SAMPLER" 2>/dev/null || true; unit_stop "$UNIT" >/dev/null 2>&1 || true; unit_reset "$UNIT"; drop_slot "$DB" "$NAME"; }
 trap cleanup EXIT
 
 seed_db "$DB" 1000 >/dev/null 2>&1
@@ -31,13 +33,25 @@ unit_start "$UNIT" "$RUN/engine.log" "$PGCOPYDB" clone --follow --source "$(src_
   --table-jobs 2 --index-jobs 2 --skip-extensions --no-owner --host 127.0.0.1 --port "$COORD_PORT"
 wait_for 300 bash -c "[[ \$($PGCOPYDB stream sentinel get --source '$(src_uri "$DB")' --dir '$RUN/clone' 2>/dev/null | awk '\$1==\"apply\"{print \$2}') == enabled ]]" >/dev/null || fail "no CDC"
 
+bash "$HERE/sample-cdc-rate.sh" "$DB" "$RUN/clone" "$NAME" "$RATE" 30 >/dev/null 2>&1 </dev/null &
+SAMPLER=$!
 cdc_bytes() { du -sb "$RUN/clone/cdc" | cut -f1; }
 cdc_files() { find "$RUN/clone/cdc" -name '*-output.db' | wc -l; }
+# Receive is slow (about 2 MB/s of WAL in this environment), so writes are paced: after
+# each ~100 MB batch, wait until the received position is within 200 MB of the source.
+# Unpaced, the first attempt invalidated the slot (evidence/s08-invalidated/).
+behind() { local cur w; cur=$(src "$DB" -c "select pg_current_wal_lsn()"); w=$(sentinel_field "$DB" "$RUN/clone" write_lsn)
+  src defaultdb -c "select pg_wal_lsn_diff('$cur','$w')::bigint"; }
+close_enough() { (( $(behind) < 200*1024*1024 )); }
+write_batches() { # from to
+  for b in $(seq "$1" "$2"); do
+    src "$DB" -c "insert into big select g, repeat(md5(g::text), 30) from generate_series(($b-1)*100000+1, $b*100000) g"
+    wait_for 1800 close_enough >/dev/null || fail "receive fell too far behind"
+    log "batch $b: cdc=$(cdc_bytes) bytes, files=$(cdc_files), behind=$(behind)"
+  done
+}
 log "writing $BATCHES batches of ~100 MB"
-for b in $(seq 1 "$BATCHES"); do
-  src "$DB" -c "insert into big select g, repeat(md5(g::text), 30) from generate_series(($b-1)*100000+1, $b*100000) g"
-  log "batch $b: cdc=$(cdc_bytes) bytes, files=$(cdc_files)"
-done
+write_batches 1 "$BATCHES"
 rot_ms=$(wait_for 900 bash -c "(( \$(find '$RUN/clone/cdc' -name '*-output.db' | wc -l) >= 2 ))" || echo -1)
 record "{\"step\":\"rotation\",\"output_files\":$(cdc_files),\"ms_waited\":$rot_ms,\"rotated_log_lines\":$(grep -c 'rotating' "$RUN/engine.log" || true)}"
 # Wait for apply to pass the first file's end so something is prunable.
@@ -52,10 +66,8 @@ p2=$("$PGCOPYDB" stream prune --dir "$RUN/clone" --host 127.0.0.1 --port "$COORD
 after=$(cdc_bytes)
 record "{\"step\":\"P2_coordinator_prune\",\"out\":\"$p2\",\"bytes_before\":$before,\"bytes_after\":$after,\"unit_still_running\":$(unit_empty "$UNIT" && echo false || echo true)}"
 # More changes, another rotation, then direct mode while the run is live.
-for b in $(seq $((BATCHES+1)) $((BATCHES*2))); do
-  src "$DB" -c "insert into big select g, repeat(md5(g::text), 30) from generate_series(($b-1)*100000+1, $b*100000) g"
-done
-sleep 60
+write_batches $((BATCHES+1)) $((BATCHES*2))
+wait_for 1800 prunable >/dev/null || true
 before=$(cdc_bytes)
 p3=$("$PGCOPYDB" stream prune --dir "$RUN/clone" 2>&1 | grep -E "Removed|ERROR|locked|busy" | tail -1 | cut -c60- | tr -d '"')
 record "{\"step\":\"P3_direct_prune_while_running\",\"out\":\"$p3\",\"bytes_before\":$before,\"bytes_after\":$(cdc_bytes),\"unit_still_running\":$(unit_empty "$UNIT" && echo false || echo true)}"

@@ -20,7 +20,7 @@ OUT="$EVIDENCE_DIR/s05"; mkdir -p "$OUT"; EVID="$OUT/results.jsonl"; : >"$EVID"
 export SPIKE_LOG="$OUT/spike.log"; : >"$SPIKE_LOG"
 record() { printf '%s\n' "$1" >>"$EVID"; log "RESULT $1"; }
 WRITER=""; BUSY=""
-cleanup() { for p in $WRITER $BUSY; do stop_writer "$p"; done; [[ -n "${UNIT:-}" ]] && { unit_stop "$UNIT" >/dev/null 2>&1 || true; unit_reset "$UNIT"; }; }
+cleanup() { for p in $WRITER $BUSY; do stop_writer "$p"; done; [[ -n "${UNIT:-}" ]] && { unit_stop "$UNIT" >/dev/null 2>&1 || true; unit_reset "$UNIT"; }; for pl in pgoutput test_decoding; do for sc in idle busy; do drop_slot "$DB" "upwell_s05_${pl}_${sc}"; done; done; }
 trap cleanup EXIT
 
 seed_db "$DB" "$ROWS" >/dev/null 2>&1
