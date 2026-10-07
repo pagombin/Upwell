@@ -1,0 +1,17 @@
+// Candidate polkit rule (Phase 0 spike S07). Lets the "upwell" service user start, stop
+// and reset ONLY instances of the pre-installed template unit upwell-eng@.service.
+// It deliberately does NOT rely on transient units: polkit sees the same action
+// (org.freedesktop.systemd1.manage-units, verb "start") for systemd-run, and cannot
+// inspect the transient unit's properties, so allowing transient "upwell-eng-*" units
+// would let the service user start any command as any user (see test.sh, check T2).
+polkit.addRule(function (action, subject) {
+  if (subject.user !== "upwell") return polkit.Result.NOT_HANDLED;
+  if (action.id !== "org.freedesktop.systemd1.manage-units") return polkit.Result.NOT_HANDLED;
+  var unit = action.lookup("unit") || "";
+  var verb = action.lookup("verb") || "";
+  if (/^upwell-eng@[a-z0-9_.-]{1,200}\.service$/.test(unit) &&
+      ["start", "stop", "restart", "reset-failed"].indexOf(verb) >= 0) {
+    return polkit.Result.YES;
+  }
+  return polkit.Result.NOT_HANDLED;
+});

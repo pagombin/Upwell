@@ -1,0 +1,5 @@
+# Go build output for spikes
+spikes/**/s06
+*.db
+*.db-shm
+*.db-wal

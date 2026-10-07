@@ -1,0 +1,9 @@
+{"check":"0_context","result":{"user" : "doadmin", "server_version" : "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)", "superuser" : false, "createrole" : true, "member_pg_signal_backend" : true, "member_pg_read_all_stats" : true}}
+{"check":"1_freeze_owned_db","result":{"ok":true}}
+{"check":"2_freeze_db_owned_by_other_role","owner":"upwell_probe_app","result":{"ok":false,"error":"ERROR:  must be owner of database upwell_freeze_probe_other"}}
+{"check":"3_new_app_session_write_blocked","result":{"ok":false,"error":"ERROR:  cannot execute INSERT in a read-only transaction"}}
+{"check":"4_old_session_still_writes","rows_before":3,"rows_3s_later":5,"still_writing":true}
+{"check":"5_terminate_app_session","pid":"26081","returned":"t"}
+{"check":"6_session_can_unfreeze_itself","result":{"ok":true}}
+{"check":"7_reset_undoes","reset":{"ok":true},"new_session_write":{"ok":true}}
+{"check":"8_emit_logical_message","result":{"ok":true}}

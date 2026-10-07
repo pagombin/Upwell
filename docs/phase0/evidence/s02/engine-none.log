@@ -1,0 +1,15 @@
+2026-10-07 19:20:13.964 17561 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 19:20:13.964 17561 INFO   cli_common.c:1394         [SOURCE] Copying database from "postgres://doadmin@127.0.0.1:55432/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 19:20:13.964 17561 INFO   cli_common.c:1395         [TARGET] Copying database into "postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 19:20:14.039 17561 INFO   pgsql.c:5470              Creating publication "upwell_s02_none"
+2026-10-07 19:20:14.062 17561 INFO   pgsql.c:4145              Created logical replication slot "upwell_s02_none" with plugin "pgoutput" at 0/32F3C408 and exported snapshot 00000003-00003E17-1
+2026-10-07 19:20:14.063 17561 INFO   ld_store.c:110            Creating output CDC file "/var/tmp/upwell-spike/runs/s02/none/clone/cdc/00000001-00000000-32F3C408-output.db"
+2026-10-07 19:20:14.076 17561 ERROR  pgsql.c:2386              [TARGET 17572] ERROR:  permission denied for function pg_replication_origin_oid
+2026-10-07 19:20:14.076 17561 ERROR  pgsql.c:2386              [TARGET 17572] ERROR:  permission denied for function pg_replication_origin_oid
+2026-10-07 19:20:14.076 17561 ERROR  pgsql.c:2397              [TARGET 17572] SQL query: select pg_replication_origin_oid($1)
+2026-10-07 19:20:14.076 17561 ERROR  pgsql.c:2405              [TARGET 17572] SQL params: 'upwell_s02_none'
+2026-10-07 19:20:14.076 17561 ERROR  pgsql.c:4985              Failed to get replication origin oid for "upwell_s02_none"
+2026-10-07 19:20:36.159 18245 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 19:20:36.172 18245 INFO   cli_sentinel.c:600        Fetched endpos 0/32F62668 from source database
+2026-10-07 19:20:36.297 18245 INFO   cli_sentinel.c:650        pgcopydb sentinel endpos has been set to 0/32F62668
+0/32F62668
