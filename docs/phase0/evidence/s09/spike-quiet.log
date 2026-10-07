@@ -1,0 +1,10 @@
+20:51:22.529 batch 1 committed at 1/77245CA0; sentinel: write_lsn=1/7333BFC8 flush_lsn=1/7333BFC8 replay_lsn=1/7333BFC8  origin=1/7333BFC8
+20:52:08.015 batch 2 committed at 1/7B14A3A8; sentinel: write_lsn=1/76ED3DD0 flush_lsn=1/7333BFC8 replay_lsn=1/77245CA0  origin=1/7333BFC8
+20:52:53.737 batch 3 committed at 1/7F13E478; sentinel: write_lsn=1/7B239560 flush_lsn=1/7B239560 replay_lsn=1/7B239560  origin=1/77245CA0
+20:53:39.243 batch 4 committed at 1/830BA520; sentinel: write_lsn=1/7E89CC00 flush_lsn=1/7E89CC00 replay_lsn=1/7F13E478  origin=1/7B14A3A8
+20:54:24.707 batch 5 committed at 1/87036DF8; sentinel: write_lsn=1/830BA558 flush_lsn=1/830BA558 replay_lsn=1/830BA558  origin=1/7F13E478
+20:55:10.215 batch 6 committed at 1/8AF3BCE8; sentinel: write_lsn=1/86A03B90 flush_lsn=1/86A03B90 replay_lsn=1/87036DF8  origin=1/7F13E478
+20:55:55.701 batch 7 committed at 1/8EF312F8; sentinel: write_lsn=1/8B02B068 flush_lsn=1/8B02B068 replay_lsn=1/8B02B068  origin=1/830BA520
+20:56:41.207 batch 8 committed at 1/92E3F408; sentinel: write_lsn=1/8E905050 flush_lsn=1/8E905050 replay_lsn=1/8EF312F8  origin=1/87036DF8
+21:00:21.970 RESULT {"mode":"quiet","batches":8,"rows_per_batch":60000,"gap_s":45,"drain_ms":115390,"source_rows":480000,"target_rows":480000,"match":true,"target_per_batch":"1:60000 2:60000 3:60000 4:60000 5:60000 6:60000 7:60000 8:60000","claims_endpos_reached":1,"engine_log_errors":0}
+21:00:21.974 done

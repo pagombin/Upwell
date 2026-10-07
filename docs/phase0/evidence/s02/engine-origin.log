@@ -1,89 +1,89 @@
-2026-10-07 19:20:38.536 18344 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
-2026-10-07 19:20:38.537 18344 INFO   cli_common.c:1394         [SOURCE] Copying database from "postgres://doadmin@127.0.0.1:55432/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-2026-10-07 19:20:38.537 18344 INFO   cli_common.c:1395         [TARGET] Copying database into "postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-2026-10-07 19:20:38.612 18344 INFO   pgsql.c:5470              Creating publication "upwell_s02_origin"
-2026-10-07 19:20:38.634 18344 INFO   pgsql.c:4145              Created logical replication slot "upwell_s02_origin" with plugin "pgoutput" at 0/32F64F88 and exported snapshot 00000003-00003F7E-1
-2026-10-07 19:20:38.636 18344 INFO   ld_store.c:110            Creating output CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000000-32F64F88-output.db"
-2026-10-07 19:20:38.654 18344 INFO   ld_stream.c:2347          Created logical replication origin "upwell_s02_origin" at LSN 0/32F64F88
-2026-10-07 19:20:38.792 18344 INFO   copydb_schema.c:776       Fetched information for 2 tables (including 0 tables split in 0 partitions total), with an estimated total of 60 053 tuples and 4200 kB on-disk
-2026-10-07 19:20:38.808 18344 INFO   copydb_schema.c:999       Fetched information for 3 indexes (supporting 2 constraints)
-2026-10-07 19:20:38.810 18344 INFO   sequences.c:78            Fetching information for 1 sequences
-2026-10-07 19:20:38.816 18344 INFO   copydb_schema.c:1242      Fetched information for 1 extensions
-2026-10-07 19:20:38.872 18344 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
-2026-10-07 19:20:38.883 18369 INFO   cli_clone_follow.c:981    STEP 1: fetch source database tables, indexes, and sequences
-2026-10-07 19:20:38.889 18371 INFO   ld_stream.c:847           Resuming streaming at LSN 0/32F64F88 (sentinel startpos)
-2026-10-07 19:20:38.889 18372 INFO   ld_apply.c:1374           Waiting until the pgcopydb sentinel apply is enabled
-2026-10-07 19:20:38.899 18371 INFO   ld_stream.c:870           Replication slot "upwell_s02_origin" current lsn is 0/32F64F50
-2026-10-07 19:20:38.915 18371 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000000-32F64F88-output.db"
-2026-10-07 19:20:38.916 18371 INFO   pgsql.c:4864              Reported write_lsn 0/32F64F88, flush_lsn 0/32F64F88, replay_lsn 0/0
-2026-10-07 19:20:38.972 18369 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
-2026-10-07 19:20:38.973 18369 INFO   cli_clone_follow.c:1022   STEP 2: dump the source database schema (pre/post data)
-2026-10-07 19:20:38.973 18369 INFO   pgcmd.c:470                /usr/bin/pg_dump -Fc --snapshot 00000003-00003F7E-1 --section=pre-data --section=post-data --file /var/tmp/upwell-spike/runs/s02/origin/clone/schema/schema.dump 'postgres://doadmin@127.0.0.1:55432/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
-2026-10-07 19:20:39.093 18369 INFO   cli_clone_follow.c:1030   STEP 3: restore the pre-data section to the target database
-2026-10-07 19:20:39.132 18369 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 2 --no-owner --use-list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/pre-filtered.list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/schema.dump
-2026-10-07 19:20:39.452 18403 INFO   table-data.c:708          STEP 4: starting 2 table-data COPY processes
-2026-10-07 19:20:39.455 18405 INFO   vacuum.c:166              STEP 8: starting 2 VACUUM processes
-2026-10-07 19:20:39.463 18404 INFO   indexes.c:218             STEP 6: starting 2 CREATE INDEX processes
-2026-10-07 19:20:39.463 18404 INFO   indexes.c:219             STEP 7: constraints are built by the CREATE INDEX processes
-2026-10-07 19:20:39.465 18369 INFO   blobs.c:74                Skipping large objects: none found.
-2026-10-07 19:20:39.497 18369 INFO   sequences.c:194           STEP 9: reset sequences values
-2026-10-07 19:20:39.503 18421 INFO   sequences.c:290           Set sequences values on the target database
-2026-10-07 19:20:39.909 18369 INFO   cli_clone_follow.c:1046   STEP 10: restore the post-data section to the target database
-2026-10-07 19:20:39.957 18369 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 2 --no-owner --use-list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/post-filtered.list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/schema.dump
-2026-10-07 19:20:40.090 18369 INFO   cli_clone_follow.c:1061   Updating the pgcopydb.sentinel to enable applying changes
-2026-10-07 19:20:40.108 18369 INFO   cli_clone_follow.c:1077   All step are now done,  1s126 elapsed
-2026-10-07 19:20:40.108 18369 INFO   summary.c:3631            Printing summary for 2 tables and 3 indexes
+2026-10-07 22:18:48.032 3913 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 22:18:48.033 3913 INFO   cli_common.c:1394         [SOURCE] Copying database from "postgres://doadmin@127.0.0.1:55432/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 22:18:48.033 3913 INFO   cli_common.c:1395         [TARGET] Copying database into "postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 22:18:48.102 3913 INFO   pgsql.c:5470              Creating publication "upwell_s02_origin"
+2026-10-07 22:18:48.128 3913 INFO   pgsql.c:4145              Created logical replication slot "upwell_s02_origin" with plugin "pgoutput" at 2/74EBDC38 and exported snapshot 00000003-00011D38-1
+2026-10-07 22:18:48.129 3913 INFO   ld_store.c:110            Creating output CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000002-74EBDC38-output.db"
+2026-10-07 22:18:48.142 3913 INFO   ld_stream.c:2347          Created logical replication origin "upwell_s02_origin" at LSN 2/74EBDC38
+2026-10-07 22:18:48.239 3913 INFO   copydb_schema.c:776       Fetched information for 2 tables (including 0 tables split in 0 partitions total), with an estimated total of 60 006 tuples and 4208 kB on-disk
+2026-10-07 22:18:48.248 3913 INFO   copydb_schema.c:999       Fetched information for 3 indexes (supporting 2 constraints)
+2026-10-07 22:18:48.252 3913 INFO   sequences.c:78            Fetching information for 1 sequences
+2026-10-07 22:18:48.258 3913 INFO   copydb_schema.c:1242      Fetched information for 1 extensions
+2026-10-07 22:18:48.303 3913 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
+2026-10-07 22:18:48.315 3936 INFO   cli_clone_follow.c:981    STEP 1: fetch source database tables, indexes, and sequences
+2026-10-07 22:18:48.322 3939 INFO   ld_apply.c:1374           Waiting until the pgcopydb sentinel apply is enabled
+2026-10-07 22:18:48.322 3938 INFO   ld_stream.c:847           Resuming streaming at LSN 2/74EBDC38 (sentinel startpos)
+2026-10-07 22:18:48.332 3938 INFO   ld_stream.c:870           Replication slot "upwell_s02_origin" current lsn is 2/74EBDC00
+2026-10-07 22:18:48.347 3938 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000002-74EBDC38-output.db"
+2026-10-07 22:18:48.348 3938 INFO   pgsql.c:4864              Reported write_lsn 2/74EBDC38, flush_lsn 2/74EBDC38, replay_lsn 0/0
+2026-10-07 22:18:48.386 3936 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
+2026-10-07 22:18:48.388 3936 INFO   cli_clone_follow.c:1022   STEP 2: dump the source database schema (pre/post data)
+2026-10-07 22:18:48.389 3936 INFO   pgcmd.c:470                /usr/bin/pg_dump -Fc --snapshot 00000003-00011D38-1 --section=pre-data --section=post-data --file /var/tmp/upwell-spike/runs/s02/origin/clone/schema/schema.dump 'postgres://doadmin@127.0.0.1:55432/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
+2026-10-07 22:18:48.486 3936 INFO   cli_clone_follow.c:1030   STEP 3: restore the pre-data section to the target database
+2026-10-07 22:18:48.529 3936 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 2 --no-owner --use-list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/pre-filtered.list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/schema.dump
+2026-10-07 22:18:48.628 3970 INFO   vacuum.c:166              STEP 8: starting 2 VACUUM processes
+2026-10-07 22:18:48.628 3968 INFO   table-data.c:708          STEP 4: starting 2 table-data COPY processes
+2026-10-07 22:18:48.637 3936 INFO   blobs.c:74                Skipping large objects: none found.
+2026-10-07 22:18:48.637 3969 INFO   indexes.c:218             STEP 6: starting 2 CREATE INDEX processes
+2026-10-07 22:18:48.637 3969 INFO   indexes.c:219             STEP 7: constraints are built by the CREATE INDEX processes
+2026-10-07 22:18:48.643 3936 INFO   sequences.c:194           STEP 9: reset sequences values
+2026-10-07 22:18:48.644 3981 INFO   sequences.c:290           Set sequences values on the target database
+2026-10-07 22:18:48.947 3936 INFO   cli_clone_follow.c:1046   STEP 10: restore the post-data section to the target database
+2026-10-07 22:18:48.984 3936 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 2 --no-owner --use-list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/post-filtered.list /var/tmp/upwell-spike/runs/s02/origin/clone/schema/schema.dump
+2026-10-07 22:18:49.072 3936 INFO   cli_clone_follow.c:1061   Updating the pgcopydb.sentinel to enable applying changes
+2026-10-07 22:18:49.073 3936 INFO   cli_clone_follow.c:1077   All step are now done, 685ms elapsed
+2026-10-07 22:18:49.073 3936 INFO   summary.c:3631            Printing summary for 2 tables and 3 indexes
 
   OID | Schema |   Name | Parts | copy duration | transmitted bytes | indexes | create index 
 ------+--------+--------+-------+---------------+-------------------+---------+-------------
-16557 | public |  items |     1 |          43ms |            711 kB |       1 |         25ms
-16548 | public | orders |     1 |          53ms |           1535 kB |       2 |         26ms
+17248 | public |  items |     1 |          43ms |            711 kB |       1 |         19ms
+17239 | public | orders |     1 |          43ms |           1537 kB |       2 |         28ms
 
 
                                                Step   Connection    Duration    Transfer   Concurrency
  --------------------------------------------------   ----------  ----------  ----------  ------------
-   Catalog Queries (table ordering, filtering, etc)       source        86ms                         1
-                                        Dump Schema       source       119ms                         1
-                                     Prepare Schema       target       117ms                         1
-      COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       456ms                         6
-                                  COPY (cumulative)         both        96ms     2247 kB             2
-                          CREATE INDEX (cumulative)       target        48ms                         2
-                           CONSTRAINTS (cumulative)       target         3ms                         2
-                                VACUUM (cumulative)       target       252ms                         2
-                                    Reset Sequences         both        18ms                         1
+   Catalog Queries (table ordering, filtering, etc)       source        69ms                         1
+                                        Dump Schema       source        96ms                         1
+                                     Prepare Schema       target       130ms                         1
+      COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       327ms                         6
+                                  COPY (cumulative)         both        86ms     2249 kB             2
+                          CREATE INDEX (cumulative)       target        45ms                         2
+                           CONSTRAINTS (cumulative)       target         2ms                         2
+                                VACUUM (cumulative)       target        80ms                         2
+                                    Reset Sequences         both        21ms                         1
                          Large Objects (cumulative)         both         0ms                         4
-                                    Finalize Schema         both       173ms                         2
+                                    Finalize Schema         both       123ms                         2
  --------------------------------------------------   ----------  ----------  ----------  ------------
-                          Total Wall Clock Duration         both       1s126                        12
+                          Total Wall Clock Duration         both       685ms                        12
 
-2026-10-07 19:20:40.890 18372 INFO   ld_apply.c:1384           The pgcopydb sentinel has enabled applying changes
-2026-10-07 19:20:40.910 18372 INFO   ld_apply.c:2489           Setting up previous LSN from replication origin "upwell_s02_origin" progress at 0/32F64F88
-2026-10-07 19:20:40.912 18372 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000000-32F64F88-output.db"
-2026-10-07 19:20:40.912 18372 INFO   ld_store.c:165            Creating replay CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000000-32F64F88-replay.db"
-2026-10-07 19:20:40.916 18372 INFO   ld_apply.c:1260           Catchup-up with changes from LSN 0/32F64F88
-2026-10-07 19:20:40.925 18372 INFO   ld_apply.c:203            Applying CDC changes from replayDB "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000000-32F64F88-replay.db" after LSN 0/32F64F88
-2026-10-07 19:20:49.067 18371 INFO   pgsql.c:4864              Reported write_lsn 0/32F6E218, flush_lsn 0/32F688A8, replay_lsn 0/32F688A8
-2026-10-07 19:20:49.067 18371 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000000000032"
-2026-10-07 19:21:00.014 18371 INFO   pgsql.c:4864              Reported write_lsn 0/32F76A80, flush_lsn 0/32F6CC70, replay_lsn 0/32F6CC70
-2026-10-07 19:21:00.724 19135 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
-2026-10-07 19:21:00.735 19135 INFO   cli_sentinel.c:600        Fetched endpos 0/32F76A80 from source database
-2026-10-07 19:21:00.738 19135 INFO   cli_sentinel.c:650        pgcopydb sentinel endpos has been set to 0/32F76A80
-0/32F76A80
-2026-10-07 19:21:10.025 18371 INFO   pgsql.c:4855              endpos is now set to 0/32F76A80
-2026-10-07 19:21:10.025 18371 INFO   pgsql.c:4864              Reported write_lsn 0/32F76A80, flush_lsn 0/32F70C00, replay_lsn 0/32F70C00
-2026-10-07 19:21:18.096 18371 INFO   pgsql.c:4864              Reported write_lsn 0/32F76AB8, flush_lsn 0/32F73CA8, replay_lsn 0/32F73CA8
-2026-10-07 19:21:18.098 18371 INFO   ld_stream.c:1251          streamCloseFile: receive done at 0/32F76AB8, signalling transform
-2026-10-07 19:21:18.098 18371 INFO   ld_stream.c:727           Streamed up to write_lsn 0/32F76AB8, flush_lsn 0/32F73CA8, stopping: endpos is 0/32F76A80
-2026-10-07 19:21:18.098 18372 INFO   ld_stream.c:487           Upstream done signal received: final LSN 0/32F76AB8
-2026-10-07 19:21:18.099 18371 INFO   sentinel.c:853            pipeline_state_end: receive done at 0/32F76A80
-2026-10-07 19:21:18.099 18371 INFO   follow.c:738              Prefetch process has terminated
-2026-10-07 19:21:18.151 18372 INFO   sentinel.c:853            pipeline_state_end: apply done at 0/32F76A80
-2026-10-07 19:21:18.152 18372 INFO   follow.c:797              Apply process has terminated
-2026-10-07 19:21:18.231 18370 INFO   follow.c:671              Subprocesses for receive and apply have now all exited
-2026-10-07 19:21:18.231 18370 INFO   follow.c:279              Current sentinel replay_lsn is 0/32F76A80, endpos has now been set to 0/32F76A80
-2026-10-07 19:21:18.231 18370 INFO   follow.c:461              Current endpos 0/32F76A80 has been reached at replay_lsn 0/32F76A80
-2026-10-07 19:21:18.231 18370 INFO   follow.c:367              Follow mode is now done, reached endpos 0/32F76A80 with replay_lsn 0/32F76A80
-2026-10-07 19:21:18.532 18344 INFO   copydb_schema.c:376       A previous run has run through completion
-2026-10-07 19:21:18.532 18344 INFO   copydb_schema.c:50        Re-using catalog caches
-2026-10-07 19:21:18.532 18344 INFO   sequences.c:290           Reset sequences values on the target database
-2026-10-07 19:21:18.532 18344 INFO   sequences.c:78            Fetching information for 1 sequences
+2026-10-07 22:18:49.323 3939 INFO   ld_apply.c:1384           The pgcopydb sentinel has enabled applying changes
+2026-10-07 22:18:49.343 3939 INFO   ld_apply.c:2489           Setting up previous LSN from replication origin "upwell_s02_origin" progress at 2/74EBDC38
+2026-10-07 22:18:49.345 3939 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000002-74EBDC38-output.db"
+2026-10-07 22:18:49.345 3939 INFO   ld_store.c:165            Creating replay CDC file "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000002-74EBDC38-replay.db"
+2026-10-07 22:18:49.350 3939 INFO   ld_apply.c:1260           Catchup-up with changes from LSN 2/74EBDC38
+2026-10-07 22:18:49.359 3939 INFO   ld_apply.c:203            Applying CDC changes from replayDB "/var/tmp/upwell-spike/runs/s02/origin/clone/cdc/00000001-00000002-74EBDC38-replay.db" after LSN 2/74EBDC38
+2026-10-07 22:18:58.420 3938 INFO   pgsql.c:4864              Reported write_lsn 2/74EC77D8, flush_lsn 2/74EC1E50, replay_lsn 2/74EC1E50
+2026-10-07 22:18:58.420 3938 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000074"
+2026-10-07 22:19:09.421 3938 INFO   pgsql.c:4864              Reported write_lsn 2/74ED1300, flush_lsn 2/74EC6D60, replay_lsn 2/74EC6D60
+2026-10-07 22:19:11.432 4835 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 22:19:11.444 4835 INFO   cli_sentinel.c:600        Fetched endpos 2/74ED1300 from source database
+2026-10-07 22:19:11.446 4835 INFO   cli_sentinel.c:650        pgcopydb sentinel endpos has been set to 2/74ED1300
+2/74ED1300
+2026-10-07 22:19:19.430 3938 INFO   pgsql.c:4855              endpos is now set to 2/74ED1300
+2026-10-07 22:19:19.430 3938 INFO   pgsql.c:4864              Reported write_lsn 2/74ED1300, flush_lsn 2/74ECB970, replay_lsn 2/74ECB970
+2026-10-07 22:19:21.092 3938 INFO   pgsql.c:4864              Reported write_lsn 2/74ED1338, flush_lsn 2/74ECC678, replay_lsn 2/74ECC678
+2026-10-07 22:19:21.093 3938 INFO   ld_stream.c:1251          streamCloseFile: receive done at 2/74ED1338, signalling transform
+2026-10-07 22:19:21.093 3938 INFO   ld_stream.c:727           Streamed up to write_lsn 2/74ED1338, flush_lsn 2/74ECC678, stopping: endpos is 2/74ED1300
+2026-10-07 22:19:21.093 3939 INFO   ld_stream.c:487           Upstream done signal received: final LSN 2/74ED1338
+2026-10-07 22:19:21.094 3938 INFO   sentinel.c:853            pipeline_state_end: receive done at 2/74ED1300
+2026-10-07 22:19:21.094 3938 INFO   follow.c:738              Prefetch process has terminated
+2026-10-07 22:19:21.195 3939 INFO   sentinel.c:853            pipeline_state_end: apply done at 2/74ED1300
+2026-10-07 22:19:21.195 3939 INFO   follow.c:797              Apply process has terminated
+2026-10-07 22:19:21.289 3937 INFO   follow.c:671              Subprocesses for receive and apply have now all exited
+2026-10-07 22:19:21.289 3937 INFO   follow.c:279              Current sentinel replay_lsn is 2/74ED1300, endpos has now been set to 2/74ED1300
+2026-10-07 22:19:21.289 3937 INFO   follow.c:461              Current endpos 2/74ED1300 has been reached at replay_lsn 2/74ED1300
+2026-10-07 22:19:21.289 3937 INFO   follow.c:367              Follow mode is now done, reached endpos 2/74ED1300 with replay_lsn 2/74ED1300
+2026-10-07 22:19:21.508 3913 INFO   copydb_schema.c:376       A previous run has run through completion
+2026-10-07 22:19:21.509 3913 INFO   copydb_schema.c:50        Re-using catalog caches
+2026-10-07 22:19:21.509 3913 INFO   sequences.c:290           Reset sequences values on the target database
+2026-10-07 22:19:21.509 3913 INFO   sequences.c:78            Fetching information for 1 sequences
