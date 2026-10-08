@@ -264,7 +264,7 @@ else
   if [[ -n $GO ]]; then
     mkdir -p "$BUILD_CACHE"
     ver=$(cd "$REPO" && git describe --tags --always --dirty 2>/dev/null || echo dev)
-    (cd "$REPO" && GOTOOLCHAIN=local GOFLAGS=-mod=mod GOCACHE=$BUILD_CACHE/cache GOMODCACHE=$BUILD_CACHE/mod CGO_ENABLED=0 \
+    (cd "$REPO" && GOTOOLCHAIN=local GOCACHE=$BUILD_CACHE/cache GOMODCACHE=$BUILD_CACHE/mod CGO_ENABLED=0 \
       "$GO" build -trimpath -buildvcs=false -ldflags "-s -w -X main.Version=$ver" -o "$BUILD_CACHE/upwell" ./cmd/upwell) >>"$LOGFILE" 2>&1 || fail "building Upwell failed (see $LOGFILE)"
     NEW=$BUILD_CACHE/upwell
   fi
