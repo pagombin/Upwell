@@ -91,6 +91,12 @@ func (o *Orchestrator) Engine() engine.Engine { return o.eng }
 func (o *Orchestrator) Runner() runner.Runner { return o.run }
 
 func (o *Orchestrator) lock(id string) func() {
+	// The API accepts the full or the short ID; lock on the full one so every
+	// caller, the supervisor included, shares one mutex per migration.
+	var full string
+	if err := o.st.DB.QueryRow(`SELECT id FROM migrations WHERE id = ? OR short_id = ? LIMIT 1`, id, id).Scan(&full); err == nil {
+		id = full
+	}
 	v, _ := o.migMu.LoadOrStore(id, &sync.Mutex{})
 	m := v.(*sync.Mutex)
 	m.Lock()
@@ -541,3 +547,6 @@ func bootID() string {
 	b, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	return strings.TrimSpace(string(b))
 }
+
+// SettingsService returns the settings store (tests and tools).
+func (o *Orchestrator) SettingsService() *settings.Service { return o.settings }

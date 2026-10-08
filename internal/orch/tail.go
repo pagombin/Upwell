@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -20,6 +21,14 @@ type classes struct {
 	baseCopyFailed bool
 	permanent      bool
 	endposReached  bool
+	// engineLock: pgcopydb's own SQLite catalog was locked by another of its
+	// processes (F12), an engine-internal transient failure.
+	engineLock bool
+	// fatal or applyGone during streaming: pgcopydb gave up (or its apply
+	// process exited) while other processes, such as receive, which ignores
+	// SIGTERM (F3), keep the unit looking alive. Nothing is applied any more.
+	fatal     bool
+	applyGone bool
 }
 
 type tailer struct {
@@ -126,8 +135,17 @@ func (t *tailers) read(tl *tailer) {
 		case "error", "fatal":
 			tl.cls.errors++
 			tl.cls.lastError = rec.Msg
+			if strings.Contains(rec.Msg, "database is locked") {
+				tl.cls.engineLock = true
+			}
+			if rec.Level == "fatal" {
+				tl.cls.fatal = true
+			}
 		case "warn":
 			tl.cls.warnings++
+		}
+		if strings.Contains(rec.Msg, "Apply process has terminated") {
+			tl.cls.applyGone = true
 		}
 		switch cls {
 		case engine.FailSlotLost:

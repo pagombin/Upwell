@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -140,12 +141,32 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 			o.afterExit(ctx, m, d, engine.FailSlotLost, classes.lastError)
 			return
 		}
+		// During streaming: if pgcopydb gave up or its apply process exited
+		// outside a cutover's end position, the unit can still look alive
+		// (receive ignores SIGTERM) while nothing is applied. Stop it and let
+		// the retry policy resume it.
+		if d.BaseCopyDone && (classes.fatal || classes.applyGone) && !classes.endposReached {
+			why := firstNonEmpty(classes.lastError, "the apply process exited")
+			o.Event(ctx, m.ID, d.SourceName, "engine_failed", "critical", fmt.Sprintf("%s: the engine stopped applying changes (%s) while parts of it kept running; stopping the unit and resuming", d.SourceName, why), nil)
+			o.mustStop(ctx, m, d, "engine stopped applying")
+			o.endAttempt(ctx, d, nil, "engine stopped applying: "+why)
+			cls := engine.FailTransient
+			if classes.permanent && !classes.engineLock {
+				cls = engine.FailPermanent
+			}
+			o.afterExit(ctx, m, d, cls, "the engine stopped applying changes: "+why)
+			return
+		}
 		// F10: a failed base copy leaves the run streaming. Detect it from the log.
 		if !d.BaseCopyDone && (classes.baseCopyFailed || classes.errors > 0) {
 			o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", "The base copy of "+d.SourceName+" failed ("+classes.lastError+"); stopping the unit, because pgcopydb keeps streaming after such a failure", nil)
 			o.mustStop(ctx, m, d, "base copy failed")
 			o.endAttempt(ctx, d, nil, "base copy failed: "+classes.lastError)
-			o.afterExit(ctx, m, d, engine.FailBaseCopy, classes.lastError)
+			reason := classes.lastError
+			if classes.engineLock {
+				reason = engineLockReason + " (" + reason + ")"
+			}
+			o.afterExit(ctx, m, d, engine.FailBaseCopy, reason)
 			return
 		}
 		pr, err := o.eng.Observe(ctx, plan, spec)
@@ -191,6 +212,9 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		cls, reason = engine.FailSlotLost, classes.lastError
 	case !d.BaseCopyDone:
 		cls, reason = engine.FailBaseCopy, firstNonEmpty(classes.lastError, "the engine exited during the base copy")
+		if classes.engineLock {
+			reason = engineLockReason + " (" + reason + ")"
+		}
 	case classes.permanent:
 		cls, reason = engine.FailPermanent, classes.lastError
 	default:
@@ -205,6 +229,10 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	}
 	o.afterExit(ctx, m, d, cls, reason)
 }
+
+// engineLockReason marks a base-copy failure caused by pgcopydb's internal
+// SQLite lock (F12).
+const engineLockReason = "the engine's internal catalog was locked"
 
 func firstNonEmpty(a, b string) string {
 	if a != "" {
@@ -236,7 +264,15 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 		o.Event(ctx, m.ID, d.SourceName, "slot_lost", "critical", d.SourceName+": the replication slot was invalidated, so this database must restart from zero. Upwell never does this automatically.", map[string]any{"reason": reason})
 	case engine.FailBaseCopy:
 		v := o.globalSettings(ctx)
-		if v.Bool("auto_restart_base_copy") && d.SizeBytes <= int64(v.Int("auto_restart_base_copy_max_gb"))<<30 {
+		underLimit := d.SizeBytes <= int64(v.Int("auto_restart_base_copy_max_gb"))<<30
+		// F12: pgcopydb's own SQLite catalog lock is an engine-internal
+		// transient fault, so it gets one automatic restart from zero (the
+		// copy had not finished, so nothing on the target is kept).
+		engineFlake := strings.HasPrefix(reason, engineLockReason) && d.RetryCount == 0
+		if engineFlake {
+			o.setDB(ctx, d.ID, map[string]any{"retry_count": d.RetryCount + 1})
+		}
+		if (v.Bool("auto_restart_base_copy") || engineFlake) && underLimit {
 			o.Event(ctx, m.ID, d.SourceName, "auto_restart", "warning", d.SourceName+": base copy failed ("+reason+"); restarting from zero automatically (under the size limit)", nil)
 			spec, err := o.dbSpec(ctx, m, d)
 			if err == nil {

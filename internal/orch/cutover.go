@@ -58,6 +58,22 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 			c.Detail = fmt.Sprintf("Backlog %s, stable for %d s", humanSize(*d.BacklogBytes), (now-*d.InSyncSince)/1000)
 		}
 		out = append(out, c)
+		// Lag in time, from the heartbeat: bytes of backlog can hide a long
+		// apply (pgcopydb applies a few transactions a second, F11), and the
+		// write pause lasts at least as long as the target is behind.
+		if v.Bool("heartbeat") {
+			maxLag := float64(o.globalSettings(ctx).Int("cutover_max_lag_seconds"))
+			lc := Condition{Key: "lag", Label: d.SourceName + " target lag", Database: d.SourceName}
+			if lag, ok := o.LastValue(m.ID, d.SourceName, "heartbeat_latency_s"); !ok {
+				lc.Detail = "Not measured yet: waiting for the heartbeat to reach the target"
+			} else if lag > maxLag {
+				lc.Detail = fmt.Sprintf("The target is %s behind (limit %s); the write pause would last at least that long", humanDuration(lag), humanDuration(maxLag))
+			} else {
+				lc.OK = true
+				lc.Detail = fmt.Sprintf("The target is %s behind", humanDuration(lag))
+			}
+			out = append(out, lc)
+		}
 	}
 	alerts, _ := o.ListAlerts(ctx, "firing", 100)
 	crit := 0

@@ -555,6 +555,18 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 			o.Event(ctx, m.ID, d.SourceName, "target_db", "info", "Created target database "+d.TargetName, nil)
 		}
 	}
+	// Extensions first: tables may use their types, functions and operators.
+	if made, skipped, err := pgpack.EnsureExtensions(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName)); err != nil {
+		done("failed: " + err.Error())
+		return o.dbFailed(ctx, m, d, engine.FailPermanent, err.Error())
+	} else {
+		if len(made) > 0 {
+			o.Event(ctx, m.ID, d.SourceName, "extensions", "info", "Created extensions on the target: "+strings.Join(made, ", "), nil)
+		}
+		if len(skipped) > 0 {
+			o.Event(ctx, m.ID, d.SourceName, "extensions", "warning", "Extensions not created on the target: "+strings.Join(skipped, "; "), nil)
+		}
+	}
 	// The data-safety gate starts here: re-check the apply privileges inside the
 	// database the engine will apply into (function grants are per database).
 	if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err == nil {

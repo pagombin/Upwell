@@ -79,3 +79,51 @@ func TestClassify(t *testing.T) {
 		t.Fatalf("parse: %+v", r)
 	}
 }
+
+func TestPlanRoleStatements(t *testing.T) {
+	dump := `--
+-- PostgreSQL database cluster dump
+--
+\restrict abc123
+SET default_transaction_read_only = off;
+CREATE ROLE app_rw;
+ALTER ROLE app_rw WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
+CREATE ROLE reporting;
+ALTER ROLE reporting WITH SUPERUSER INHERIT NOCREATEROLE NOCREATEDB NOLOGIN REPLICATION BYPASSRLS;
+CREATE ROLE doadmin;
+ALTER ROLE doadmin WITH NOSUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION NOBYPASSRLS;
+CREATE ROLE postgres;
+ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS;
+CREATE ROLE "Mixed Case";
+ALTER ROLE "Mixed Case" WITH LOGIN;
+CREATE ROLE already_there;
+ALTER ROLE already_there WITH LOGIN;
+ALTER ROLE app_rw SET statement_timeout TO '30s';
+GRANT reporting TO app_rw WITH INHERIT TRUE GRANTED BY doadmin;
+GRANT pg_monitor TO doadmin WITH INHERIT TRUE GRANTED BY postgres;
+GRANT pg_read_all_data TO reporting GRANTED BY postgres;
+\unrestrict abc123
+`
+	p := PlanRoleStatements(dump, map[string]bool{"already_there": true, "doadmin": true}, "doadmin")
+	got := strings.Join(p.Statements, "\n")
+	for _, want := range []string{
+		"CREATE ROLE app_rw;",
+		"ALTER ROLE reporting WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB NOLOGIN NOREPLICATION NOBYPASSRLS;",
+		`CREATE ROLE "Mixed Case";`,
+		"ALTER ROLE app_rw SET statement_timeout TO '30s';",
+		"GRANT reporting TO app_rw WITH INHERIT TRUE;",
+		"GRANT pg_read_all_data TO reporting;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	for _, bad := range []string{"doadmin WITH", "ROLE postgres", "already_there", "restrict", "SET default", "GRANTED BY", " SUPERUSER", " REPLICATION", " BYPASSRLS"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("unexpected %q in:\n%s", bad, got)
+		}
+	}
+	if p.Existing != 1 || strings.Join(p.New, ",") != "app_rw,Mixed Case" {
+		t.Errorf("existing %d new %v", p.Existing, p.New)
+	}
+}

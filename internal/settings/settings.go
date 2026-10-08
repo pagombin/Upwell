@@ -62,6 +62,8 @@ var Catalog = []Def{
 	def("verify_checksum_budget_seconds", "int", 600, 0, 86400, "migration", "Data safety", "s", "Time verification may spend on row checksums per database, smallest tables first. Tables beyond the budget are reported as not checksummed."),
 	def("cutover_lag_threshold_mb", "int", 16, 1, 1024, "migration", "Cutover", "MB", "Backlog per database below which writes may stop."),
 	def("cutover_stable_seconds", "int", 60, 0, 600, "global", "Cutover", "s", "How long the backlog must stay under the threshold before the readiness gate passes."),
+	def("assumed_apply_tps", "float", 5, 0.1, 100000, "global", "Preflight", "transactions/s", "Transactions a second the engine applies per database, for the apply_rate check. 5 was measured with pgcopydb 0.18 in the build container (F11); calibrate it with a test migration on the droplet."),
+	def("cutover_max_lag_seconds", "int", 180, 10, 86400, "global", "Cutover", "s", "Largest heartbeat lag (how far the target is behind, in time) at which the readiness gate passes. The write pause lasts at least this long. A backlog in bytes can hide a long apply time (F11)."),
 	def("cutover_write_sample_seconds", "int", 10, 5, 120, "global", "Cutover", "s", "Window between the two row-change samples taken after the operator confirms writers stopped."),
 	def("cutover_drain_timeout_seconds", "int", 1800, 60, 86400, "global", "Cutover", "s", "Maximum wait for every database to reach its end position."),
 	def("cutover_nudge_seconds", "int", 0, 0, 600, "global", "Cutover", "s", "Delay before the drain nudge. 0 nudges immediately after setting the end position."),

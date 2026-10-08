@@ -440,8 +440,8 @@ func (e *Engine) Classify(r engine.LogRecord) string {
 	return engine.FailTransient
 }
 
-// CopyRoles copies cluster roles once (best effort), falling back to
-// pg_dumpall --roles-only with \restrict lines stripped and existing roles skipped.
+// CopyRoles copies cluster roles once (best effort) without passwords, as a
+// non-superuser admin can: see PlanRoleStatements.
 func (e *Engine) CopyRoles(ctx context.Context, src, dst pg.Conn, runDir string) (string, error) {
 	if err := os.MkdirAll(runDir, 0o750); err != nil {
 		return "", err
@@ -451,12 +451,141 @@ func (e *Engine) CopyRoles(ctx context.Context, src, dst pg.Conn, runDir string)
 		return "", err
 	}
 	defer os.Remove(pass)
-	p := engine.RunPlan{PassFile: pass}
-	dir := filepath.Join(runDir, "roles")
-	os.RemoveAll(dir)
-	out, err := e.run(ctx, 5*time.Minute, p, "copy", "roles", "--source", src.URI(), "--target", dst.URI(), "--dir", dir)
-	if err == nil {
-		return "copied roles with pgcopydb copy roles", nil
+	// pgcopydb copy roles reads pg_authid, which only a superuser may read, so
+	// it always fails as DigitalOcean's doadmin. Dump the roles without
+	// passwords (pg_roles is readable) and apply what a non-superuser may.
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "pg_dumpall", "--roles-only", "--no-role-passwords", "--dbname", src.URI())
+	cmd.Env = append(os.Environ(), "PGPASSFILE="+pass)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("pg_dumpall --roles-only: %v: %s", err, strings.TrimSpace(errb.String()))
 	}
-	return out, fmt.Errorf("copying roles: %w", err)
+	_ = os.WriteFile(filepath.Join(runDir, "roles.sql"), out.Bytes(), 0o600)
+	conn, err := pg.Connect(ctx, dst, 30*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("target: %w", err)
+	}
+	defer conn.Close(ctx)
+	existing := map[string]bool{}
+	rows, err := conn.Query(ctx, `SELECT rolname FROM pg_roles`)
+	if err != nil {
+		return "", err
+	}
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			existing[n] = true
+		}
+	}
+	rows.Close()
+	plan := PlanRoleStatements(out.String(), existing, src.User)
+	created, failed := 0, []string{}
+	for _, st := range plan.Statements {
+		if _, err := conn.Exec(ctx, st); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", firstWords(st, 4), err))
+			continue
+		}
+		if strings.HasPrefix(st, "CREATE ROLE") {
+			created++
+		}
+	}
+	msg := fmt.Sprintf("Copied roles to the target without passwords: %d created, %d already existed", created, plan.Existing)
+	if len(plan.New) > 0 {
+		msg += ". Set passwords for " + strings.Join(limitStrings(plan.New, 10), ", ") + " on the target (for example in the DigitalOcean control panel) before switching applications"
+	}
+	if len(failed) > 0 {
+		msg += fmt.Sprintf(". %d statement(s) could not be applied, first: %s", len(failed), failed[0])
+	}
+	return msg + ".", nil
+}
+
+// RoleStatements is the filtered role script for a non-superuser target admin.
+type RoleStatements struct {
+	Statements []string
+	New        []string // login roles that will be created without a password
+	Existing   int
+}
+
+// reservedRole reports roles owned by the platform or the server.
+func reservedRole(name, admin string) bool {
+	return name == admin || name == "postgres" || name == "doadmin" || strings.HasPrefix(name, "pg_") || strings.HasPrefix(name, "_")
+}
+
+var (
+	roleNameRe  = regexp.MustCompile(`^(?:CREATE|ALTER) ROLE ("(?:[^"]|"")+"|[^\s;]+)`)
+	grantRe     = regexp.MustCompile(`^GRANT ("(?:[^"]|"")+"|\S+) TO ("(?:[^"]|"")+"|\S+)`)
+	grantedByRe = regexp.MustCompile(` GRANTED BY ("(?:[^"]|"")+"|[^\s;]+)`)
+	privAttrRe  = regexp.MustCompile(`\b(SUPERUSER|REPLICATION|BYPASSRLS)\b`)
+)
+
+func unquoteIdent(s string) string {
+	if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) {
+		return strings.ReplaceAll(s[1:len(s)-1], `""`, `"`)
+	}
+	return s
+}
+
+// PlanRoleStatements turns pg_dumpall --roles-only output into statements a
+// non-superuser admin can run: platform roles and roles that already exist
+// are left alone, attributes only a superuser may grant are turned off, and
+// GRANTED BY clauses are dropped. Role-level settings are kept.
+func PlanRoleStatements(dump string, existing map[string]bool, admin string) RoleStatements {
+	var out RoleStatements
+	seenNew := map[string]bool{}
+	for _, raw := range strings.Split(dump, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "\\") || strings.HasPrefix(line, "SET ") {
+			continue
+		}
+		if m := roleNameRe.FindStringSubmatch(line); m != nil {
+			name := unquoteIdent(m[1])
+			if reservedRole(name, admin) {
+				continue
+			}
+			if strings.HasPrefix(line, "CREATE ROLE") {
+				if existing[name] {
+					out.Existing++
+					continue
+				}
+				seenNew[name] = true
+				out.Statements = append(out.Statements, line)
+				continue
+			}
+			if !seenNew[name] {
+				continue // never change a role that already existed on the target
+			}
+			line = privAttrRe.ReplaceAllStringFunc(line, func(a string) string { return "NO" + a })
+			if strings.Contains(line, " LOGIN") && !strings.Contains(line, "NOLOGIN") {
+				out.New = append(out.New, name)
+			}
+			out.Statements = append(out.Statements, line)
+			continue
+		}
+		if m := grantRe.FindStringSubmatch(line); m != nil {
+			role, member := unquoteIdent(m[1]), unquoteIdent(m[2])
+			if reservedRole(member, admin) || (reservedRole(role, admin) && !strings.HasPrefix(role, "pg_")) {
+				continue
+			}
+			out.Statements = append(out.Statements, grantedByRe.ReplaceAllString(line, ""))
+		}
+	}
+	return out
+}
+
+func firstWords(s string, n int) string {
+	f := strings.Fields(s)
+	if len(f) > n {
+		f = f[:n]
+	}
+	return strings.Join(f, " ")
+}
+
+func limitStrings(s []string, n int) []string {
+	if len(s) > n {
+		return append(s[:n:n], fmt.Sprintf("and %d more", len(s)-n))
+	}
+	return s
 }

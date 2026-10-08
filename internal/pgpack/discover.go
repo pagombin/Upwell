@@ -279,3 +279,53 @@ func SortDiscovered(ds []DiscoveredDB) {
 		return ds[i].SizeBytes > ds[j].SizeBytes
 	})
 }
+
+// EnsureExtensions creates, in the target database, every extension installed
+// in the source database (the engine runs with --skip-extensions, because a
+// non-superuser cannot restore extension objects). Each is created in the same
+// schema when that schema exists on the target; extensions whose schema does
+// not exist yet are reported, not guessed. It returns what it created.
+func EnsureExtensions(ctx context.Context, src, dst pg.Conn) (created, skipped []string, err error) {
+	sc, err := pg.Connect(ctx, src, 30*time.Second)
+	if err != nil {
+		return nil, nil, fmt.Errorf("source: %w", err)
+	}
+	defer sc.Close(ctx)
+	rows, err := sc.Query(ctx, `SELECT e.extname, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql' ORDER BY e.oid`)
+	if err != nil {
+		return nil, nil, err
+	}
+	type ext struct{ name, schema string }
+	var exts []ext
+	for rows.Next() {
+		var x ext
+		if rows.Scan(&x.name, &x.schema) == nil {
+			exts = append(exts, x)
+		}
+	}
+	rows.Close()
+	if len(exts) == 0 {
+		return nil, nil, nil
+	}
+	dc, err := pg.Connect(ctx, dst, 30*time.Second)
+	if err != nil {
+		return nil, nil, fmt.Errorf("target: %w", err)
+	}
+	defer dc.Close(ctx)
+	for _, x := range exts {
+		var present, schemaOK bool
+		_ = dc.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1), EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $2)`, x.name, x.schema).Scan(&present, &schemaOK)
+		if present {
+			continue
+		}
+		if !schemaOK {
+			skipped = append(skipped, fmt.Sprintf("%s (schema %s does not exist on the target yet)", x.name, x.schema))
+			continue
+		}
+		if _, err := dc.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS "+pg.QuoteIdent(x.name)+" SCHEMA "+pg.QuoteIdent(x.schema)); err != nil {
+			return created, skipped, fmt.Errorf("creating extension %s on the target: %w", x.name, err)
+		}
+		created = append(created, x.name)
+	}
+	return created, skipped, nil
+}

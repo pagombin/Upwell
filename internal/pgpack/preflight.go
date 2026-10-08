@@ -71,6 +71,7 @@ var Catalog = []check.Definition{
 	cd("primary", check.ScopeClusters, "Both endpoints are primaries", "hard"),
 	cd("connections", check.ScopeClusters, "Free connections", "acceptable"),
 	cd("throughput_sample", check.ScopeClusters, "Throughput estimate", "info"),
+	cd("apply_rate", check.ScopeDatabase, "Commit rate within the engine's apply rate", "warning"),
 	cd("cdc_throughput", check.ScopeClusters, "Source WAL rate against receive throughput", "warning"),
 	cd("wal_level", check.ScopeSource, "Logical decoding enabled", "hard"),
 	cd("repl_slots", check.ScopeSource, "Free replication slots", "hard"),
@@ -885,6 +886,25 @@ func (r *Runner) samplingChecks(ctx context.Context) {
 		secs = 60
 	}
 	var a, b string
+	// Commit rate per database, sampled over the same window (F11: the engine
+	// applies a limited number of transactions a second).
+	commits := func() map[string]int64 {
+		out := map[string]int64{}
+		rows, err := r.src.Query(ctx, `SELECT datname, xact_commit FROM pg_stat_database WHERE datname IS NOT NULL`)
+		if err != nil {
+			return out
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var n string
+			var c int64
+			if rows.Scan(&n, &c) == nil {
+				out[n] = c
+			}
+		}
+		return out
+	}
+	c0 := commits()
 	r.src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&a)
 	select {
 	case <-ctx.Done():
@@ -892,6 +912,7 @@ func (r *Runner) samplingChecks(ctx context.Context) {
 	case <-time.After(time.Duration(secs) * time.Second):
 	}
 	r.src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&b)
+	c1 := commits()
 	r.walRateBps = float64(pg.LSNDiff(b, a)) / float64(secs)
 	mibs := e.Settings.Float("assumed_throughput_mibs")
 	if mibs <= 0 {
@@ -908,6 +929,23 @@ func (r *Runner) samplingChecks(ctx context.Context) {
 			"Calibrate with a test migration on this droplet, or migrate during a quieter period.", ev, t)
 	} else {
 		ok(r, "cdc_throughput", "", "", fmt.Sprintf("The source writes %s of WAL per second, well within the assumed rate.", humanBytes(r.walRateBps)), ev, t)
+	}
+	// Transactions per second per database against the engine's apply rate.
+	t = time.Now()
+	applyTPS := e.Settings.Float("assumed_apply_tps")
+	if applyTPS <= 0 {
+		applyTPS = 5
+	}
+	for _, d := range e.Databases {
+		// Upwell's own sampling connections commit too; one a second is noise.
+		tps := float64(c1[d.Source]-c0[d.Source]) / float64(secs)
+		dev := map[string]any{"_commits_per_s": tps, "assumed_apply_tps": applyTPS, "_sample_seconds": secs}
+		if tps > applyTPS*0.8 {
+			r.emit("apply_rate", "", d.Source, check.Warning, false, fmt.Sprintf("This database commits %.1f transactions a second; pgcopydb 0.18 applied about %.0f a second in testing, so the target could fall further and further behind.", tps, applyTPS),
+				"Measure on this droplet with a test migration first (the In sync state and the cutover lag gate show whether it keeps up), or migrate during a quieter period.", dev, t)
+		} else {
+			ok(r, "apply_rate", "", d.Source, fmt.Sprintf("This database commits %.1f transactions a second, within the assumed apply rate of %.0f.", tps, applyTPS), dev, t)
+		}
 	}
 	t = time.Now()
 	var capStr string

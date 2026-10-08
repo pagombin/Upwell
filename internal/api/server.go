@@ -4,6 +4,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -200,6 +202,7 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			r = r.WithContext(context.WithValue(r.Context(), sessKey, sess))
 		}
 		key := r.Header.Get("Idempotency-Key")
+		var bodyHash string
 		if mutating && !rt.noIdem {
 			if key == "" {
 				writeErr(w, apiErr(400, "idempotency_key_required", "Every change needs an Idempotency-Key header so repeated submissions act once.", ""))
@@ -212,9 +215,19 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			lk, _ := idemLocks.LoadOrStore(key, &sync.Mutex{})
 			mu := lk.(*sync.Mutex)
 			mu.Lock()
+			// Hash the request body so a reused key with another request is refused.
+			reqBody, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+			r.Body = io.NopCloser(bytes.NewReader(reqBody))
+			sum := sha256.Sum256(append([]byte(r.Method+" "+r.URL.Path+"\n"), reqBody...))
+			bodyHash = hex.EncodeToString(sum[:])
 			var status int
-			var body string
-			err := s.Store.DB.QueryRowContext(r.Context(), `SELECT status, response FROM idempotency WHERE key=? AND method=? AND path=?`, key, r.Method, r.URL.Path).Scan(&status, &body)
+			var body, prevHash string
+			err := s.Store.DB.QueryRowContext(r.Context(), `SELECT status, response, body_hash FROM idempotency WHERE key=?`, key).Scan(&status, &body, &prevHash)
+			if err == nil && prevHash != "" && prevHash != bodyHash {
+				mu.Unlock()
+				writeErr(w, apiErr(422, "idempotency_key_reused", "This Idempotency-Key was already used for a different request.", "Send a new key for a new request."))
+				return
+			}
 			if err == nil {
 				mu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
@@ -232,8 +245,8 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			writeErr(cw, err)
 		}
 		if mutating && !rt.noIdem && cw.status < 500 && cw.status != 0 {
-			s.Store.DB.ExecContext(context.Background(), `INSERT OR IGNORE INTO idempotency(key,user_id,method,path,status,response,created_at) VALUES (?,?,?,?,?,?,?)`,
-				key, session(r).User.ID, r.Method, r.URL.Path, cw.status, cw.buf.String(), store.Now())
+			s.Store.DB.ExecContext(context.Background(), `INSERT OR IGNORE INTO idempotency(key,user_id,method,path,status,response,created_at,body_hash) VALUES (?,?,?,?,?,?,?,?)`,
+				key, session(r).User.ID, r.Method, r.URL.Path, cw.status, cw.buf.String(), store.Now(), bodyHash)
 		}
 		if !strings.Contains(rt.Path, "/stream/") {
 			lvl := "debug"

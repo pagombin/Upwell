@@ -621,3 +621,11 @@ func (o *Orchestrator) AckAlert(ctx context.Context, id, by, note string) error 
 	o.bus.Publish("alerts", "alert", "", map[string]any{"id": id, "state": "acknowledged"})
 	return nil
 }
+
+func humanDuration(s float64) string {
+	d := time.Duration(s * float64(time.Second)).Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%d s", int(d.Seconds()))
+	}
+	return d.String()
+}

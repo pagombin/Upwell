@@ -433,6 +433,15 @@ func (e *Env) waitFor(d time.Duration, what string, f func() bool) {
 func (e *Env) waitDBState(id, db string, d time.Duration, states ...string) orch.Database {
 	e.t.Helper()
 	var last orch.Database
+	defer func() {
+		if e.t.Failed() {
+			backlog := int64(-1)
+			if last.BacklogBytes != nil {
+				backlog = *last.BacklogBytes
+			}
+			e.t.Logf("%s last seen: state %s, backlog %d bytes, retries %d, error class %q, error %q", db, last.State, backlog, last.RetryCount, last.ErrorClass, last.LastError)
+		}
+	}()
 	e.waitFor(d, db+" to reach "+strings.Join(states, "/"), func() bool {
 		last = e.db(id, db)
 		for _, s := range states {
@@ -457,10 +466,18 @@ func (e *Env) waitOp(opID string, d time.Duration) *orch.Operation {
 
 func (e *Env) startCutover(id string) *orch.Operation {
 	e.t.Helper()
-	e.waitFor(3*time.Minute, "the readiness gate", func() bool {
-		var rd struct {
-			Ready bool `json:"ready"`
+	var rd struct {
+		Ready      bool             `json:"ready"`
+		Conditions []orch.Condition `json:"conditions"`
+	}
+	defer func() {
+		if e.t.Failed() {
+			for _, c := range rd.Conditions {
+				e.t.Logf("readiness %-9s ok=%v %s: %s", c.Key, c.OK, c.Label, c.Detail)
+			}
 		}
+	}()
+	e.waitFor(15*time.Minute, "the readiness gate", func() bool {
 		e.do("GET", "/api/v1/migrations/"+id+"/cutover/readiness", nil, &rd, 200)
 		return rd.Ready
 	})
@@ -468,7 +485,7 @@ func (e *Env) startCutover(id string) *orch.Operation {
 		OperationID string `json:"operation_id"`
 	}
 	e.do("POST", "/api/v1/migrations/"+id+"/cutover", map[string]any{"confirm_writers_stopped": true}, &r, 202)
-	return e.waitOp(r.OperationID, 6*time.Minute)
+	return e.waitOp(r.OperationID, 25*time.Minute)
 }
 
 func (e *Env) cleanup(id, name string) {

@@ -199,8 +199,8 @@ func TestIdempotentReplay(t *testing.T) {
 		t.Fatalf("migrations after 8 submissions with one key: %s", raw)
 	}
 	// A different body under a used key is refused rather than silently replayed.
-	if code, _, _ := c.req("POST", "/api/v1/migrations", "same-key", map[string]any{"name": "Other"}); code != 201 && code != 409 && code != 422 {
-		t.Fatalf("reused key with another body: %d", code)
+	if code, m, _ := c.req("POST", "/api/v1/migrations", "same-key", map[string]any{"name": "Other"}); code != 422 || m["code"] != "idempotency_key_reused" {
+		t.Fatalf("reused key with another body: %d %v", code, m)
 	}
 }
 
