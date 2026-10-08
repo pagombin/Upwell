@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -16,6 +17,9 @@ import (
 // numbers (finding F8 covers receive; this covers apply) and fails only if a
 // batch never arrives.
 func TestApplyThroughput(t *testing.T) {
+	if os.Getenv("UPWELL_MEASURE") == "" {
+		t.Skip("a measurement, not a check: run with UPWELL_MEASURE=1 (about 15 minutes)")
+	}
 	e := newEnv(t, "", orch.TestHooks{})
 	db := uniq("it_apply_rate")
 	seedDB(t, db, 1000)

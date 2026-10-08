@@ -103,8 +103,13 @@ func TestEdgeNoReplicaIdentity(t *testing.T) {
 	}
 	code := e.do("POST", "/api/v1/migrations/"+id+"/acceptances", map[string]any{"result_id": resultID, "reason": "testing the consequences of accepting this"}, nil)
 	if code >= 400 {
-		t.Logf("the risk cannot be accepted (%d): start refused, nothing can go wrong", code)
-		return
+		t.Logf("the risk cannot be accepted (%d)", code)
+		if c := e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil); c < 400 {
+			t.Fatalf("start was accepted (%d) with a table that would break the application's updates", c)
+		}
+		// The customer's fix: REPLICA IDENTITY FULL, then the migration runs and updates work.
+		exec1(t, srcConn, db, `ALTER TABLE nokey REPLICA IDENTITY FULL`)
+		e.preflight(id)
 	}
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
 	e.waitDBState(id, db, 3*time.Minute, orch.DInSync)
@@ -115,7 +120,10 @@ func TestEdgeNoReplicaIdentity(t *testing.T) {
 	}
 	_, upErr := conn.Exec(ctx, `UPDATE nokey SET b = 'y' WHERE a = 1`)
 	conn.Close(ctx)
-	t.Logf("UPDATE on the source table without a key while migrating: %v", upErr)
+	t.Logf("UPDATE on the source table while migrating: %v", upErr)
+	if upErr != nil {
+		t.Fatalf("the application's UPDATE failed on the source: %v", upErr)
+	}
 	exec1(t, srcConn, db, `INSERT INTO nokey VALUES (1000, 'inserted')`)
 	outcome(t, e, id, db)
 	e.cleanup(id, "Edge no identity")

@@ -226,6 +226,19 @@ func (e *Engine) Nudge(ctx context.Context, d engine.DatabaseSpec) error {
 		return err
 	}
 	defer c.Close(ctx)
+	// A real transaction in Upwell's heartbeat table decodes with every plugin.
+	// pgcopydb 0.18 cannot parse a logical decoding message under
+	// test_decoding and its receive process fails on it (F14), so the message
+	// is only a fallback for pgoutput when the heartbeat table is off.
+	var hb *string
+	_ = c.QueryRow(ctx, `SELECT to_regclass('upwell.heartbeat')::text`).Scan(&hb)
+	if hb != nil {
+		_, err = c.Exec(ctx, `INSERT INTO upwell.heartbeat(kind, token) VALUES ('nudge', 'drain')`)
+		return err
+	}
+	if d.Plugin == "test_decoding" {
+		return fmt.Errorf("no safe drain nudge for %s: the heartbeat table is off and pgcopydb cannot parse logical messages with test_decoding", d.Source)
+	}
 	_, err = c.Exec(ctx, `SELECT pg_logical_emit_message(true, 'upwell', 'drain nudge')`)
 	return err
 }

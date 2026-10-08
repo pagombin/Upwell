@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/logx"
@@ -38,6 +39,10 @@ type tailer struct {
 	offset        int64
 	inode         uint64
 	cls           classes
+	// since: lines the engine wrote before the current attempt started (the
+	// tail of a stopped run, read late) are indexed but never classified
+	// against the new attempt.
+	since time.Time
 }
 
 type tailers struct {
@@ -60,10 +65,11 @@ func (t *tailers) attach(migration, db, file string, attempt int) {
 		if tl.attempt != attempt {
 			tl.attempt = attempt
 			tl.cls = classes{}
+			tl.since = time.Now().Add(-2 * time.Second)
 		}
 		return
 	}
-	tl := &tailer{migration: migration, db: db, file: file, attempt: attempt}
+	tl := &tailer{migration: migration, db: db, file: file, attempt: attempt, since: time.Now().Add(-2 * time.Second)}
 	var inode int64
 	t.o.st.DB.QueryRow(`SELECT inode, offset FROM log_offsets WHERE file=?`, file).Scan(&inode, &tl.offset)
 	tl.inode = uint64(inode)
@@ -75,6 +81,7 @@ func (t *tailers) reset(migration, db string) {
 	defer t.mu.Unlock()
 	if tl, ok := t.m[key(migration, db)]; ok {
 		tl.cls = classes{}
+		tl.since = time.Now().Add(-2 * time.Second)
 	}
 }
 
@@ -131,8 +138,12 @@ func (t *tailers) read(tl *tailer) {
 		rec := eng.ParseLog(raw)
 		cls := eng.Classify(rec)
 		t.mu.Lock()
-		switch rec.Level {
-		case "error", "fatal":
+		// Only minutes-old lines are a stopped run's tail; anything hours off is a
+		// clock or time-zone difference and must still be classified.
+		stale := !rec.TS.IsZero() && rec.TS.Before(tl.since) && tl.since.Sub(rec.TS) < 30*time.Minute
+		switch {
+		case stale:
+		case rec.Level == "error" || rec.Level == "fatal":
 			tl.cls.errors++
 			tl.cls.lastError = rec.Msg
 			if strings.Contains(rec.Msg, "database is locked") {
@@ -141,10 +152,13 @@ func (t *tailers) read(tl *tailer) {
 			if rec.Level == "fatal" {
 				tl.cls.fatal = true
 			}
-		case "warn":
+		case rec.Level == "warn":
 			tl.cls.warnings++
 		}
-		if strings.Contains(rec.Msg, "Apply process has terminated") {
+		if stale {
+			cls = engine.FailNone
+		}
+		if !stale && strings.Contains(rec.Msg, "Apply process has terminated") {
 			tl.cls.applyGone = true
 		}
 		switch cls {

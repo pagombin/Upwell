@@ -67,3 +67,30 @@ If an engine unit ends without success before pgcopydb logs an error (for exampl
 
 ## D22. The tester's walkthrough is automated
 `web/e2e/flow.spec.ts` drives the README's test migration through the browser against the local clusters: the wizard from an empty form, a live connection test, preflight, start, In sync, stop and resume of the database, cutover to GO, verification, the report and cleanup. `dev/e2e.sh` runs it after the screen suite with the writer stopped. It found one real bug: a new migration's database list came back as JSON `null` and crashed the wizard; the API now never returns `null` for a list.
+
+## D23. Roles are copied without passwords, as a non-superuser can
+`pgcopydb copy roles` runs `pg_dumpall --roles-only`, which reads `pg_authid`, and only a superuser may read it: on DigitalOcean it always failed, so application roles were never created on the target and any `GRANT` to them in the schema could fail the restore. Upwell now dumps roles with `--no-role-passwords` (from `pg_roles`), skips platform and existing roles, turns off attributes only a superuser may grant (SUPERUSER, REPLICATION, BYPASSRLS), drops `GRANTED BY`, and applies the rest statement by statement. The event lists login roles created without a password; their passwords must be set on the target (for example in the DigitalOcean control panel) before applications switch.
+
+## D24. Extensions are created on the target before the engine starts
+The engine runs with `--skip-extensions` (a non-superuser cannot restore extension objects), and nothing created them, so a table using an extension type, function or operator (citext, hstore, pgcrypto, PostGIS) would fail its base copy. Upwell now creates every extension of the source database in the target database, in the same schema when it exists there, before launching the engine. Extension versions are the target's defaults.
+
+## D25. A reused Idempotency-Key with a different request is refused
+Keys now remember a hash of the method, path and body; the same key with a different request returns 422 `idempotency_key_reused` instead of replaying another request's answer (store migration 0002).
+
+## D26. Engine failures during streaming are detected from the log (F13)
+In the fidelity test a resumed engine hit pgcopydb's internal SQLite lock, logged a fatal error, and its apply process exited; pgcopydb's receive process ignores SIGTERM (F3), so the unit stayed active and the database showed In sync while nothing was applied for 15 minutes. The heartbeat gate turned that into NO-GO, so nothing was lost, but nothing recovered either. During streaming, a fatal engine line or an apply process that exits outside a cutover's end position now stops the unit and goes through the retry policy.
+
+## D27. One automatic restart from zero for pgcopydb's internal lock during the base copy (F12)
+pgcopydb's processes share a SQLite catalog; under load one of them intermittently fails with "database is locked" and the base copy fails. Because the copy had not finished, restarting it from zero is safe, so a database whose base copy failed this way restarts once automatically (under `auto_restart_base_copy_max_gb`); a second failure goes to Restart required.
+
+## D28. Readiness also checks lag in time, and preflight checks the commit rate (F11)
+pgcopydb 0.18 applied about 190 rows a second for a large transaction and about 5 transactions a second for small ones in the build container (TestApplyThroughput), while the target accepted 17,000 single-row inserts a second directly. A backlog under the byte threshold could therefore hide many minutes of apply time, and the database showed In sync while it was. The readiness gate now also requires each database's heartbeat lag to be under `cutover_max_lag_seconds` (180 s), so the write pause is bounded by how far behind the target really is, and preflight's new `apply_rate` check warns when a database commits more transactions a second than `assumed_apply_tps` (5, to be calibrated on a droplet).
+
+## D29. The migration lock is keyed on the full ID
+The API accepts a migration's full or short ID; the per-migration lock was keyed on whichever string the caller used, so an API client using the short ID was not mutually excluded with the supervisor. The lock now resolves the full ID first.
+
+## D30. The drain nudge is a heartbeat row, not a logical message (F14)
+With test_decoding, pgcopydb 0.18 cannot parse a logical decoding message and its receive process fails on it ("Failed to parse test_decoding message ... drain nudge"); Phase 0 had only proved the nudge with pgoutput. The nudge after setting end positions is now a one-row transaction in Upwell's own heartbeat table, which every plugin decodes; it falls after the end position, so it is never applied, and verification ignores the `upwell` schema (D12). The logical message remains only as the fallback for pgoutput when the heartbeat is off; with test_decoding and no heartbeat the nudge is refused with a clear message.
+
+## D31. Log lines from before an attempt are never classified against it
+The tailer resumes at its stored offset, so the last lines of a stopped run (for example "Apply process has terminated") could be read after the next attempt started and counted against it. Lines timestamped before the attempt began (by less than 30 minutes, so a clock or time-zone difference can never hide real errors) are now indexed but not classified. Stall detection (D26) also stays out of drains, where apply exiting at the end position is expected.

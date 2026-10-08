@@ -145,7 +145,9 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		// outside a cutover's end position, the unit can still look alive
 		// (receive ignores SIGTERM) while nothing is applied. Stop it and let
 		// the retry policy resume it.
-		if d.BaseCopyDone && (classes.fatal || classes.applyGone) && !classes.endposReached {
+		// Not during a drain: with an end position set, apply exiting is the
+		// expected end, and the drain step decides what it means.
+		if d.BaseCopyDone && d.EndPos == "" && d.State != DDraining && d.State != DDrained && (classes.fatal || classes.applyGone) && !classes.endposReached {
 			why := firstNonEmpty(classes.lastError, "the apply process exited")
 			o.Event(ctx, m.ID, d.SourceName, "engine_failed", "critical", fmt.Sprintf("%s: the engine stopped applying changes (%s) while parts of it kept running; stopping the unit and resuming", d.SourceName, why), nil)
 			o.mustStop(ctx, m, d, "engine stopped applying")

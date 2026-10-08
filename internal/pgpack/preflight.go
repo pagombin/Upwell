@@ -87,7 +87,7 @@ var Catalog = []check.Definition{
 	cd("repl_protocol", check.ScopeDatabase, "Replication connection", "hard"),
 	cd("read_privs", check.ScopeDatabase, "Read access to every table", "hard"),
 	cd("publication_privs", check.ScopeDatabase, "Decoding plugin", "hard"),
-	cd("replica_identity", check.ScopeDatabase, "Updates and deletes can replay", "acceptable"),
+	cd("replica_identity", check.ScopeDatabase, "Updates and deletes can replay", "hard"),
 	cd("large_objects", check.ScopeDatabase, "Large objects", "warning"),
 	cd("unlogged_tables", check.ScopeDatabase, "Unlogged tables", "warning"),
 	cd("materialized_views", check.ScopeDatabase, "Materialized views", "warning"),
@@ -595,8 +595,12 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')
 		ORDER BY 1 LIMIT 100`)
 	if len(noIdent) > 0 {
-		r.emit("replica_identity", "", d.Source, check.Blocker, false, fmt.Sprintf("%d table(s) have no primary key or replica identity, so UPDATE and DELETE on them cannot replay (for example %s).", len(noIdent), noIdent[0]),
-			"Add a primary key or set REPLICA IDENTITY FULL, or accept the risk if those tables are insert-only.", map[string]any{"tables": noIdent}, t)
+		// Hard: with the migration's publication in place, PostgreSQL refuses the
+		// application's own UPDATE and DELETE on these tables on the source
+		// ("cannot update table ... publishes updates"), so accepting this would
+		// break the customer's writes while the migration runs (tested).
+		r.emit("replica_identity", "", d.Source, check.Blocker, true, fmt.Sprintf("%d table(s) have no primary key or replica identity (for example %s). While the migration runs, the application's UPDATE and DELETE on them would fail with an error on the source, and they could not be replayed.", len(noIdent), noIdent[0]),
+			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent}, t)
 	} else {
 		ok(r, "replica_identity", "", d.Source, "Every table can replay updates and deletes.", map[string]any{"tables": []string{}}, t)
 	}
