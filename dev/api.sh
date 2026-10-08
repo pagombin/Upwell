@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Source me: small curl helpers for the dev server.
 # Usage: source dev/api.sh; up_login admin 'password...'; up GET /api/v1/migrations
 UP_BASE="${UP_BASE:-https://127.0.0.1:8443}"

@@ -4,7 +4,58 @@ Branch `overnight-build`. Status legend: **done**; **partial** (what is missing 
 
 ## Summary
 
-_Updated at the end of the night._
+Upwell is demo-ready for the end-to-end test. Everything below was verified in the build container against two local PostgreSQL 16 clusters that mimic the pair (a Standard-like source with a non-superuser `doadmin` with REPLICATION, an Advanced-like target with a non-superuser `doadmin` holding the F1 privileges and a `doadmin.aries_health` table). No DigitalOcean cluster or real credential was used.
+
+**What works**
+
+- **The whole online migration from the browser**, automated as a Playwright test (`web/e2e/flow.spec.ts`, about 2 minutes): define it in the wizard with a live connection test, preflight, start, watch it reach In sync, stop and resume a database, cut over to **GO**, read the verification and the report, clean up.
+- **The data-safety gate.** GO needs, per database, the final heartbeat on the target, the target origin at or past the heartbeat position, and a data comparison (schema, exact counts, checksums, sequences). S02 (missing privilege at start, privilege revoked mid-stream), S09 (last batch missing) and a checksum mismatch each end NO-GO or cannot start. A heartbeat that never arrives is an explicit NO-GO with a retry allowed.
+- **Recovery and faults** (integration tests): the engine killed during CDC resumes by itself; killed during the base copy goes to Restart required, then restart from zero reaches GO; the app killed during CDC reattaches to the running engines; a stale walsender is terminated after 15 s; double-submitted commands act once; an unlogged table and a verification mismatch end NO-GO; a name conflict on the target is a hard blocker; a simulated reboot resumes streaming databases and flags the one caught mid-copy.
+- **The UI**: every screen in the spec at 1440 and 1280 pixels in dark and light (140 screenshots in `docs/screenshots/`), with no overlapping text, no clipping without an ellipsis and tooltip, no horizontal scroll, no axe violations, loading/empty/error/stale states on every screen, CLS under 0.1 while metrics stream, no console errors or failed requests, every control reachable by keyboard with a visible focus ring, and actions hidden from roles that cannot use them.
+- **Three bug sweeps** (below): vet, staticcheck, golangci-lint, the race detector, tsc, ESLint, shellcheck, the integration suite (also under `-race`) and the e2e suite; every finding fixed.
+
+**Partial**
+
+- Write freeze, offline mode, the migration queue, DigitalOcean API discovery, notifications, the Prometheus endpoint, PDF reports, the support bundle, SSO and TOTP are stubs labelled "Coming soon".
+- Watched tables and saved log views are labelled "Coming soon".
+- Known engine limitations F2, F8 and F9 are guarded against, not fixed (README, "Known limitations").
+
+**Needs a droplet** (implemented to spec; the container has no systemd as PID 1 and no DigitalOcean access)
+
+- `deploy/install.sh` for real, and its idempotency (`--check` was verified here; the Go build it uses is reproducible, so a second run sees the binary unchanged).
+- `upwell.service` with the watchdog, `upwell-eng@.service`, the polkit rule, `upwell-health.timer`, Restart Upwell from the System screen, and systemd's reason in engine errors (D21).
+- A real reboot (simulated in-process here).
+- A real Advanced target: whether its `doadmin` has the F1 privileges is unverified; preflight and the connection test say so before anything is copied.
+- Receive throughput on a droplet (F8).
+
+**Exact commands**
+
+Install on a fresh Ubuntu 24.04 droplet:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/pagombin/Upwell.git && cd Upwell && git checkout overnight-build
+sudo bash deploy/install.sh          # prints the URL, the certificate fingerprint and the setup token
+sudo bash deploy/install.sh          # second run: "Everything is up to date; nothing changed."
+```
+
+Optional local test clusters on the droplet, and test data:
+
+```bash
+sudo apt-get install -y postgresql-16 && sudo bash spikes/env/local-clusters.sh up
+dev/demo-data.sh create 'postgresql://doadmin:spike-password-not-secret@127.0.0.1:55432/defaultdb' 200000
+dev/demo-data.sh write  'postgresql://doadmin:spike-password-not-secret@127.0.0.1:55432/defaultdb'   # Ctrl+C before the cutover
+```
+
+Then follow "Test migration, step by step" in the README.
+
+Developer test commands (as root, with the local clusters up):
+
+```bash
+go test ./...                                                  # unit and API tests
+go test -tags integration -timeout 60m ./test/integration/     # data-safety gate and fault scenarios
+dev/e2e.sh                                                     # Playwright: screens, states, keyboard, CLS, visual baseline, walkthrough
+```
 
 ## Checklist
 
@@ -64,6 +115,8 @@ _Updated at the end of the night._
 | Roles hide buttons (not disable) | done | e2e "viewer: action buttons are hidden" |
 | Dark and light themes, density toggle, UTC or local time | done | |
 | Coming-soon labels for every stubbed feature | done | |
+| Playwright checks: screenshots at 1440x900 and 1280x800 in both themes; overlap, clipping, horizontal scroll, axe (WCAG 2.1 AA and the other rules); stress content; loading, empty, error and stale states; CLS under 0.1 while metrics stream; no console errors or failed requests; keyboard reachability with visible focus; visual regression baseline | done | `dev/e2e.sh`, 229 tests; baseline in `web/e2e/__visual__` |
+| The tester's walkthrough through the browser (wizard to cleanup, GO) | done | `web/e2e/flow.spec.ts` |
 
 ### Install and operations
 

@@ -18,7 +18,7 @@ PASS="${UPWELL_SPIKE_PASSWORD:-spike-password-not-secret}"
 as_pg() { runuser -u postgres -- "$@"; }
 
 init_cluster() { # name port
-  local name=$1 port=$2 dir="$ROOT/$1"
+  local port=$2 dir="$ROOT/$1"
   install -d -o postgres -g postgres "$ROOT"
   if [[ -f "$dir/PG_VERSION" ]]; then return; fi
   install -d -o postgres -g postgres "$dir"
