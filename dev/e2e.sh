@@ -80,7 +80,7 @@ if [[ $REUSE -eq 1 && -f $DATA/e2e.env ]] && curl -sk $BASE/readyz | grep -q '"o
   log "Reusing the running server (migration $E2E_MIG)"
   cd web
   set +e
-  npx playwright test $UPDATE "${PWARGS[@]}"
+  npx playwright test --project=ui $UPDATE "${PWARGS[@]}"
   RC=$?
   echo "playwright exit $RC"
   exit $RC
@@ -141,6 +141,14 @@ CREATE INDEX ON orders(customer);
 ANALYZE orders, items;
 SQL
 
+log "Source database e2e_flow for the browser walkthrough"
+psql_su $SRC_PORT postgres -c "DROP DATABASE IF EXISTS e2e_flow WITH (FORCE)" -c "CREATE DATABASE e2e_flow OWNER doadmin"
+psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS e2e_flow WITH (FORCE)"
+psql_do $SRC_PORT e2e_flow <<'SQL'
+CREATE TABLE orders(id bigserial PRIMARY KEY, customer int NOT NULL, amount numeric(12,2), note text);
+INSERT INTO orders(customer, amount, note) SELECT g%1000, (g%9999)/100.0, md5(g::text) FROM generate_series(1,50000) g;
+SQL
+
 conn() { echo "{\"host\":\"127.0.0.1\",\"port\":$1,\"user\":\"doadmin\",\"password\":\"spike-password-not-secret\",\"dbname\":\"defaultdb\",\"sslmode\":\"disable\",\"storage_gb\":20}"; }
 perm='{"customer":"Example Customer","account_id":"acct-0001","ticket":"SUP-1234","granted_by":"Jamie Customer","granted_at":"2026-10-07","scope":"Copy e2e_shop to the target and cut over."}'
 
@@ -197,8 +205,16 @@ printf 'export E2E_BASE=%s E2E_PASSWORD=%s E2E_MIG=%s E2E_DRAFT=%s E2E_DB=%s\n' 
 log "Playwright (running migration $SHORT, draft $DSHORT)"
 cd web
 set +e
-npx playwright test $UPDATE "${PWARGS[@]}"
+npx playwright test --project=ui $UPDATE "${PWARGS[@]}"
 RC=$?
+if [[ ${#PWARGS[@]} -eq 0 ]]; then
+  log "Browser walkthrough (writer stopped)"
+  [[ -n "${WRITER:-}" ]] && kill "$WRITER" 2>/dev/null
+  WRITER=""
+  npx playwright test --project=flow
+  RC2=$?
+  [[ $RC -eq 0 ]] && RC=$RC2
+fi
 set -e
 echo "playwright exit $RC"
 exit $RC

@@ -36,7 +36,7 @@ export function NewMigrationScreen() {
   if (m && m.flags.started) {
     return <div className="page"><Empty title="This migration has started" action={<Link className="btn" to={`/migrations/${m.short_id}`}>Open its overview</Link>}>Its definition is frozen once it starts.</Empty></div>;
   }
-  const max = !v ? 0 : !v.permission ? 0 : !v.source ? 1 : !v.target ? 2 : v.databases.length === 0 ? 3 : 6;
+  const max = !v ? 0 : !v.permission ? 0 : !v.source ? 1 : !v.target ? 2 : !v.databases?.length ? 3 : 6;
   return (
     <div className="page">
       <div className="pagehead">
@@ -167,14 +167,14 @@ function StepConnection({ v, kind, onDone }: { v: MigrationView; kind: "source" 
 }
 
 function StepDatabases({ v, onDone }: { v: MigrationView; onDone: () => void }) {
-  const [rows, setRows] = useState<Database[]>(v.databases);
+  const [rows, setRows] = useState<Database[]>(v.databases || []);
   const [err, setErr] = useState<ApiError>();
   const [busy, setBusy] = useState<string>();
   const discover = async () => {
     setBusy("discover"); setErr(undefined);
     try { setRows(await api.post<Database[]>(`/api/v1/migrations/${v.migration.id}/discover`)); } catch (e) { setErr(e as ApiError); } finally { setBusy(undefined); }
   };
-  useEffect(() => { if (v.databases.length === 0) discover(); /* first visit */ // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (!v.databases?.length) discover(); /* first visit */ // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const save = async () => {
     setBusy("save"); setErr(undefined);

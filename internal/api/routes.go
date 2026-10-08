@@ -416,6 +416,9 @@ func (s *Server) listMigrations(w http.ResponseWriter, r *http.Request) error {
 }
 
 func migrationView(m orch.Migration, dbs []orch.Database) map[string]any {
+	if dbs == nil {
+		dbs = []orch.Database{}
+	}
 	inc := 0
 	var total, done float64
 	counts := map[string]int{}
@@ -554,6 +557,9 @@ func (s *Server) discover(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if dbs == nil {
+		dbs = []orch.Database{}
+	}
 	return writeJSON(w, 200, dbs)
 }
 
@@ -565,6 +571,9 @@ func (s *Server) putDatabases(w http.ResponseWriter, r *http.Request) error {
 	dbs, err := s.Orch.SetDatabases(r.Context(), actor(r), r.PathValue("id"), in)
 	if err != nil {
 		return err
+	}
+	if dbs == nil {
+		dbs = []orch.Database{}
 	}
 	return writeJSON(w, 200, dbs)
 }
