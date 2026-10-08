@@ -93,3 +93,15 @@ DigitalOcean API discovery, notifications, Prometheus endpoint, PDF reports, sup
 | Integration suite (`go test -tags integration`) | 12 of 14 passed | **bug:** the engine's main process dying during the base copy took the transient path and retried a resume that can never work; now Restart required. **bug:** a failed automatic resume retried every 30 s forever; it now follows the backoff and hourly cap. The stale-walsender test held the slot as a superuser (doadmin correctly cannot terminate it) and `pg_recvlogical` reconnected by itself; the test now behaves like a real stale walsender. The slot-holder error printed a pointer. |
 | Playwright e2e (`dev/e2e.sh`) | 147 of 229 passed on the first full run | missing landmark on sign-in and setup, empty table headers, dialog `<header>` counted as a second banner, the stress table scrolled horizontally at 1280 (tables now hide optional columns first), state tests matched short IDs while the app used full IDs, a spurious heartbeat alert on idle databases (D19); then 229 of 229 |
 | Fault scenarios | SIGKILL main during CDC: pass. SIGKILL during base copy: fixed, pass. App killed during CDC: pass (engines reattached, not restarted). Stale walsender: pass (released after 15 s). Double-submitted commands: pass (one effect, identical replays; a second cutover refused). Verification mismatch: NO-GO. Unlogged table with the default plugin: preflight warns, cutover NO-GO. Name conflict on the target: hard blocker, start refused. Simulated reboot: pass. | |
+
+### Sweep 2 (about 04:00 to 05:00 UTC)
+
+| Tool | Result | Fixed |
+| --- | --- | --- |
+| `go vet`, `staticcheck`, `golangci-lint` | clean, 0 issues | |
+| `go test -race ./internal/...` (now including the API tests) | pass | |
+| `tsc --noEmit`, ESLint | clean | |
+| Integration suite under the race detector (`go test -race -tags integration`, 15 tests, 21 minutes) | 15 of 15 passed, no data races | |
+| New: browser walkthrough (`web/e2e/flow.spec.ts`) | failed, then passed (2 minutes) | **bug:** a new migration's database list was JSON `null`, which crashed the wizard's database step; the API now never returns `null` for a list (D22) |
+| Review of screenshots | | fixture migrations showed action buttons the backend refuses (now hidden with a note); a NO-GO listed the failed database below the passing one (failed first now); an engine unit failing before pgcopydb logs anything now reports systemd's reason (D21) |
+
