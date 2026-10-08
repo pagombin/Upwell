@@ -126,6 +126,11 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 			o.setDB(ctx, d.ID, map[string]any{"state": DDegraded})
 			o.mustStop(ctx, m, d, "degraded")
 			o.endAttempt(ctx, d, nil, "degraded: main process died")
+			if !d.BaseCopyDone {
+				// A base copy cannot be resumed consistently: restart required.
+				o.afterExit(ctx, m, d, engine.FailBaseCopy, "the engine's main process died during the base copy")
+				return
+			}
 			o.afterExit(ctx, m, d, engine.FailTransient, "the engine's main process died")
 			return
 		}
@@ -289,9 +294,14 @@ func (o *Orchestrator) retries(ctx context.Context, m Migration) {
 	for _, d := range included(dbs) {
 		if d.State == DStopped && d.NextRetryAt != nil && *d.NextRetryAt <= now {
 			if err := o.resumeDB(ctx, m, d, "automatic resume"); err != nil {
-				next := now + 30000
-				o.setDB(ctx, d.ID, map[string]any{"next_retry_at": next, "last_error": "automatic resume failed: " + err.Error()})
 				o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "automatic resume failed: %v", err)
+				// A failed resume goes through the same policy as a failed run:
+				// backoff and the hourly cap, or Restart required during the base copy.
+				cls := engine.FailTransient
+				if !d.BaseCopyDone {
+					cls = engine.FailBaseCopy
+				}
+				o.afterExit(ctx, m, d, cls, "automatic resume failed: "+err.Error())
 			}
 		}
 	}

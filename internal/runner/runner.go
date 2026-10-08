@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -76,12 +77,23 @@ func WriteEnvFile(s Spec) (string, error) {
 		}
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "UPWELL_ENGINE_ARGS=%s\n", strings.Join(s.Args, " "))
-	for k, v := range s.Env {
-		fmt.Fprintf(&b, "%s=%s\n", k, v)
+	fmt.Fprintf(&b, "UPWELL_ENGINE_ARGS=%s\n", envQuote(strings.Join(s.Args, " ")))
+	keys := make([]string, 0, len(s.Env))
+	for k := range s.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s=%s\n", k, envQuote(s.Env[k]))
 	}
 	p := filepath.Join(s.RunDir, "engine.env")
 	return p, os.WriteFile(p, []byte(b.String()), 0o600)
+}
+
+// envQuote double-quotes a value for a systemd EnvironmentFile, where
+// backslash and double quote are the only characters escaped inside quotes.
+func envQuote(v string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v) + `"`
 }
 
 // Systemd runs instances of upwell-eng@.service.

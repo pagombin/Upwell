@@ -5,6 +5,7 @@ package integration
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pagombin/upwell/internal/orch"
+	"github.com/pagombin/upwell/internal/store"
 )
 
 type dbDetail struct {
@@ -160,14 +162,18 @@ func TestFaultStaleWalsender(t *testing.T) {
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
 	d := e.waitDBState(id, a, 3*time.Minute, orch.DInSync)
 	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+a+"/stop", nil, nil, 200)
-	// Hold the slot with a foreign walsender.
-	cmd := exec.Command("runuser", "-u", "postgres", "--", "pg_recvlogical", "-h", sockDir, "-p", strconv.Itoa(srcPort), "-d", a, "--slot", d.SlotName, "--start", "-f", "/dev/null", "-o", "proto_version=1", "-o", "publication_names="+d.SlotName)
-	if d.Plugin == "test_decoding" {
-		cmd = exec.Command("runuser", "-u", "postgres", "--", "pg_recvlogical", "-h", sockDir, "-p", strconv.Itoa(srcPort), "-d", a, "--slot", d.SlotName, "--start", "-f", "/dev/null")
+	// Hold the slot with a foreign walsender owned by the same admin user, as
+	// a leftover engine process would.
+	args := []string{"-h", "127.0.0.1", "-p", strconv.Itoa(srcPort), "-U", "doadmin", "-d", a, "--slot", d.SlotName, "--start", "-f", "/dev/null"}
+	if d.Plugin != "test_decoding" {
+		args = append(args, "-o", "proto_version=1", "-o", "publication_names="+d.SlotName)
 	}
+	cmd := exec.Command("pg_recvlogical", args...)
+	cmd.Env = append(cmd.Environ(), "PGPASSWORD="+password)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	e.waitFor(20*time.Second, "the foreign walsender to hold the slot", func() bool {
@@ -339,4 +345,57 @@ func TestRBAC(t *testing.T) {
 	if code := e.doKey("POST", "/api/v1/migrations", "", map[string]any{"name": "x"}, nil); code != 400 {
 		t.Errorf("missing idempotency key: %d, want 400", code)
 	}
+}
+
+// TestFaultReboot simulates a droplet reboot: the app stops, every engine
+// process dies, and the boot ID changes. On start, the streaming database
+// resumes by itself (auto_resume_after_reboot) and one caught in its base copy
+// goes to Restart required.
+func TestFaultReboot(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	a, b := uniq("it_reboot_a"), uniq("it_reboot_b")
+	seedDB(t, a, 10000)
+	seedDB(t, b, 2000000)
+	id := e.defineMigration("Reboot", []string{a, b}, nil)
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	e.waitDBState(id, a, 3*time.Minute, orch.DInSync)
+	bState := e.db(id, b).State
+	pids := []int{e.mainPID(id, a)}
+	if bState == orch.DBaseCopy {
+		pids = append(pids, e.mainPID(id, b))
+	}
+	dir := e.Dir
+	e.Close()
+	for _, p := range pids {
+		syscall.Kill(-p, syscall.SIGKILL) // the local runner starts each engine in its own process group
+		syscall.Kill(p, syscall.SIGKILL)
+	}
+	time.Sleep(2 * time.Second)
+	st, err := store.Open(filepath.Join(dir, "data", "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.DB.Exec(`UPDATE settings SET value='"00000000-0000-0000-0000-000000000000"' WHERE key='_boot_id'`)
+	st.Close()
+	e2 := newEnv(t, dir, orch.TestHooks{})
+	defer func() {
+		if e2.migration(id).Migration.Flags.Verdict == "" {
+			e2.abortAndClean(id, "Reboot")
+		}
+	}()
+	if !e2.Orch.Rebooted {
+		t.Fatal("the reboot was not detected")
+	}
+	e2.waitDBState(id, a, 3*time.Minute, orch.DInSync)
+	if bState == orch.DBaseCopy {
+		d := e2.waitDBState(id, b, time.Minute, orch.DRestartRequired)
+		t.Logf("%s after reboot: %s (%s)", b, d.State, d.LastError)
+		e2.do("POST", "/api/v1/migrations/"+id+"/databases/"+b+"/restart", map[string]any{"confirm": b}, nil, 200)
+	} else {
+		t.Logf("%s finished its base copy before the simulated reboot (%s); only the streaming path was exercised", b, bState)
+	}
+	e2.waitDBState(id, b, 6*time.Minute, orch.DInSync)
+	e2.mustGO(id)
+	e2.cleanup(id, "Reboot")
 }

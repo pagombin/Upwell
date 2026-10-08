@@ -278,7 +278,11 @@ func ReleaseSlot(ctx context.Context, c pg.Conn, slot string, terminateAfter, gi
 			terminated = true
 		}
 		if time.Since(start) > giveUp {
-			return false, terminated, fmt.Errorf("replication slot %s is still held by process %v after %s", slot, pid, giveUp)
+			holder := "an unknown process"
+			if pid != nil {
+				holder = fmt.Sprintf("process %d", *pid)
+			}
+			return false, terminated, fmt.Errorf("replication slot %s is still held by %s after %s", slot, holder, giveUp)
 		}
 		select {
 		case <-ctx.Done():

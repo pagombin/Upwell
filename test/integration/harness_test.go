@@ -481,6 +481,7 @@ func (e *Env) cleanup(id, name string) {
 	if op.State != "done" {
 		e.t.Fatalf("cleanup failed: %s", op.Error)
 	}
+	noLeftovers(e.t, e.migration(id).Migration.ShortID)
 }
 
 func (e *Env) abortAndClean(id, name string) {

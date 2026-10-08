@@ -115,6 +115,8 @@ fi
 # ---------- packages
 
 PKGS=(curl ca-certificates gnupg ufw chrony jq openssl)
+# polkit lets the upwell user start and stop its engine units (the rule below).
+if apt-cache show polkitd >/dev/null 2>&1; then PKGS+=(polkitd); else PKGS+=(policykit-1); fi
 missing=()
 for p in "${PKGS[@]}"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || missing+=("$p"); done
 if [[ ${#missing[@]} -eq 0 ]]; then say "os packages" "unchanged"
@@ -148,7 +150,12 @@ fi
 
 # ---------- pgcopydb (pinned)
 
-pgcopydb_version() { /usr/local/bin/pgcopydb --version 2>/dev/null | grep -oE 'pgcopydb version [0-9.]+' | awk '{print $3}' || command -v pgcopydb >/dev/null && pgcopydb --version 2>/dev/null | grep -oE 'pgcopydb version [0-9.]+' | awk '{print $3}'; }
+pgcopydb_version() {
+  local b
+  b=$(command -v /usr/local/bin/pgcopydb || command -v pgcopydb || true)
+  [[ -n $b ]] || return 0
+  "$b" --version 2>&1 | grep -oE 'pgcopydb version [0-9.]+' | awk '{print $3}' | head -1
+}
 vge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
 cur=$(pgcopydb_version || true)
 if [[ -n $cur ]] && vge "$cur" "$PGCOPYDB_PIN"; then say "pgcopydb" "unchanged ($cur)"
