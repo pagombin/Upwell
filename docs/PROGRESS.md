@@ -80,4 +80,16 @@ DigitalOcean API discovery, notifications, Prometheus endpoint, PDF reports, sup
 
 ## Bug sweeps
 
-_Recorded below as they run._
+### Sweep 1 (2026-10-08, about 03:00 to 04:00 UTC)
+
+| Tool | Result | Fixed |
+| --- | --- | --- |
+| `go vet ./...` (and `-tags integration`) | clean | |
+| `staticcheck ./...` (2025.1.1) | 3 findings | an unused helper exposed that the catalog's `client_version` check never ran: now implemented (hard blocker when pg_dump/pg_restore are older than the source); a dead store in discovery |
+| `golangci-lint run` (v2.1.6) | 425 errcheck, 1 ineffassign, 7 style | errcheck policy in `.golangci.yml` (D18); six real ones handled (stopping an engine the supervisor decided to stop, the disk guard, the drain nudge, the cleanup password file, the automatic restart's target reset, a resume's stop); state writes log their failures; now 0 issues |
+| `go test -race ./internal/...` | pass | |
+| TypeScript (`tsc --noEmit`, `verbatimModuleSyntax`) | 1 class of error | type-only imports compiled as runtime imports broke Playwright; fixed across the UI and enforced |
+| ESLint (`--max-warnings 0`) | clean | |
+| Integration suite (`go test -tags integration`) | 12 of 14 passed | **bug:** the engine's main process dying during the base copy took the transient path and retried a resume that can never work; now Restart required. **bug:** a failed automatic resume retried every 30 s forever; it now follows the backoff and hourly cap. The stale-walsender test held the slot as a superuser (doadmin correctly cannot terminate it) and `pg_recvlogical` reconnected by itself; the test now behaves like a real stale walsender. The slot-holder error printed a pointer. |
+| Playwright e2e (`dev/e2e.sh`) | 147 of 229 passed on the first full run | missing landmark on sign-in and setup, empty table headers, dialog `<header>` counted as a second banner, the stress table scrolled horizontally at 1280 (tables now hide optional columns first), state tests matched short IDs while the app used full IDs, a spurious heartbeat alert on idle databases (D19); then 229 of 229 |
+| Fault scenarios | SIGKILL main during CDC: pass. SIGKILL during base copy: fixed, pass. App killed during CDC: pass (engines reattached, not restarted). Stale walsender: pass (released after 15 s). Double-submitted commands: pass (one effect, identical replays; a second cutover refused). Verification mismatch: NO-GO. Unlogged table with the default plugin: preflight warns, cutover NO-GO. Name conflict on the target: hard blocker, start refused. Simulated reboot: pass. | |

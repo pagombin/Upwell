@@ -164,7 +164,7 @@ func TestFaultStaleWalsender(t *testing.T) {
 	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+a+"/stop", nil, nil, 200)
 	// Hold the slot with a foreign walsender owned by the same admin user, as
 	// a leftover engine process would.
-	args := []string{"-h", "127.0.0.1", "-p", strconv.Itoa(srcPort), "-U", "doadmin", "-d", a, "--slot", d.SlotName, "--start", "-f", "/dev/null"}
+	args := []string{"-h", "127.0.0.1", "-p", strconv.Itoa(srcPort), "-U", "doadmin", "-d", a, "--slot", d.SlotName, "--start", "--no-loop", "-f", "/dev/null"}
 	if d.Plugin != "test_decoding" {
 		args = append(args, "-o", "proto_version=1", "-o", "publication_names="+d.SlotName)
 	}
