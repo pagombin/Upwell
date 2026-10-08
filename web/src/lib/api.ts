@@ -11,6 +11,9 @@ export class ApiError extends Error {
   }
 }
 
+// Connection health: when requests keep failing, every screen shows how old its data is.
+export const health = { lastOk: Date.now(), lastFail: 0 };
+
 let csrf = "";
 export function setCsrf(t: string) { csrf = t; }
 let onUnauthenticated: () => void = () => {};
@@ -32,6 +35,7 @@ async function request<T>(method: string, path: string, body?: unknown, key?: st
   try {
     res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
   } catch {
+    health.lastFail = Date.now();
     throw new ApiError(0, "network", "Upwell is not reachable. Check that the service is running and your network connection.");
   }
   const text = await res.text();
@@ -39,6 +43,8 @@ async function request<T>(method: string, path: string, body?: unknown, key?: st
   if (text) {
     try { data = JSON.parse(text); } catch { data = text; }
   }
+  if (res.status >= 500) health.lastFail = Date.now();
+  else health.lastOk = Date.now();
   if (!res.ok) {
     if (res.status === 401 && path !== "/api/v1/auth/login") onUnauthenticated();
     const d = data && typeof data === "object" ? data : {};

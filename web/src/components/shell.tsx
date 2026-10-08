@@ -1,7 +1,7 @@
-import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, useLocation, useMatch, useNavigate } from "react-router-dom";
-import { api } from "../lib/api";
-import { useApi, useStream } from "../lib/hooks";
+import { api, health } from "../lib/api";
+import { useApi, useNow, useStream } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { Alert, MigrationView } from "../lib/types";
 import { Dialog, Icon, Trunc, useToast } from "./ui";
@@ -56,6 +56,8 @@ export function Shell({ children }: { children: ReactNode }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+  const now = useNow(5000);
+  const stale = health.lastFail > health.lastOk && now - health.lastOk > 30000;
   const firing = (alerts.data || []).filter((a) => a.state === "firing");
   const critical = firing.filter((a) => a.severity === "critical");
   const logout = async () => {
@@ -109,7 +111,12 @@ export function Shell({ children }: { children: ReactNode }) {
             <Link to="/alerts" style={{ color: "inherit" }}>Open alerts</Link>
           </div>
         )}
-        {children}
+        {stale && (
+          <div className="banner warn" role="status" data-testid="stale-banner">
+            <span style={{ flex: 1 }}>Upwell is not answering. What you see was last updated {Math.round((now - health.lastOk) / 1000)} s ago and may be out of date; it refreshes by itself when the connection returns.</span>
+          </div>
+        )}
+        <div className={stale ? "stale" : undefined}>{children}</div>
       </main>
       {palette && <Palette onClose={() => setPalette(false)} migrations={active} current={current} onLogout={logout} />}
       {pw && <PasswordDialog onClose={() => setPw(false)} onDone={() => toast("ok", "Password changed")} />}

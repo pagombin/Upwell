@@ -25,6 +25,7 @@ export function LogViewer({ filter, height = 420, live = true, label = "Logs" }:
   const [paused, setPaused] = useState(false);
   const [scrollTop, setScrollTop] = useState(0);
   const [open, setOpen] = useState<LogRecord | null>(null);
+  const [hl, setHl] = useState(-1);
   const box = useRef<HTMLDivElement>(null);
   const key = qs(filter);
   const pending = useRef<LogRecord[]>([]);
@@ -73,6 +74,25 @@ export function LogViewer({ filter, height = 420, live = true, label = "Logs" }:
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < ROW * 2;
     if (atBottom !== follow) setFollow(atBottom);
   };
+  // Keyboard: arrows move the highlighted line, Enter opens it, End follows.
+  const onKey = (e: React.KeyboardEvent) => {
+    if (!rows.length) return;
+    let n = hl;
+    if (e.key === "ArrowDown") n = Math.min(rows.length - 1, (hl < 0 ? Math.floor(scrollTop / ROW) : hl) + 1);
+    else if (e.key === "ArrowUp") n = Math.max(0, (hl < 0 ? Math.floor(scrollTop / ROW) + Math.floor(height / ROW) : hl) - 1);
+    else if (e.key === "Home") n = 0;
+    else if (e.key === "End") { setHl(-1); setFollow(true); e.preventDefault(); return; }
+    else if (e.key === "Enter" && hl >= 0) { setOpen(rows[hl]); e.preventDefault(); return; }
+    else return;
+    e.preventDefault();
+    setHl(n);
+    setFollow(false);
+    const el = box.current;
+    if (el) {
+      if (n * ROW < el.scrollTop) el.scrollTop = n * ROW;
+      else if ((n + 1) * ROW > el.scrollTop + el.clientHeight) el.scrollTop = (n + 1) * ROW - el.clientHeight;
+    }
+  };
   const first = Math.max(0, Math.floor(scrollTop / ROW) - 10);
   const visible = Math.ceil(height / ROW) + 20;
   const slice = useMemo(() => rows.slice(first, first + visible), [rows, first, visible]);
@@ -88,14 +108,14 @@ export function LogViewer({ filter, height = 420, live = true, label = "Logs" }:
         <a className="btn" href={`/api/v1/logs?${qs(filter, { format: "download", limit: 5000 })}`} download>Download</a>
       </div>
       {error ? <ErrorState error={error} /> : loading ? <Skeleton lines={6} /> : (
-        <div className="logview" ref={box} style={{ height }} onScroll={onScroll} role="log" aria-label={label} tabIndex={0}>
+        <div className="logview" ref={box} style={{ height }} onScroll={onScroll} onKeyDown={onKey} role="log" aria-label={`${label}. Use the arrow keys to move between lines and Enter to open one.`} tabIndex={0}>
           {rows.length === 0 ? (
             <div className="empty" style={{ margin: 12 }}><h3>No log lines match</h3><p>Lines appear here as soon as Upwell or the engine writes them. Widen the level or clear the search.</p></div>
           ) : (
             <div style={{ height: rows.length * ROW, position: "relative" }}>
               {slice.map((r, i) => (
-                <div key={(r.seq || 0) + ":" + (first + i)} className={`logrow ${r.level}`} style={{ position: "absolute", top: (first + i) * ROW, left: 0, right: 0 }}
-                  onClick={() => setOpen(r)} onKeyDown={(e) => { if (e.key === "Enter") setOpen(r); }} tabIndex={-1} role="button" aria-label={`${r.level} ${r.msg}`}>
+                <div key={(r.seq || 0) + ":" + (first + i)} id={`logline-${first + i}`} className={`logrow ${r.level}${first + i === hl ? " hl" : ""}`} style={{ position: "absolute", top: (first + i) * ROW, left: 0, right: 0 }}
+                  onClick={() => { setHl(first + i); setOpen(r); }}>
                   <span className="faint" title={time(r.ts)}>{time(r.ts, false).replace(/ \S+$/, "")}</span>
                   <span className={`lv-${r.level}`}>{r.level}</span>
                   <span className="muted" title={r.component}>{r.component}</span>

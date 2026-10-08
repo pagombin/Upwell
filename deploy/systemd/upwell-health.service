@@ -1,0 +1,8 @@
+[Unit]
+Description=Upwell liveness check
+After=upwell.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'curl -fsk --max-time 10 "https://127.0.0.1:${UPWELL_PORT:-443}/healthz" >/dev/null || { echo "upwell /healthz failed" >&2; exit 1; }'
+EnvironmentFile=-/etc/upwell/health.env

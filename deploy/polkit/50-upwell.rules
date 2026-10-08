@@ -1,0 +1,16 @@
+// Upwell (PC1): the upwell user may start, stop, restart and reset-failed
+// instances of the upwell-eng@ template unit, and nothing else. A rule over
+// transient units would let the user run any command as root, because polkit
+// cannot inspect a transient unit's properties.
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" || subject.user !== "upwell") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (unit && /^upwell-eng@[A-Za-z0-9_.-]+\.service$/.test(unit) &&
+        (verb === "start" || verb === "stop" || verb === "restart" || verb === "reset-failed")) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

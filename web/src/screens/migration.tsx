@@ -3,7 +3,7 @@ import { Link, NavLink, Outlet, useNavigate, useParams } from "react-router-dom"
 import { api } from "../lib/api";
 import { copyEtaMs, dbCopyFraction, lifecycleIndex, overallProgress, rateFrom, readyForCutover } from "../lib/derive";
 import { ago, bytes, count, duration, pct, rate, time } from "../lib/format";
-import { Loaded, useApi, useNow, useStream } from "../lib/hooks";
+import { type Loaded, useApi, useNow, useStream } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { Alert, EventRow, MigrationView, Series } from "../lib/types";
 import { Sparkline } from "../components/charts";

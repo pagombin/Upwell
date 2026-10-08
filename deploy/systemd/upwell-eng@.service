@@ -1,0 +1,28 @@
+# One instance per database being migrated (PC1). The app writes
+# /var/lib/upwell/runs/%i/engine.env and starts upwell-eng@%i.service through
+# the polkit rule in /etc/polkit-1/rules.d/50-upwell.rules.
+[Unit]
+Description=Upwell engine %i
+After=network-online.target
+
+[Service]
+Type=simple
+User=upwell
+Group=upwell
+WorkingDirectory=/var/lib/upwell/runs/%i
+EnvironmentFile=/var/lib/upwell/runs/%i/engine.env
+ExecStart=/usr/local/bin/pgcopydb $UPWELL_ENGINE_ARGS
+StandardOutput=append:/var/lib/upwell/runs/%i/engine.log
+StandardError=append:/var/lib/upwell/runs/%i/engine.log
+# Stop: SIGTERM to every process in the cgroup, SIGKILL to all 10 s later (PC2).
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=10
+SendSIGKILL=yes
+Restart=no
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/upwell/runs/%i

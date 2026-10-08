@@ -48,6 +48,8 @@ func main() {
 		err = serve(os.Args[2:])
 	case "selftest":
 		err = selftest(os.Args[2:])
+	case "init":
+		err = initCmd(os.Args[2:])
 	case "user":
 		err = userCmd(os.Args[2:])
 	case "migrate":
@@ -73,6 +75,7 @@ func usage() {
 
 Commands:
   serve      Run the web console, API and orchestrator
+  init       Create the master key, TLS certificate and setup token (install.sh runs this)
   selftest   Check config, store, master key and port before a restart
   user       Manage local users (user create --username NAME --role admin)
   migrate    Inspect migrations from the command line (migrate list | migrate show ID)
@@ -253,6 +256,60 @@ func serve(args []string) error {
 	hs.Shutdown(sctx)
 	a.log.Logf("info", "api", "", "Upwell stopped; engine units keep running")
 	a.log.Close()
+	return nil
+}
+
+// initCmd prepares files the service cannot create itself under
+// ProtectSystem=strict: the master key, the TLS certificate and, while no
+// user exists, the first-run setup token. It never replaces existing files.
+func initCmd(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	cfg, err := loadConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	for _, d := range []string{cfg.DataDir, cfg.LogDir, cfg.RunsDir()} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			return err
+		}
+	}
+	st, err := store.Open(cfg.StorePath())
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer st.Close()
+	var nSecrets int
+	st.DB.QueryRow(`SELECT count(*) FROM secrets`).Scan(&nSecrets)
+	if _, err := os.Stat(cfg.MasterKey); os.IsNotExist(err) && nSecrets > 0 {
+		return fmt.Errorf("the store holds %d secrets but the master key %s is missing; restore the key before continuing", nSecrets, cfg.MasterKey)
+	}
+	if _, err := secrets.LoadOrCreateKey(cfg.MasterKey, true); err != nil {
+		return fmt.Errorf("master key: %w", err)
+	}
+	fmt.Println("master key: ok")
+	created, err := tlsutil.EnsureSelfSigned(cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		return fmt.Errorf("TLS certificate: %w", err)
+	}
+	info, err := tlsutil.Inspect(cfg.TLSCert)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("tls: %s (fingerprint %s)\n", map[bool]string{true: "created", false: "kept"}[created], info.Fingerprint)
+	as := auth.NewService(st)
+	if n, _ := as.CountUsers(context.Background()); n == 0 {
+		if _, err := os.Stat(cfg.SetupToken); os.IsNotExist(err) {
+			if err := os.MkdirAll(filepath.Dir(cfg.SetupToken), 0o750); err != nil {
+				return err
+			}
+			if err := os.WriteFile(cfg.SetupToken, []byte(auth.RandomToken(16)+"\n"), 0o600); err != nil {
+				return err
+			}
+		}
+		fmt.Printf("setup token: %s\n", cfg.SetupToken)
+	} else {
+		fmt.Println("setup token: not needed (users exist)")
+	}
 	return nil
 }
 

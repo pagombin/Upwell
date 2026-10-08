@@ -1,6 +1,6 @@
-import { createContext, ReactNode, useCallback, useContext, useEffect, useState } from "react";
+import { createContext, type ReactNode, useCallback, useContext, useEffect, useState } from "react";
 import { api, setCsrf, setUnauthenticatedHandler } from "./api";
-import { setTimePref, timePref, TimePref } from "./format";
+import { setTimePref, timePref, type TimePref } from "./format";
 import type { Role, User } from "./types";
 
 export interface Me { user: User; csrf_token: string; expires_at: number; idle_minutes: number; time_zone: string; version: string }

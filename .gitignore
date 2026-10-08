@@ -10,3 +10,4 @@ web/dist/
 test-results/
 playwright-report/
 e2e/.auth/
+web/e2e/.auth/
