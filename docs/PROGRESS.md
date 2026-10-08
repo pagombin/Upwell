@@ -18,7 +18,7 @@ Upwell is demo-ready for the end-to-end test. Everything below was verified in t
 
 - Write freeze, offline mode, the migration queue, DigitalOcean API discovery, notifications, the Prometheus endpoint, PDF reports, the support bundle, SSO and TOTP are stubs labelled "Coming soon".
 - Watched tables and saved log views are labelled "Coming soon".
-- Known engine limitations F2, F8 and F9 are guarded against, not fixed (README, "Known limitations").
+- Known engine limitations F2, F8, F9, F11, F12 and F13 are guarded against, not fixed (README, "Known limitations"). Roles are copied without passwords; DDL is not streamed.
 
 **Needs a droplet** (implemented to spec; the container has no systemd as PID 1 and no DigitalOcean access)
 
@@ -26,7 +26,7 @@ Upwell is demo-ready for the end-to-end test. Everything below was verified in t
 - `upwell.service` with the watchdog, `upwell-eng@.service`, the polkit rule, `upwell-health.timer`, Restart Upwell from the System screen, and systemd's reason in engine errors (D21).
 - A real reboot (simulated in-process here).
 - A real Advanced target: whether its `doadmin` has the F1 privileges is unverified; preflight and the connection test say so before anything is copied.
-- Receive throughput on a droplet (F8).
+- Receive throughput (F8) and apply rate (F11) on a droplet; calibrate `assumed_apply_tps` from it.
 
 **Exact commands**
 
@@ -171,3 +171,32 @@ DigitalOcean API discovery, notifications, Prometheus endpoint, PDF reports, sup
 | Integration suite, 15 tests (data-safety gate, happy path, fault scenarios, RBAC, simulated reboot) | 15 of 15 passed in 22 minutes; no slot or origin left on either cluster |
 | Playwright e2e from a fresh server (`dev/e2e.sh --update`) | 229 of 229 passed; browser walkthrough passed (GO); screenshots and visual baseline regenerated after the intentional UI changes of this sweep |
 
+
+## Data fidelity pass (2026-10-08, evening)
+
+Goal: run real transactions through real migrations and prove that nothing is lost between source and target, checked by a comparison independent of Upwell's own verification (`count(*)` plus an md5 over every row in key order, per table and per partition, on both clusters).
+
+**What the tests do**
+
+| Test | Scenario | Result |
+| --- | --- | --- |
+| `TestFidelityPgoutput`, `TestFidelityTestDecoding` | Two databases, 13 tables covering identity columns, an enum, jsonb, arrays, bytea, inet, uuid, NaN and infinity, a pgcrypto default, foreign keys with ON DELETE CASCADE, a table without a primary key (REPLICA IDENTITY FULL), TOAST values, a partitioned table, generated columns, Unicode text and a sequence. A live workload (multi-statement transactions, updates, TOAST updates, deletes, primary key updates, hot rows, savepoints, rollbacks) runs through the base copy and streaming; one database is stopped and resumed, the other's engine is killed with SIGKILL; a final 10,000-row transaction just before the cutover | GO for both plugins; the independent comparison finds 24 tables in 2 databases (about 330,000 rows each) identical row for row, sequences at or past the source, no rolled-back row on the target |
+| `TestEdgeTruncateDuringCDC` | TRUNCATE and reinsert while streaming | GO, identical |
+| `TestEdgeDDLDuringCDC` | A column added on the source while streaming | NO-GO (DDL is not streamed) |
+| `TestEdgeNoReplicaIdentity` | A table with no key and no replica identity | Hard blocker; start refused; after REPLICA IDENTITY FULL the application's UPDATE works during the migration and the result is GO, identical |
+| `TestApplyThroughput` (`UPWELL_MEASURE=1`) | Engine apply rate | about 190 rows a second for one large transaction, about 5 transactions a second for small ones (F11) |
+
+**Found and fixed during this pass** (decisions D23 to D32)
+
+- pgcopydb's role copy needs superuser; Upwell copies roles itself, without passwords (D23). Extensions are created on the target before the copy (D24).
+- F11, the apply rate: readiness now also requires the heartbeat lag under `cutover_max_lag_seconds`, and preflight's `apply_rate` check warns about busy databases (D28).
+- F12, pgcopydb's internal SQLite lock: one automatic restart from zero during the base copy (D27).
+- F13, an apply process that dies while receive keeps the unit alive: detected from the log and resumed (D26, D31).
+- F14, the drain nudge broke test_decoding: the nudge is now a heartbeat row (D30).
+- A table without a replica identity is now a hard blocker: with a FOR ALL TABLES publication the application's UPDATE and DELETE on it would fail on the source.
+- A reused Idempotency-Key with a different body is refused (D25); the migration lock is keyed on the full ID (D29).
+- Heartbeat lag is measured even when the target has no heartbeat at all (D32), found by the regression run.
+
+**Regression run after the fixes**: all 19 integration tests pass (TestS02PrivilegeLostMidStream after D32, re-run with the happy path, the no-identity edge and the pgoutput fidelity test), no slot, publication or origin left on either cluster.
+
+**Browser e2e after the fixes** (`dev/e2e.sh --update`): 229 of 229 passed, and the browser walkthrough (define, preflight, start, stop and resume, cut over, report, clean up) passed with GO; screenshots regenerated (the cutover screen now shows the lag condition).
