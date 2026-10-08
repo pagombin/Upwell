@@ -110,6 +110,16 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 				return op, ErrDuplicate
 			}
 		}
+		if m.Flags.Verdict == "NO-GO" && noEndPositions(o, ctx, m.ID) {
+			// The last cutover stopped before any end position was set: streaming
+			// continued, so a new cutover may start.
+			o.updateFlags(ctx, m.ID, func(f *Flags) { f.Verdict = ""; f.Cutover = nil })
+			dbs, _ := o.ListDatabases(ctx, m.ID)
+			for _, d := range dbs {
+				o.setDB(ctx, d.ID, map[string]any{"verdict": nil, "hb_token": nil, "hb_before_lsn": nil})
+			}
+			m.Flags.Verdict = ""
+		}
 		if m.Flags.Verdict != "" {
 			return nil, uerr("verdict", "This migration already has a verdict.", "Restart the failed databases to try again.")
 		}
@@ -327,7 +337,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			cur, _ := o.GetDatabase(bg, m.ID, d.ID)
 			pending[d.SourceName] = cur
 		}
-		lastNudge := time.Time{}
+		lastNudge := time.Now().Add(-4 * time.Second)
 		for len(pending) > 0 {
 			if ctx.Err() != nil {
 				fail("await", errors.New("cutover cancelled"))
@@ -348,14 +358,23 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 				for n := range pending {
 					names = append(names, n)
 				}
-				err := fmt.Errorf("the final heartbeat did not reach the target for %s within %s; end positions were not set and streaming continues. Check the engine logs, then run the cutover again", strings.Join(names, ", "), limit)
-				fail("await", err)
+				err := fmt.Errorf("the final heartbeat did not reach the target for %s within %s, so changes may be missing there. End positions were not set and streaming continues; restart the affected databases from zero or investigate the engine logs, then run the cutover again", strings.Join(names, ", "), limit)
+				op.StepEnd("await", "failed", err.Error())
+				for name, d := range pending {
+					o.setDB(bg, d.ID, map[string]any{"verdict": "NO-GO", "last_error": "NO-GO: the final heartbeat never reached the target"})
+					op.LogDB("error", name, "NO-GO: the final heartbeat never reached the target")
+				}
+				o.finishCutover(bg, m, op, a, err)
 				return
 			}
 			if time.Since(lastNudge) > 5*time.Second {
-				for _, d := range pending {
-					spec, _ := o.dbSpec(bg, m, d)
-					o.eng.Nudge(bg, spec)
+				// pgcopydb applies a transaction only once a later decodable one
+				// arrives; a logical message does not count under pgoutput. Push with
+				// a small heartbeat row (ignored by verification).
+				for name, d := range pending {
+					if _, err := pgpack.WriteHeartbeat(bg, src.WithDB(d.SourceName), "push", store.NewID()); err != nil {
+						op.LogDB("warn", name, "heartbeat push failed: %v", err)
+					}
 				}
 				lastNudge = time.Now()
 			}
@@ -519,6 +538,9 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	verdicts := map[string]bool{}
 	for i, d := range inc {
 		op.StepDetail("verify", "verifying "+d.SourceName, float64(i)/float64(max(len(inc), 1)))
+		if o.testHooks.BeforeVerify != nil {
+			o.testHooks.BeforeVerify(ctx, d)
+		}
 		cur, _ := o.GetDatabase(ctx, m.ID, d.ID)
 		res, err := pgpack.Verify(ctx, pgpack.VerifyInput{Source: src.WithDB(d.SourceName), Target: dst.WithDB(d.TargetName), TargetMaint: dst, Origin: d.OriginName,
 			HeartbeatRequired: hbOn, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
@@ -725,3 +747,13 @@ func (o *Orchestrator) Verification(ctx context.Context, id string) (string, []V
 }
 
 var _ = engine.FailNone
+
+func noEndPositions(o *Orchestrator, ctx context.Context, id string) bool {
+	dbs, _ := o.ListDatabases(ctx, id)
+	for _, d := range included(dbs) {
+		if d.EndPos != "" {
+			return false
+		}
+	}
+	return true
+}

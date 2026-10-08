@@ -42,19 +42,21 @@ type Orchestrator struct {
 	metrics *collector
 	alerts  *alerter
 
-	Heartbeat   func(name string) // watchdog heartbeat hook
-	lastLoop    time.Time
-	loopMu      sync.Mutex
-	Reconciled  bool
-	StartedAt   time.Time
-	Rebooted    bool
-	testHooks   TestHooks
+	Heartbeat  func(name string) // watchdog heartbeat hook
+	lastLoop   time.Time
+	loopMu     sync.Mutex
+	Reconciled bool
+	StartedAt  time.Time
+	Rebooted   bool
+	testHooks  TestHooks
 }
 
 // TestHooks let tests inject faults. Never set from the API.
 type TestHooks struct {
-	ExtraEngineArgs  func(db string) []string
+	ExtraEngineArgs   func(db string) []string
 	SkipPreflightGate bool
+	// BeforeVerify runs after the drain and before verification of each database.
+	BeforeVerify func(ctx context.Context, db Database)
 }
 
 // Deps bundles constructor arguments.
@@ -125,12 +127,12 @@ func (o *Orchestrator) Event(ctx context.Context, migration, db, typ, severity, 
 
 // Step is one numbered step of an operation.
 type Step struct {
-	Key       string `json:"key"`
-	Title     string `json:"title"`
-	State     string `json:"state"` // waiting, running, done, failed, skipped
-	StartedAt int64  `json:"started_at,omitempty"`
-	EndedAt   int64  `json:"ended_at,omitempty"`
-	Detail    string `json:"detail,omitempty"`
+	Key       string  `json:"key"`
+	Title     string  `json:"title"`
+	State     string  `json:"state"` // waiting, running, done, failed, skipped
+	StartedAt int64   `json:"started_at,omitempty"`
+	EndedAt   int64   `json:"ended_at,omitempty"`
+	Detail    string  `json:"detail,omitempty"`
 	Progress  float64 `json:"progress,omitempty"`
 }
 
