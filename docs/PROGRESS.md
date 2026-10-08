@@ -158,3 +158,16 @@ DigitalOcean API discovery, notifications, Prometheus endpoint, PDF reports, sup
 | New: browser walkthrough (`web/e2e/flow.spec.ts`) | failed, then passed (2 minutes) | **bug:** a new migration's database list was JSON `null`, which crashed the wizard's database step; the API now never returns `null` for a list (D22) |
 | Review of screenshots | | fixture migrations showed action buttons the backend refuses (now hidden with a note); a NO-GO listed the failed database below the passing one (failed first now); an engine unit failing before pgcopydb logs anything now reports systemd's reason (D21) |
 
+### Sweep 3, final (about 05:00 to 06:00 UTC)
+
+| Tool | Result |
+| --- | --- |
+| `go vet ./...` and `-tags integration` | clean |
+| `staticcheck ./...` | clean |
+| `golangci-lint run ./...` | 0 issues |
+| `go test -race ./internal/...` | all 9 packages pass |
+| `tsc --noEmit`, ESLint `--max-warnings 0` | clean |
+| `shellcheck -S warning` on install.sh, dev/*.sh, spikes/env/local-clusters.sh | clean (two unused loop variables and a missing shell directive fixed) |
+| Integration suite, 15 tests (data-safety gate, happy path, fault scenarios, RBAC, simulated reboot) | 15 of 15 passed in 22 minutes; no slot or origin left on either cluster |
+| Playwright e2e from a fresh server (`dev/e2e.sh --update`) | 229 of 229 passed; browser walkthrough passed (GO); screenshots and visual baseline regenerated after the intentional UI changes of this sweep |
+
