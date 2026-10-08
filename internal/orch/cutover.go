@@ -19,10 +19,10 @@ import (
 
 // Condition is one readiness gate line.
 type Condition struct {
-	Key     string `json:"key"`
-	Label   string `json:"label"`
-	OK      bool   `json:"ok"`
-	Detail  string `json:"detail"`
+	Key      string `json:"key"`
+	Label    string `json:"label"`
+	OK       bool   `json:"ok"`
+	Detail   string `json:"detail"`
 	Database string `json:"database,omitempty"`
 }
 
@@ -623,8 +623,8 @@ func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Opera
 		pause = f.Cutover.WritePauseMS
 	}
 	if verdict == "GO" {
-		op.StepEnd("verdict", "done", fmt.Sprintf("GO: every database verified; write pause %s", (time.Duration(pause) * time.Millisecond).Round(time.Second)))
-		o.Event(ctx, m.ID, "", "verdict", "info", fmt.Sprintf("Cutover verdict GO: every database verified (write pause %s)", (time.Duration(pause) * time.Millisecond).Round(time.Second)), map[string]any{"verdict": verdict})
+		op.StepEnd("verdict", "done", fmt.Sprintf("GO: every database verified; write pause %s", (time.Duration(pause)*time.Millisecond).Round(time.Second)))
+		o.Event(ctx, m.ID, "", "verdict", "info", fmt.Sprintf("Cutover verdict GO: every database verified (write pause %s)", (time.Duration(pause)*time.Millisecond).Round(time.Second)), map[string]any{"verdict": verdict})
 		if o.Settings(ctx, m).Bool("analyze_after_go") {
 			_, dst, _ := o.Conns(ctx, m)
 			for _, d := range included(dbs) {

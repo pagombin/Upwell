@@ -17,19 +17,19 @@ import (
 
 // DiscoveredDB is one source database.
 type DiscoveredDB struct {
-	Name          string `json:"name"`
-	SizeBytes     int64  `json:"size_bytes"`
-	Tables        int    `json:"tables"`
-	RowsEstimate  int64  `json:"rows_estimate"`
-	Sequences     int    `json:"sequences"`
-	Views         int    `json:"views"`
-	Unlogged      int    `json:"unlogged"`
-	LargeObjects  int64  `json:"large_objects"`
-	Encoding      string `json:"encoding"`
-	Collate       string `json:"collate"`
-	Include       bool   `json:"include"`
-	SkipReason    string `json:"skip_reason,omitempty"`
-	ExistsOnTarget bool  `json:"exists_on_target"`
+	Name           string `json:"name"`
+	SizeBytes      int64  `json:"size_bytes"`
+	Tables         int    `json:"tables"`
+	RowsEstimate   int64  `json:"rows_estimate"`
+	Sequences      int    `json:"sequences"`
+	Views          int    `json:"views"`
+	Unlogged       int    `json:"unlogged"`
+	LargeObjects   int64  `json:"large_objects"`
+	Encoding       string `json:"encoding"`
+	Collate        string `json:"collate"`
+	Include        bool   `json:"include"`
+	SkipReason     string `json:"skip_reason,omitempty"`
+	ExistsOnTarget bool   `json:"exists_on_target"`
 }
 
 // systemDBs are never migrated.

@@ -15,6 +15,7 @@ import (
 	"github.com/pagombin/upwell/internal/check"
 	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/pgpack"
+	"github.com/pagombin/upwell/internal/settings"
 	"github.com/pagombin/upwell/internal/store"
 )
 
@@ -376,5 +377,16 @@ func (o *Orchestrator) Plan(ctx context.Context, mig string) ([]PlanEntry, map[s
 	conc := max(1, min(len(out), v.Int("max_concurrent_base_copies")))
 	est := map[string]any{"total_bytes": total, "assumed_mibs": rate, "concurrent": conc, "estimated_copy_seconds": float64(total) / (rate * 1024 * 1024),
 		"target_disk_needed_bytes": int64(float64(total) * v.Float("target_disk_factor")), "work_dir": filepath.Clean(o.cfg.RunsDir())}
+	// Connections: each running database uses table jobs + index jobs + about
+	// three engine sessions (main, sentinel, CDC walsender) on the source.
+	tj, ij := settings.Jobs(v, conc)
+	est["table_jobs"], est["index_jobs"] = tj, ij
+	est["source_connections_peak"] = conc*(tj+ij+3) + 2
+	est["target_connections_peak"] = conc*(tj+ij+2) + 2
+	// WAL retention: the slot holds WAL written during the base copy.
+	if w, ok := o.LastValue(m.ID, "", "src_wal_rate"); ok && w > 0 {
+		est["source_wal_rate_bps"] = w
+		est["wal_retained_during_copy_bytes"] = int64(w * float64(total) / (rate * 1024 * 1024) / float64(conc))
+	}
 	return out, est, nil
 }

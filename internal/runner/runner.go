@@ -87,8 +87,8 @@ func WriteEnvFile(s Spec) (string, error) {
 // Systemd runs instances of upwell-eng@.service.
 type Systemd struct{}
 
-func (*Systemd) Name() string                   { return "systemd" }
-func (*Systemd) UnitName(inst string) string    { return "upwell-eng@" + inst + ".service" }
+func (*Systemd) Name() string                { return "systemd" }
+func (*Systemd) UnitName(inst string) string { return "upwell-eng@" + inst + ".service" }
 func systemctl(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "systemctl", args...)
 	out, err := cmd.CombinedOutput()
@@ -206,8 +206,8 @@ func NewLocal(stateDir string) (*Local, error) {
 	return l, nil
 }
 
-func (*Local) Name() string                { return "local" }
-func (*Local) UnitName(inst string) string { return "upwell-eng@" + inst + ".service" }
+func (*Local) Name() string                  { return "local" }
+func (*Local) UnitName(inst string) string   { return "upwell-eng@" + inst + ".service" }
 func (l *Local) pidFile(inst string) string  { return filepath.Join(l.stateDir, inst+".pid") }
 func (l *Local) exitFile(inst string) string { return filepath.Join(l.stateDir, inst+".exit") }
 func (l *Local) cg(inst string) string {

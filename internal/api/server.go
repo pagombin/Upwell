@@ -115,9 +115,9 @@ func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
 		hd.Set("X-Content-Type-Options", "nosniff")
-		hd.Set("X-Frame-Options", "DENY")
+		hd.Set("X-Frame-Options", "SAMEORIGIN")
 		hd.Set("Referrer-Policy", "no-referrer")
-		hd.Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		hd.Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'")
 		h.ServeHTTP(w, r)
 	})
 }

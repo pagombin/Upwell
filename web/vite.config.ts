@@ -8,6 +8,7 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: false,
     chunkSizeWarningLimit: 800,
+    assetsInlineLimit: 0,
   },
   server: {
     proxy: { "/api": { target: "https://127.0.0.1:8443", secure: false, changeOrigin: false } },

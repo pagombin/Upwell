@@ -122,11 +122,11 @@ type Runner struct {
 	Env  Env
 	Emit func(check.Result)
 
-	src, dst          *pgx.Conn
-	srcVer, dstVer    int
-	srcErr, dstErr    error
-	walRateBps        float64
-	totalSourceBytes  int64
+	src, dst         *pgx.Conn
+	srcVer, dstVer   int
+	srcErr, dstErr   error
+	walRateBps       float64
+	totalSourceBytes int64
 }
 
 func (r *Runner) emit(id, scope, db, level string, hard bool, msg, remediation string, ev map[string]any, start time.Time) {

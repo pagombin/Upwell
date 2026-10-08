@@ -18,15 +18,15 @@ import (
 
 // collector samples metrics into the compact series-plus-samples store (PC7).
 type collector struct {
-	o        *Orchestrator
-	mu       sync.Mutex
-	series   map[string]int64
-	prev     map[string]prevSample
-	slow     map[string]time.Time
-	hb       map[string]time.Time
-	cpuPrev  [2]uint64
-	stale    map[string]int
-	last     map[string]float64
+	o         *Orchestrator
+	mu        sync.Mutex
+	series    map[string]int64
+	prev      map[string]prevSample
+	slow      map[string]time.Time
+	hb        map[string]time.Time
+	cpuPrev   [2]uint64
+	stale     map[string]int
+	last      map[string]float64
 	lastWrite time.Time
 }
 
@@ -420,7 +420,9 @@ func (o *Orchestrator) LastMetricWrite() time.Time {
 }
 
 // LastValue returns the newest in-memory value of a series.
-func (o *Orchestrator) LastValue(mig, db, name string) (float64, bool) { return o.metrics.Last(mig, db, name) }
+func (o *Orchestrator) LastValue(mig, db, name string) (float64, bool) {
+	return o.metrics.Last(mig, db, name)
+}
 
 // ---------- alerts
 

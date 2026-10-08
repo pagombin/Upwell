@@ -48,6 +48,7 @@ func (s *Server) register() {
 	noIdem(r)
 	noIdem(s.add("POST", "/api/v1/auth/logout", viewer, "Sign out", s.logout))
 	s.add("GET", "/api/v1/auth/me", viewer, "Current user and CSRF token", s.me)
+	pub(s.add("GET", "/api/v1/auth/session", "", "Session status without an error when signed out", s.sessionStatus))
 	s.add("POST", "/api/v1/auth/totp", viewer, "TOTP (coming soon)", s.comingSoon("TOTP second factor"))
 	s.add("POST", "/api/v1/auth/password", viewer, "Change own password", s.changePassword)
 
@@ -115,6 +116,7 @@ func (s *Server) register() {
 	s.add("GET", "/api/v1/audit/verify", viewer, "Verify the audit chain", s.auditVerify)
 	s.add("GET", "/api/v1/system", viewer, "System health and versions", s.system)
 	s.add("GET", "/api/v1/host/metrics", viewer, "Droplet metrics", s.hostMetrics)
+	s.add("POST", "/api/v1/system/restart", admin, "Restart the app (engines keep running)", s.restartApp)
 	s.add("GET", "/metrics", admin, "Prometheus (coming soon)", s.comingSoon("Prometheus metrics"))
 	s.add("POST", "/api/v1/dev/fixtures", admin, "Create demonstration fixtures (dev only)", s.devFixtures)
 
@@ -242,6 +244,25 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) error {
 	tz, _ = strconv.Unquote(tz)
 	g, _ := s.Settings.Global(r.Context())
 	return writeJSON(w, 200, map[string]any{"user": sess.User, "csrf_token": sess.CSRF, "expires_at": sess.ExpiresAt, "idle_minutes": g.Int("session_idle_minutes"), "time_zone": tz, "version": s.Version})
+}
+
+// sessionStatus lets the UI find out whether it is signed in without a 401.
+func (s *Server) sessionStatus(w http.ResponseWriter, r *http.Request) error {
+	tok := ""
+	if c, _ := r.Cookie("upwell_session"); c != nil {
+		tok = c.Value
+	}
+	if tok != "" {
+		if sess, err := s.Auth.Resolve(r.Context(), tok); err == nil {
+			r = r.WithContext(context.WithValue(r.Context(), sessKey, sess))
+			return s.me(w, r)
+		}
+	}
+	n, err := s.Auth.CountUsers(r.Context())
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, map[string]any{"user": nil, "needs_setup": n == 0})
 }
 
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) error {
@@ -1114,16 +1135,56 @@ func (s *Server) system(w http.ResponseWriter, r *http.Request) error {
 	ready, readyDetail := s.Health.Ready()
 	return writeJSON(w, 200, map[string]any{
 		"version": s.Version, "go": runtime.Version(), "started_at": s.Orch.StartedAt.UnixMilli(), "uptime_s": int64(time.Since(s.Orch.StartedAt).Seconds()),
-		"engine": map[string]any{"name": s.Orch.Engine().Name(), "version": ev, "runner": s.Orch.Runner().Name()},
-		"tools":  map[string]string{"pg_dump": toolVersion(s.binPath("pg_dump")), "psql": toolVersion(s.binPath("psql"))},
-		"store":  map[string]any{"path": s.Cfg.StorePath(), "bytes": storeSize, "schema_version": schema},
-		"logs":   map[string]any{"dir": s.Cfg.LogDir, "bytes": dirSize(s.Cfg.LogDir)},
-		"runs":   map[string]any{"dir": s.Cfg.RunsDir(), "bytes": dirSize(s.Cfg.RunsDir())},
+		"engine":   map[string]any{"name": s.Orch.Engine().Name(), "version": ev, "runner": s.Orch.Runner().Name()},
+		"tools":    map[string]string{"pg_dump": toolVersion(s.binPath("pg_dump")), "psql": toolVersion(s.binPath("psql"))},
+		"store":    map[string]any{"path": s.Cfg.StorePath(), "bytes": storeSize, "schema_version": schema},
+		"logs":     map[string]any{"dir": s.Cfg.LogDir, "bytes": dirSize(s.Cfg.LogDir)},
+		"runs":     map[string]any{"dir": s.Cfg.RunsDir(), "bytes": dirSize(s.Cfg.RunsDir())},
 		"watchdog": map[string]any{"healthy": ok, "late": late, "beats": s.Health.Beats(), "systemd": os.Getenv("NOTIFY_SOCKET") != ""},
-		"ready": ready, "ready_detail": readyDetail, "tls": s.TLSInfo(), "rebooted": s.Orch.Rebooted, "reconciled": s.Orch.Reconciled,
+		"ready":    ready, "ready_detail": readyDetail, "tls": s.TLSInfo(), "rebooted": s.Orch.Rebooted, "reconciled": s.Orch.Reconciled,
 		"updates": map[string]any{"available": false, "note": "Updates are applied by running install.sh again."},
-		"dev": s.Cfg.Dev,
+		"dev":     s.Cfg.Dev, "units": s.engineUnits(ctx),
 	})
+}
+
+// engineUnits lists the engine unit of every database of migrations that
+// started and are not cleaned up.
+func (s *Server) engineUnits(ctx context.Context) []map[string]any {
+	out := []map[string]any{}
+	ms, err := s.Orch.ListMigrations(ctx)
+	if err != nil {
+		return out
+	}
+	for _, m := range ms {
+		if !m.Flags.Started || m.Flags.CleanedUp || m.Fixture {
+			continue
+		}
+		dbs, _ := s.Orch.ListDatabases(ctx, m.ID)
+		for _, d := range dbs {
+			if !d.Include {
+				continue
+			}
+			st, _ := s.Orch.Runner().Status(ctx, d.Instance)
+			out = append(out, map[string]any{"migration": m.ShortID, "migration_name": m.Name, "database": d.SourceName, "state": d.State, "unit": s.Orch.Runner().UnitName(d.Instance), "status": st})
+		}
+	}
+	return out
+}
+
+// restartApp exits so systemd restarts the service. Engines run in their own
+// units and keep running; reconciliation reattaches them on start.
+func (s *Server) restartApp(w http.ResponseWriter, r *http.Request) error {
+	if os.Getenv("NOTIFY_SOCKET") == "" {
+		return apiErr(409, "no_systemd", "Upwell is not running under systemd here, so it would not come back after exiting.", "Restart it with your process manager, or on the droplet run: sudo systemctl restart upwell")
+	}
+	s.Audit.Append(r.Context(), actor(r), "system.restart", "upwell", nil, nil)
+	s.Log.Write(logx.Record{Level: "warn", Component: "app", Msg: "restart requested by " + session(r).User.Username})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		SDNotify("STOPPING=1")
+		os.Exit(0)
+	}()
+	return writeJSON(w, 202, map[string]any{"ok": true, "note": "Upwell restarts in a few seconds; running migrations are not affected."})
 }
 
 func (s *Server) binPath(n string) string {
@@ -1276,7 +1337,7 @@ func (s *Server) openapi(w http.ResponseWriter, r *http.Request) error {
 		"paths":   paths,
 		"components": map[string]any{
 			"securitySchemes": map[string]any{"session": map[string]any{"type": "apiKey", "in": "cookie", "name": "upwell_session"}},
-			"schemas": map[string]any{"Error": map[string]any{"type": "object", "properties": map[string]any{"code": map[string]any{"type": "string"}, "message": map[string]any{"type": "string"}, "remediation": map[string]any{"type": "string"}, "details": map[string]any{}}}},
+			"schemas":         map[string]any{"Error": map[string]any{"type": "object", "properties": map[string]any{"code": map[string]any{"type": "string"}, "message": map[string]any{"type": "string"}, "remediation": map[string]any{"type": "string"}, "details": map[string]any{}}}},
 		},
 	}
 	return writeJSON(w, 200, doc)

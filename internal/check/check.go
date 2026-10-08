@@ -104,14 +104,14 @@ func (r Result) Blocking() bool {
 
 // Summary counts results by outcome.
 type Summary struct {
-	Total      int  `json:"total"`
-	OK         int  `json:"ok"`
-	Info       int  `json:"info"`
-	Warnings   int  `json:"warnings"`
-	Blockers   int  `json:"blockers"`
-	Hard       int  `json:"hard"`
-	Accepted   int  `json:"accepted"`
-	CanStart   bool `json:"can_start"`
+	Total       int  `json:"total"`
+	OK          int  `json:"ok"`
+	Info        int  `json:"info"`
+	Warnings    int  `json:"warnings"`
+	Blockers    int  `json:"blockers"`
+	Hard        int  `json:"hard"`
+	Accepted    int  `json:"accepted"`
+	CanStart    bool `json:"can_start"`
 	NeedsReview bool `json:"needs_warning_review"`
 }
 

@@ -93,9 +93,32 @@ func SeedFixtures(ctx context.Context, o *Orchestrator, a audit.Actor) ([]string
 		return nil, err
 	}
 	for _, fx := range []struct {
-		m      Migration
+		m       Migration
 		verdict string
 	}{{goM, "GO"}, {noGo, "NO-GO"}} {
+		// A finished cutover operation so the console shows its steps.
+		titles := [][2]string{{"readiness", "Readiness gate"}, {"writers", "Confirm writers stopped"}, {"heartbeat", "Write final heartbeat"}, {"await", "Wait for the final heartbeat on the target"},
+			{"endpos", "Set end positions and nudge"}, {"drain", "Drain to end positions"}, {"origin", "Check target origin reached the final heartbeat"}, {"sequences", "Sync sequences"}, {"verify", "Verify data"}, {"verdict", "Verdict"}}
+		t0 := fx.m.Flags.Cutover.StartedAt
+		steps := []Step{}
+		for i, t := range titles {
+			st := Step{Key: t[0], Title: t[1], State: "done", StartedAt: t0 + int64(i)*5000, EndedAt: t0 + int64(i+1)*5000}
+			if fx.verdict == "NO-GO" && t[0] == "verify" {
+				st.State, st.Detail = "failed", "orders: row counts differ on public.orders (fixture)"
+			}
+			if fx.verdict == "NO-GO" && t[0] == "verdict" {
+				st.Detail = "NO-GO"
+			}
+			steps = append(steps, st)
+		}
+		opID := store.NewID()
+		state := "done"
+		if fx.verdict == "NO-GO" {
+			state = "failed"
+		}
+		o.st.DB.ExecContext(ctx, `INSERT INTO operations(id,migration_id,kind,state,steps,params,started_by,started_at,ended_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+			opID, fx.m.ID, "cutover", state, toJSON(steps), "{}", "fixture", t0, fx.m.Flags.Cutover.EndedAt)
+		o.updateFlags(ctx, fx.m.ID, func(f *Flags) { f.Cutover.OpID = opID })
 		for _, db := range []string{"orders", "inventory"} {
 			st, verdict := DVerified, "GO"
 			lastErr := ""

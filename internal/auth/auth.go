@@ -67,12 +67,12 @@ type Session struct {
 
 // Service holds auth state.
 type Service struct {
-	Store      *store.Store
-	IdleMin    func() int
-	MaxHours   func() int
-	argonMem   uint32
-	argonTime  uint32
-	argonPar   uint8
+	Store     *store.Store
+	IdleMin   func() int
+	MaxHours  func() int
+	argonMem  uint32
+	argonTime uint32
+	argonPar  uint8
 }
 
 // NewService returns a service with production Argon2id parameters.

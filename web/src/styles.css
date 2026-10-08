@@ -159,14 +159,14 @@ button, .btn {
 }
 button:hover, .btn:hover { border-color: var(--faint); }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
-button.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-text); }
-button.primary:hover { background: var(--primary-hover); }
+button.primary, .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-text); }
+button.primary:hover, .btn.primary:hover { background: var(--primary-hover); }
 button.danger { background: transparent; border-color: var(--crit); color: var(--crit); }
 button.danger.solid { background: var(--crit); color: #fff; }
 :root[data-theme="dark"] button.danger.solid { color: #1a0d0b; }
 button.cutover { background: var(--cutover); border-color: var(--cutover); color: #170f2b; }
 :root[data-theme="light"] button.cutover { color: #fff; }
-button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+button.ghost, .btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
 button.ghost:hover { color: var(--text); background: var(--raised); }
 button.icon { padding: 6px; min-width: 32px; }
 input, select, textarea {

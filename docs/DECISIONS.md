@@ -37,3 +37,18 @@ Function grants are per database. Creating target databases from template0 dropp
 
 ## D12. Verification ignores the `upwell` schema in table comparisons
 The heartbeat table has its own checks (final heartbeat present, origin progress). Counting it as user data produced a confusing duplicate failure.
+
+## D13. The built UI is committed under `internal/webui/dist`
+`go build` embeds the UI. Committing the Vite output means the binary builds on a droplet (or in CI) without Node, and install.sh only needs Go or a prebuilt binary. `npm run build` regenerates it; the e2e suite always rebuilds before running.
+
+## D14. Signed-out detection without a 401
+The UI asks `GET /api/v1/auth/session` (public, 200 either way) on load instead of `GET /auth/me`, so the sign-in page loads with no failed network request or console error. `/auth/me` still returns 401 for API clients.
+
+## D15. Same-origin framing is allowed
+The Report screen shows the HTML report in an iframe from the same origin, so `frame-ancestors` is `'self'` and `X-Frame-Options` is `SAMEORIGIN` (was `'none'`/`DENY`). Other origins still cannot frame Upwell.
+
+## D16. "Restart Upwell" works only under systemd
+`POST /api/v1/system/restart` exits the process so systemd (`Restart=always`) brings it back; engines run in their own units and keep going. Without `NOTIFY_SOCKET` it refuses with a clear message instead of killing a server nobody will restart.
+
+## D17. Plan estimates for connections and WAL
+The plan review shows peak connections per side (concurrent databases × (table jobs + index jobs + engine sessions)) and WAL retained during the copy (current source WAL rate × copy time ÷ concurrency) when a rate has been measured; otherwise it says the rate is not known yet.
