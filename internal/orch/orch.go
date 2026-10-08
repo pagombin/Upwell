@@ -482,7 +482,10 @@ func (o *Orchestrator) refreshState(ctx context.Context, id string) (string, err
 	pfOK := m.Flags.PreflightOK && o.preflightStillValid(ctx, m)
 	s := DeriveState(m, dbs, pfOK, permOK)
 	if s != m.State {
-		o.st.DB.ExecContext(ctx, `UPDATE migrations SET state=?, updated_at=? WHERE id=?`, s, store.Now(), m.ID)
+		if _, err := o.st.DB.ExecContext(ctx, `UPDATE migrations SET state=?, updated_at=? WHERE id=?`, s, store.Now(), m.ID); err != nil {
+			o.logf("error", "orchestrator", m.ID, "", "", "saving migration state failed: %v", err)
+			return m.State, err
+		}
 		o.Event(ctx, m.ID, "", "state", severityFor(s), fmt.Sprintf("Migration is now %s", Label(s)), map[string]any{"from": m.State, "to": s})
 	}
 	o.bus.Publish("migration", "state", m.ID, map[string]any{"state": s})

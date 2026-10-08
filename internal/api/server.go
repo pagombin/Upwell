@@ -294,7 +294,7 @@ func (s *Server) serveUI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	st, _ := f.Stat()
 	if st.IsDir() {
 		http.NotFound(w, r)
@@ -362,6 +362,6 @@ func SDNotify(msg string) {
 	if err != nil {
 		return
 	}
-	defer c.Close()
-	c.Write([]byte(msg))
+	defer func() { _ = c.Close() }()
+	_, _ = c.Write([]byte(msg))
 }

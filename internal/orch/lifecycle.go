@@ -336,7 +336,6 @@ func (o *Orchestrator) Discover(ctx context.Context, a audit.Actor, id string) (
 		target := f.Name
 		if p, ok := prev[f.Name]; ok {
 			inc = p.Include && f.SkipReason == ""
-			target = p.TargetName
 			o.st.DB.ExecContext(ctx, `UPDATE migration_databases SET skip_reason=?, size_bytes=?, rows_estimate=?, table_count=?, include=?, updated_at=? WHERE id=?`,
 				store.NullString(f.SkipReason), f.SizeBytes, f.RowsEstimate, f.Tables, inc, now, p.ID)
 			continue
@@ -418,7 +417,7 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 	for _, cid := range []string{m.SourceConnID, m.TargetConnID} {
 		if cid != "" {
 			if c, err := o.GetConnection(ctx, cid); err == nil && c.PasswordSecretID != "" {
-				o.vault.Delete(ctx, c.PasswordSecretID)
+				_ = o.vault.Delete(ctx, c.PasswordSecretID)
 			}
 		}
 	}
@@ -668,7 +667,10 @@ func (o *Orchestrator) resumeDB(ctx context.Context, m Migration, d Database, wh
 		return err
 	}
 	if st, _ := o.run.Status(ctx, d.Instance); st.Active {
-		o.eng.Stop(ctx, plan, spec)
+		if _, err := o.eng.Stop(ctx, plan, spec); err != nil {
+			done("failed: " + err.Error())
+			return err
+		}
 	}
 	if _, _, err := o.eng.ReleaseSlot(ctx, spec); err != nil {
 		done("failed: " + err.Error())
@@ -720,6 +722,15 @@ func (o *Orchestrator) stopUnit(ctx context.Context, m Migration, d Database) (e
 		o.logf("info", "orchestrator", m.ID, d.SourceName, "", "unit stopped in %s; slot released after %s (walsender terminated: %v)", res.Duration.Round(time.Millisecond), res.SlotReleaseWaited.Round(time.Millisecond), res.WalsenderKilled)
 	}
 	return res, err
+}
+
+// mustStop stops a unit the supervisor decided to stop and logs a failure:
+// a unit that keeps running after such a decision needs an operator.
+func (o *Orchestrator) mustStop(ctx context.Context, m Migration, d Database, why string) {
+	if _, err := o.stopUnit(ctx, m, d); err != nil {
+		o.logf("error", "orchestrator", m.ID, d.SourceName, "", "stopping %s (%s) failed: %v", d.SourceName, why, err)
+		o.Event(ctx, m.ID, d.SourceName, "stop_failed", "critical", fmt.Sprintf("Upwell could not stop the engine of %s (%s): %v", d.SourceName, why, err), nil)
+	}
 }
 
 // StopDatabase stops one database; slot and state are kept.
@@ -1073,7 +1084,7 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 		op.StepStart("credentials", "")
 		for _, cid := range []string{m.SourceConnID, m.TargetConnID} {
 			if c, err := o.GetConnection(bg, cid); err == nil && c.PasswordSecretID != "" {
-				o.vault.Delete(bg, c.PasswordSecretID)
+				_ = o.vault.Delete(bg, c.PasswordSecretID)
 				o.st.DB.ExecContext(bg, `UPDATE connections SET password_secret_id=NULL WHERE id=?`, cid)
 			}
 		}

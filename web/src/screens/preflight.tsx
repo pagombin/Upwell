@@ -77,7 +77,7 @@ export function PreflightResults({ mig, latest, refresh }: { mig: string; latest
           <Card key={g} title={<Trunc>{g}</Trunc>}>
             <div className="tablewrap">
               <table className="data" aria-label={`${g} checks`}>
-                <thead><tr><th style={{ width: 150 }}>Result</th><th>Check</th><th>Finding</th><th style={{ width: 210 }}></th></tr></thead>
+                <thead><tr><th style={{ width: 150 }}>Result</th><th>Check</th><th>Finding</th><th style={{ width: 210 }}><span className="sr-only">Actions</span></th></tr></thead>
                 <tbody>
                   {rs.map((r) => (
                     <tr key={r.id}>

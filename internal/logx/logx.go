@@ -95,7 +95,7 @@ func (l *Logger) Write(r Record) {
 	r.Raw = Redact(r.Raw)
 	b, _ := json.Marshal(r)
 	l.mu.Lock()
-	l.file.Write(append(b, '\n'))
+	_, _ = l.file.Write(append(b, '\n'))
 	if l.stderr {
 		fmt.Fprintf(os.Stderr, "%s %-5s %-12s %s\n", time.UnixMilli(r.TS).UTC().Format("15:04:05.000"), r.Level, r.Component, r.Msg)
 	}

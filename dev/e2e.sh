@@ -68,7 +68,15 @@ if [[ $REUSE -eq 1 && -f $DATA/e2e.env ]] && curl -sk $BASE/readyz | grep -q '"o
   E2E_KEEP=1
   # shellcheck disable=SC1091
   . $DATA/e2e.env
+  # The UI is embedded in the binary: rebuild both and restart the server
+  # (engines keep running and are reattached).
   (cd web && npm run build --silent >/dev/null)
+  go build -o $BIN ./cmd/upwell
+  kill "$(cat $DATA/serve.pid)" 2>/dev/null || true
+  sleep 2
+  UPWELL_LOG_STDERR=1 setsid $BIN serve --config $DATA/config.yaml >>$DATA/serve.log 2>&1 < /dev/null &
+  echo $! > $DATA/serve.pid
+  for _ in $(seq 1 100); do curl -sk $BASE/readyz | grep -q '"ok":true' && break; sleep 0.2; done
   log "Reusing the running server (migration $E2E_MIG)"
   cd web
   set +e
@@ -136,14 +144,14 @@ SQL
 conn() { echo "{\"host\":\"127.0.0.1\",\"port\":$1,\"user\":\"doadmin\",\"password\":\"spike-password-not-secret\",\"dbname\":\"defaultdb\",\"sslmode\":\"disable\",\"storage_gb\":20}"; }
 perm='{"customer":"Example Customer","account_id":"acct-0001","ticket":"SUP-1234","granted_by":"Jamie Customer","granted_at":"2026-10-07","scope":"Copy e2e_shop to the target and cut over."}'
 
-define() { # name -> short id; sets connections, permission and databases
-  local name=$1 id
+define() { # name [target] -> id; sets connections, permission and databases
+  local name=$1 target=${2:-$DB} id
   id=$(api POST /api/v1/migrations "{\"name\":\"$name\"}" | json 'd["id"]')
   api PUT /api/v1/migrations/$id/permission "$perm" >/dev/null
   api PUT /api/v1/migrations/$id/connections/source "$(conn $SRC_PORT)" >/dev/null
   api PUT /api/v1/migrations/$id/connections/target "$(conn $DST_PORT)" >/dev/null
   # Include only $DB; discovery includes every database by default.
-  sel=$(api POST /api/v1/migrations/$id/discover | python3 -c "import sys,json; print(json.dumps([{'source_name':d['source_name'],'target_name':d['target_name'],'include':d['source_name']=='$DB'} for d in json.load(sys.stdin) if not d.get('skip_reason') or d['source_name']=='$DB']))")
+  sel=$(api POST /api/v1/migrations/$id/discover | python3 -c "import sys,json; print(json.dumps([{'source_name':d['source_name'],'target_name':('$target' if d['source_name']=='$DB' else d['target_name']),'include':d['source_name']=='$DB'} for d in json.load(sys.stdin) if not d.get('skip_reason') or d['source_name']=='$DB']))")
   api PUT /api/v1/migrations/$id/databases "$sel" >/dev/null
   echo "$id"
 }
@@ -174,7 +182,8 @@ echo "database state: $st"
 WRITER=$!
 
 log "Draft migration for the wizard"
-DRAFT=$(define "Draft: wizard walkthrough")
+psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS ${DB}_draft WITH (FORCE)"
+DRAFT=$(define "Draft: wizard walkthrough" "${DB}_draft")
 api POST /api/v1/migrations/$DRAFT/preflight >/dev/null
 wait_preflight $DRAFT
 

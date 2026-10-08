@@ -276,6 +276,9 @@ func (o *Orchestrator) ListMigrations(ctx context.Context) ([]Migration, error) 
 
 func (o *Orchestrator) saveFlags(ctx context.Context, id string, f Flags) error {
 	_, err := o.st.DB.ExecContext(ctx, `UPDATE migrations SET flags=?, updated_at=? WHERE id=?`, toJSON(f), store.Now(), id)
+	if err != nil {
+		o.logf("error", "orchestrator", id, "", "", "saving migration flags failed: %v", err)
+	}
 	return err
 }
 
@@ -369,6 +372,9 @@ func (o *Orchestrator) setDB(ctx context.Context, id string, cols map[string]any
 	sets = append(sets, "updated_at=?")
 	args = append(args, store.Now(), id)
 	_, err := o.st.DB.ExecContext(ctx, `UPDATE migration_databases SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
+	if err != nil {
+		o.logf("error", "orchestrator", "", "", "", "saving database %s state failed: %v", id, err)
+	}
 	return err
 }
 

@@ -134,7 +134,7 @@ export function AlertsScreen() {
               { key: "msg", label: "Alert", sort: (a) => a.message, render: (a) => <div className="stack" style={{ gap: 2 }}><span className="wrapany">{a.message}</span><span className="small faint mono">{a.rule}{a.scope ? ` · ${a.scope}` : ""}</span>{a.ack_note && <span className="small muted">Note from {a.acked_by}: {a.ack_note}</span>}</div> },
               { key: "mig", label: "Migration", sort: (a) => names.get(a.migration_id || "")?.name || "", render: (a) => { const m = names.get(a.migration_id || ""); return m ? <Link to={`/migrations/${m.short_id}`}><Trunc>{m.name}</Trunc></Link> : <span className="faint">Host</span>; }, width: 200 },
               { key: "since", label: "Since", sort: (a) => a.first_at, render: (a) => <span title={time(a.first_at)}>{ago(a.first_at, now)}</span>, csv: (a) => new Date(a.first_at).toISOString(), width: 120 },
-              { key: "act", label: "", render: (a) => a.state === "firing" && can("operator") ? <button onClick={() => setAck(a)}>Acknowledge</button> : null, width: 140 },
+              { key: "act", label: "Actions", srLabel: true, render: (a) => a.state === "firing" && can("operator") ? <button onClick={() => setAck(a)}>Acknowledge</button> : null, width: 140 },
             ]} />
         )}
       </Card>
@@ -317,7 +317,7 @@ function UsersSection() {
         {users.error ? <ErrorState error={users.error} retry={users.refresh} /> : !users.data ? <Skeleton lines={4} /> : (
           <div className="tablewrap">
             <table className="data" aria-label="Users">
-              <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead>
+              <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last sign-in</th><th><span className="sr-only">Actions</span></th></tr></thead>
               <tbody>{users.data.map((u) => (
                 <tr key={u.id}>
                   <td style={{ maxWidth: 240 }}><Trunc>{u.username}</Trunc></td>

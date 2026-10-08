@@ -90,7 +90,10 @@ export async function layoutViolations(page: Page): Promise<Violation[]> {
       return r;
     };
     const boxes: { el: Element; l: number; t: number; r: number; b: number }[] = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    // With a modal open, only the modal is visible and interactive.
+    const modals = Array.from(document.querySelectorAll('[aria-modal="true"]'));
+    const scope = modals.length ? modals[modals.length - 1] : document.body;
+    const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
     while (walker.nextNode()) {
       const n = walker.currentNode as Text;
       if (!n.textContent || !n.textContent.trim()) continue;
@@ -128,7 +131,7 @@ export async function layoutViolations(page: Page): Promise<Violation[]> {
       }
     }
     // Clipping: overflow hidden that cuts text needs an ellipsis and the full value in a tooltip.
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>("body *"))) {
+    for (const el of Array.from(scope.querySelectorAll<HTMLElement>("*"))) {
       if (el.closest("svg, select, input, textarea, iframe, .sr-only")) continue;
       if (!el.textContent || !el.textContent.trim()) continue;
       const cs = getComputedStyle(el);

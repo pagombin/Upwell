@@ -222,7 +222,7 @@ export function VerificationTab() {
           <Card key={db} title={<span className="row" style={{ gap: 8, flexWrap: "nowrap" }}><Trunc className="mono">{db}</Trunc><Pill kind={bad ? "crit" : "ok"} text={bad ? "Failed" : "Passed"} /></span>}>
             <div className="tablewrap">
               <table className="data" aria-label={`Verification for ${db}`}>
-                <thead><tr><th style={{ width: 150 }}>Result</th><th>Check</th><th>Detail</th><th style={{ width: 100 }}></th></tr></thead>
+                <thead><tr><th style={{ width: 150 }}>Result</th><th>Check</th><th>Detail</th><th style={{ width: 100 }}><span className="sr-only">Evidence</span></th></tr></thead>
                 <tbody>
                   {rows.map((r) => (
                     <tr key={r.check_id}>

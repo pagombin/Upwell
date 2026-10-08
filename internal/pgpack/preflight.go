@@ -153,6 +153,7 @@ func (r *Runner) Run(ctx context.Context) {
 	r.migrationChecks()
 	r.hostChecks(ctx)
 	r.clusterChecks(ctx)
+	r.clientVersionCheck()
 	defer func() {
 		if r.src != nil {
 			r.src.Close(ctx)
@@ -209,6 +210,33 @@ func toolMajor(path string) (int, string, error) {
 	return n, strings.TrimSpace(string(out)), nil
 }
 
+// clientVersionCheck: pg_dump and pg_restore must be at least the source's
+// major version (a dump tool cannot read a newer server's catalog).
+func (r *Runner) clientVersionCheck() {
+	if r.srcVer == 0 {
+		return
+	}
+	t := time.Now()
+	srcMajor := r.srcVer / 10000
+	ev := map[string]any{"source_major": srcMajor, "target_major": r.dstVer / 10000}
+	low := []string{}
+	for _, tool := range []string{"pg_dump", "pg_restore"} {
+		maj, out, err := toolMajor(r.bin(tool))
+		ev[tool] = out
+		if err != nil {
+			low = append(low, fmt.Sprintf("%s (%v)", tool, err))
+		} else if maj < srcMajor {
+			low = append(low, fmt.Sprintf("%s %d", tool, maj))
+		}
+	}
+	if len(low) > 0 {
+		r.emit("client_version", "", "", check.Blocker, true, fmt.Sprintf("The source runs PostgreSQL %d but this droplet has %s.", srcMajor, strings.Join(low, " and ")),
+			"Run install.sh again; it installs the newest PostgreSQL client, which reads every older server.", ev, t)
+		return
+	}
+	ok(r, "client_version", "", "", fmt.Sprintf("pg_dump and pg_restore can read the source's PostgreSQL %d.", srcMajor), ev, t)
+}
+
 func (r *Runner) hostChecks(ctx context.Context) {
 	e := r.Env
 	t := time.Now()
@@ -245,7 +273,7 @@ func (r *Runner) hostChecks(ctx context.Context) {
 	t = time.Now()
 	ncpu := runtime.NumCPU()
 	var si syscall.Sysinfo_t
-	syscall.Sysinfo(&si)
+	_ = syscall.Sysinfo(&si)
 	ram := float64(si.Totalram) * float64(si.Unit) / (1 << 30)
 	var free float64
 	var st syscall.Statfs_t
@@ -280,7 +308,7 @@ func (r *Runner) hostChecks(ctx context.Context) {
 		f.Close()
 		os.Remove(f.Name())
 		var rootSt syscall.Statfs_t
-		syscall.Statfs("/", &rootSt)
+		_ = syscall.Statfs("/", &rootSt)
 		if rootSt.Fsid == st.Fsid {
 			r.emit("work_dir", "", "", check.Warning, false, "The work directory is on the root filesystem; a filling disk would affect the whole droplet.", "Mount a dedicated block-storage volume at "+e.WorkDir+".", ev, t)
 		} else {

@@ -156,7 +156,7 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute
 <h2>Customer permission</h2>
 {{with .Permission}}<table><tr><th>Customer</th><td>{{.Customer}}</td><th>Account</th><td>{{.AccountID}}</td></tr><tr><th>Ticket</th><td>{{.Ticket}}</td><th>Granted by</th><td>{{.GrantedBy}} on {{.GrantedAt}}</td></tr><tr><th>Scope</th><td colspan="3">{{.Scope}}</td></tr></table>{{else}}<p>No permission record.</p>{{end}}
 <h2>Clusters</h2>
-<table><tr><th></th><th>Host</th><th>Port</th><th>User</th><th>SSL</th></tr>
+<table><tr><th>Cluster</th><th>Host</th><th>Port</th><th>User</th><th>SSL</th></tr>
 {{with .Source}}<tr><th>Source</th><td>{{.Host}}</td><td>{{.Port}}</td><td>{{.User}}</td><td>{{.SSLMode}}</td></tr>{{end}}
 {{with .Target}}<tr><th>Target</th><td>{{.Host}}</td><td>{{.Port}}</td><td>{{.User}}</td><td>{{.SSLMode}}</td></tr>{{end}}</table>
 <p class="muted">Engine pgcopydb {{.EngineVersion}} · Upwell {{.AppVersion}}{{with .Migration.Flags.Cutover}} · write pause {{dur .WritePauseMS}}{{end}}</p>

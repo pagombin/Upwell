@@ -104,7 +104,7 @@ func (s *Systemd) Start(ctx context.Context, sp Spec) error {
 	if _, err := WriteEnvFile(sp); err != nil {
 		return err
 	}
-	systemctl(ctx, "reset-failed", s.UnitName(sp.Instance))
+	_, _ = systemctl(ctx, "reset-failed", s.UnitName(sp.Instance))
 	_, err := systemctl(ctx, "start", "--no-block", s.UnitName(sp.Instance))
 	return err
 }
@@ -144,7 +144,7 @@ func (s *Systemd) Status(ctx context.Context, inst string) (Status, error) {
 
 // Forget resets a failed instance.
 func (s *Systemd) Forget(ctx context.Context, inst string) error {
-	systemctl(ctx, "reset-failed", s.UnitName(inst))
+	_, _ = systemctl(ctx, "reset-failed", s.UnitName(inst))
 	return nil
 }
 
@@ -283,7 +283,7 @@ func (l *Local) Start(ctx context.Context, sp Spec) error {
 				code = -1
 			}
 		}
-		os.WriteFile(l.exitFile(inst), []byte(strconv.Itoa(code)), 0o640)
+		_ = os.WriteFile(l.exitFile(inst), []byte(strconv.Itoa(code)), 0o640)
 	}(sp.Instance)
 	return nil
 }
@@ -351,10 +351,10 @@ func (l *Local) signal(inst string, sig syscall.Signal) {
 		}
 	}
 	for _, p := range l.procs(inst) {
-		syscall.Kill(p, sig)
+		_ = syscall.Kill(p, sig)
 	}
 	if pid := l.mainPID(inst); pid > 0 {
-		syscall.Kill(-pid, sig)
+		_ = syscall.Kill(-pid, sig)
 	}
 }
 

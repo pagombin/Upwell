@@ -157,7 +157,7 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 		c.markStale(ctx, m, "target", err)
 	}
 	if dcn != nil {
-		defer dcn.Close(ctx)
+		defer func() { _ = dcn.Close(ctx) }()
 	}
 	for _, d := range dbs {
 		c.put(ctx, m.ID, d.SourceName, "state", stateCode[d.State], ts)
@@ -559,7 +559,7 @@ func (o *Orchestrator) diskGuard(ctx context.Context, pct float64) {
 	if best < 0 {
 		return
 	}
-	o.stopUnit(ctx, bestM, bestD)
+	o.mustStop(ctx, bestM, bestD, "disk guard")
 	o.endAttempt(ctx, bestD, nil, "disk guard")
 	o.setDB(ctx, bestD.ID, map[string]any{"state": DStopped, "next_retry_at": nil, "last_error": fmt.Sprintf("Stopped by the disk guard: the work volume reached %.0f%%", pct)})
 	o.Event(ctx, bestM.ID, bestD.SourceName, "disk_guard", "critical", fmt.Sprintf("Disk guard stopped %s (largest staging, %s) at %.0f%% work-volume use", bestD.SourceName, humanSize(best), pct), nil)

@@ -174,7 +174,7 @@ func serve(args []string) error {
 	if n, _ := a.auth.CountUsers(context.Background()); n == 0 {
 		if _, err := os.Stat(cfg.SetupToken); os.IsNotExist(err) {
 			os.MkdirAll(filepath.Dir(cfg.SetupToken), 0o750)
-			os.WriteFile(cfg.SetupToken, []byte(auth.RandomToken(16)+"\n"), 0o600)
+			_ = os.WriteFile(cfg.SetupToken, []byte(auth.RandomToken(16)+"\n"), 0o600)
 		}
 		a.log.Logf("warn", "api", "", "no users yet: open the console and complete first-run setup with the token in %s", cfg.SetupToken)
 	}
@@ -466,7 +466,7 @@ func keyCmd(args []string) error {
 		os.Remove(tmp)
 		return err
 	}
-	os.Rename(cfg.MasterKey, cfg.MasterKey+".old")
+	_ = os.Rename(cfg.MasterKey, cfg.MasterKey+".old")
 	if err := os.Rename(tmp, cfg.MasterKey); err != nil {
 		return err
 	}

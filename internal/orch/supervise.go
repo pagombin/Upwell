@@ -124,13 +124,13 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		if !st.MainLive && len(st.Procs) > 0 && st.MainPID > 0 {
 			o.Event(ctx, m.ID, d.SourceName, "degraded", "critical", fmt.Sprintf("%s is degraded: the engine's main process died but %d sub-process(es) still run; stopping the unit", d.SourceName, len(st.Procs)), nil)
 			o.setDB(ctx, d.ID, map[string]any{"state": DDegraded})
-			o.stopUnit(ctx, m, d)
+			o.mustStop(ctx, m, d, "degraded")
 			o.endAttempt(ctx, d, nil, "degraded: main process died")
 			o.afterExit(ctx, m, d, engine.FailTransient, "the engine's main process died")
 			return
 		}
 		if classes.slotLost {
-			o.stopUnit(ctx, m, d)
+			o.mustStop(ctx, m, d, "slot lost")
 			o.endAttempt(ctx, d, nil, "replication slot invalidated")
 			o.afterExit(ctx, m, d, engine.FailSlotLost, classes.lastError)
 			return
@@ -138,7 +138,7 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		// F10: a failed base copy leaves the run streaming. Detect it from the log.
 		if !d.BaseCopyDone && (classes.baseCopyFailed || classes.errors > 0) {
 			o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", "The base copy of "+d.SourceName+" failed ("+classes.lastError+"); stopping the unit, because pgcopydb keeps streaming after such a failure", nil)
-			o.stopUnit(ctx, m, d)
+			o.mustStop(ctx, m, d, "base copy failed")
 			o.endAttempt(ctx, d, nil, "base copy failed: "+classes.lastError)
 			o.afterExit(ctx, m, d, engine.FailBaseCopy, classes.lastError)
 			return
@@ -177,8 +177,7 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	}
 
 	// The unit is no longer running.
-	var reason string
-	cls := engine.FailNone
+	var reason, cls string
 	switch {
 	case classes.endposReached || (d.State == DDraining && classes.errors == 0):
 		cls = engine.FailEndposReached
@@ -233,11 +232,16 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 			o.Event(ctx, m.ID, d.SourceName, "auto_restart", "warning", d.SourceName+": base copy failed ("+reason+"); restarting from zero automatically (under the size limit)", nil)
 			spec, err := o.dbSpec(ctx, m, d)
 			if err == nil {
-				o.eng.Cleanup(ctx, spec, engine.CleanupOptions{RemoveWorkDir: true})
-				resetTargetDB(ctx, spec)
+				if _, err = o.eng.Cleanup(ctx, spec, engine.CleanupOptions{RemoveWorkDir: true}); err == nil {
+					err = resetTargetDB(ctx, spec)
+				}
+			}
+			if err == nil {
 				o.setDB(ctx, d.ID, map[string]any{"state": DPending, "base_copy_done": 0, "last_error": reason, "error_class": cls})
 				return
 			}
+			// Copying again into a target that was not reset would mix data.
+			reason += "; the automatic restart could not reset the target: " + err.Error()
 		}
 		o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "last_error": "The base copy failed: " + reason})
 		o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", d.SourceName+": the base copy failed ("+reason+"). Restart it from zero; resuming a base copy cannot guarantee consistency.", nil)

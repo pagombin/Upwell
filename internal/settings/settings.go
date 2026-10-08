@@ -84,7 +84,7 @@ var Catalog = []Def{
 	def("disk_guard_stop_pct", "int", 95, 80, 99, "global", "Alerts", "%", "Stop the fastest-growing database to protect the volume."),
 	def("alert_slot_headroom_hours_warn", "float", 4, 0.1, 48, "global", "Alerts", "h", "Warn when a slot's WAL headroom runs out within this time."),
 	def("alert_slot_headroom_hours_crit", "float", 1, 0.1, 48, "global", "Alerts", "h", "Critical when a slot's WAL headroom runs out within this time."),
-	def("alert_heartbeat_seconds", "int", 60, 5, 3600, "global", "Alerts", "s", "Heartbeat latency warning while in sync."),
+	def("alert_heartbeat_seconds", "int", 300, 5, 3600, "global", "Alerts", "s", "Heartbeat latency warning while in sync. pgcopydb applies an idle database in batches, so 30 to 90 s is normal there."),
 	enum("log_level", "info", []string{"trace", "debug", "info", "warn", "error"}, "global", "Logging", "App log verbosity. Engine logs are always kept in full."),
 	def("log_retention_days", "int", 30, 1, 365, "global", "Logging", "days", "Log retention."),
 	def("session_idle_minutes", "int", 30, 5, 240, "global", "Access", "min", "Sign-in sessions end after this much inactivity."),

@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Empty } from "./ui";
 
 export interface Column<T> {
@@ -9,7 +9,8 @@ export interface Column<T> {
   csv?: (row: T) => string | number;
   num?: boolean;
   width?: number | string;
-  optional?: boolean; // can be hidden from the column chooser
+  optional?: boolean; // can be hidden from the column chooser, and is hidden first when the table is too wide
+  srLabel?: boolean; // header text for screen readers only
 }
 
 function csvCell(v: string | number) {
@@ -26,7 +27,28 @@ export function DataTable<T>({ rows, columns, rowKey, onRow, filterText, emptyTi
   const [q, setQ] = useState("");
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [chooser, setChooser] = useState(false);
-  const cols = columns.filter((c) => !hidden.has(c.key));
+  // Optional columns the user did not ask for are hidden, last first, while
+  // the table is wider than its container; widening the window brings them back.
+  const [auto, setAuto] = useState<string[]>([]);
+  const [chosen, setChosen] = useState<Set<string>>(new Set());
+  const wrap = useRef<HTMLDivElement>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = root.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((e) => setWidth(Math.round(e[0].contentRect.width)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  useLayoutEffect(() => { setAuto([]); }, [width]);
+  useLayoutEffect(() => {
+    const el = wrap.current;
+    if (!el || el.scrollWidth <= el.clientWidth + 1) return;
+    const next = [...columns].reverse().find((c) => c.optional && !hidden.has(c.key) && !auto.includes(c.key) && !chosen.has(c.key));
+    if (next) setAuto((a) => [...a, next.key]);
+  }, [columns, hidden, auto, chosen, rows, width]);
+  const cols = columns.filter((c) => !hidden.has(c.key) && !auto.includes(c.key));
   const shown = useMemo(() => {
     let r = rows;
     if (q && filterText) {
@@ -54,7 +76,7 @@ export function DataTable<T>({ rows, columns, rowKey, onRow, filterText, emptyTi
     URL.revokeObjectURL(a.href);
   };
   return (
-    <div className="stack">
+    <div className="stack" ref={root}>
       {(filterText || csvName || toolbar || columns.some((c) => c.optional)) && (
         <div className="row">
           {filterText && <input className="search" type="search" placeholder="Filter" aria-label={`Filter ${label}`} value={q} onChange={(e) => setQ(e.target.value)} />}
@@ -67,7 +89,12 @@ export function DataTable<T>({ rows, columns, rowKey, onRow, filterText, emptyTi
                 <div className="card" style={{ position: "absolute", right: 0, top: 36, zIndex: 10, padding: 12, minWidth: 200, boxShadow: "var(--shadow)" }}>
                   <div className="stack" style={{ gap: 6 }}>
                     {columns.filter((c) => c.optional).map((c) => (
-                      <label key={c.key} className="check"><input type="checkbox" checked={!hidden.has(c.key)} onChange={() => setHidden((h) => { const n = new Set(h); if (n.has(c.key)) n.delete(c.key); else n.add(c.key); return n; })} />{c.label}</label>
+                      <label key={c.key} className="check"><input type="checkbox" checked={!hidden.has(c.key) && !auto.includes(c.key)} onChange={() => {
+                        const shown = !hidden.has(c.key) && !auto.includes(c.key);
+                        setHidden((h) => { const n = new Set(h); if (shown) n.add(c.key); else n.delete(c.key); return n; });
+                        setChosen((s) => { const n = new Set(s); if (shown) n.delete(c.key); else n.add(c.key); return n; });
+                        setAuto((a) => a.filter((k) => k !== c.key));
+                      }} />{c.label}</label>
                     ))}
                   </div>
                 </div>
@@ -78,7 +105,7 @@ export function DataTable<T>({ rows, columns, rowKey, onRow, filterText, emptyTi
         </div>
       )}
       {shown.length === 0 ? <Empty title={rows.length ? "Nothing matches the filter" : emptyTitle}>{rows.length ? "Clear the filter to see every row." : emptyHint}</Empty> : (
-        <div className="tablewrap">
+        <div className="tablewrap" ref={wrap}>
           <table className="data" aria-label={label}>
             <thead>
               <tr>
@@ -89,7 +116,7 @@ export function DataTable<T>({ rows, columns, rowKey, onRow, filterText, emptyTi
                       <button className="sort" onClick={() => setSort((s) => s?.key === c.key ? { key: c.key, dir: (s.dir * -1) as 1 | -1 } : { key: c.key, dir: c.num ? -1 : 1 })}>
                         {c.label}<span aria-hidden="true">{sort?.key === c.key ? (sort.dir === 1 ? "▲" : "▼") : ""}</span>
                       </button>
-                    ) : c.label}
+                    ) : c.srLabel ? <span className="sr-only">{c.label}</span> : c.label}
                   </th>
                 ))}
               </tr>

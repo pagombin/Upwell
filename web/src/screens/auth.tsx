@@ -37,7 +37,7 @@ export function SetupScreen() {
     } catch (e2) { setErr(e2 as ApiError); } finally { setBusy(false); }
   };
   return (
-    <div className="login">
+    <main className="login">
       <div className="card" style={{ width: "min(560px, 100%)" }}>
         <div className="cardhead"><h1>Finish setting up Upwell</h1></div>
         <div className="cardbody">
@@ -72,7 +72,7 @@ export function SetupScreen() {
           )}
         </div>
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -95,7 +95,7 @@ export function LoginScreen() {
     } catch (e2) { setErr(e2 as ApiError); } finally { setBusy(false); }
   };
   return (
-    <div className="login">
+    <main className="login">
       <div className="card">
         <div className="cardhead"><h1>Sign in</h1></div>
         <div className="cardbody">
@@ -111,6 +111,6 @@ export function LoginScreen() {
           </form>
         </div>
       </div>
-    </div>
+    </main>
   );
 }

@@ -196,7 +196,7 @@ function Palette({ onClose, migrations, current, onLogout }: { onClose: () => vo
   return (
     <div className="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="dialog palette" role="dialog" aria-modal="true" aria-label="Command palette">
-        <header>
+        <div className="dhead">
           <input autoFocus style={{ flex: 1 }} placeholder="Go to a screen, migration or action" aria-label="Search commands" value={q}
             role="combobox" aria-expanded="true" aria-controls="palette-list" aria-activedescendant={shown[sel] ? `pc-${shown[sel].id}` : undefined}
             onChange={(e) => setQ(e.target.value)}
@@ -206,7 +206,7 @@ function Palette({ onClose, migrations, current, onLogout }: { onClose: () => vo
               if (e.key === "Enter" && shown[sel]) shown[sel].run();
               if (e.key === "Escape") onClose();
             }} />
-        </header>
+        </div>
         <ul id="palette-list" role="listbox" aria-label="Commands">
           {shown.length === 0 && <li className="muted" style={{ padding: 8 }}>Nothing matches.</li>}
           {shown.map((c, i) => (

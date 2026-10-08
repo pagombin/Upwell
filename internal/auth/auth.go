@@ -324,7 +324,7 @@ func hashToken(t string) string { h := sha256.Sum256([]byte(t)); return hex.Enco
 
 func randHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	_, _ = rand.Read(b) // crypto/rand never fails on Linux
 	return hex.EncodeToString(b)
 }
 

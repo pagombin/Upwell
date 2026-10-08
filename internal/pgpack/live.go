@@ -22,7 +22,7 @@ func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
 		for rows.Next() {
 			var rel string
 			var done, total, tuples int64
-			rows.Scan(&rel, &done, &total, &tuples)
+			_ = rows.Scan(&rel, &done, &total, &tuples)
 			copies = append(copies, map[string]any{"table": rel, "bytes": done, "bytes_total": total, "tuples": tuples})
 		}
 		rows.Close()
@@ -33,7 +33,7 @@ func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
 		for rows.Next() {
 			var rel, phase string
 			var bd, bt, td, tt int64
-			rows.Scan(&rel, &phase, &bd, &bt, &td, &tt)
+			_ = rows.Scan(&rel, &phase, &bd, &bt, &td, &tt)
 			pct := 0.0
 			if bt > 0 {
 				pct = float64(bd) / float64(bt) * 100
@@ -75,7 +75,7 @@ func SourceHealth(ctx context.Context, src pg.Conn, dbs []string) map[string]any
 			var pid int32
 			var user, db, app, state, q string
 			var secs float64
-			rows.Scan(&pid, &user, &db, &app, &state, &secs, &q)
+			_ = rows.Scan(&pid, &user, &db, &app, &state, &secs, &q)
 			long = append(long, map[string]any{"pid": pid, "user": user, "database": db, "application": app, "state": state, "seconds": secs, "query": q})
 		}
 		rows.Close()
@@ -94,7 +94,7 @@ func SourceHealth(ctx context.Context, src pg.Conn, dbs []string) map[string]any
 				var t string
 				var dead, live, churnN int64
 				var since float64
-				rows.Scan(&t, &dead, &live, &churnN, &since)
+				_ = rows.Scan(&t, &dead, &live, &churnN, &since)
 				churn = append(churn, map[string]any{"database": db, "table": t, "dead_tuples": dead, "live_tuples": live, "changes": churnN, "since_vacuum_seconds": since})
 			}
 			rows.Close()

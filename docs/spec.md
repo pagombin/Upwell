@@ -539,7 +539,7 @@ Every default below is editable in Settings by an Admin. Settings marked "per mi
 | `alert_disk_warn_pct` / `alert_disk_crit_pct` | 70 / 85 | 50 to 99 | Global | Work-volume alerts |
 | `disk_guard_stop_pct` | 95 | 80 to 99 | Global | Stop the fastest-growing database to protect the volume |
 | `alert_slot_headroom_hours_warn` / `_crit` | 4 / 1 | 0.1 to 48 | Global | Slot invalidation forecasts |
-| `alert_heartbeat_seconds` | 60 | 5 to 3600 | Global | Heartbeat latency warning |
+| `alert_heartbeat_seconds` | 300 (D19) | 5 to 3600 | Global | Heartbeat latency warning while in sync |
 | `log_level` | info | trace to error | Global | App log verbosity (engine logs always kept in full) |
 | `log_retention_days` / `log_max_gb` | 30 / 10 | 1 to 365 / 1 to 500 | Global | Log retention |
 | `session_idle_minutes` / `session_max_hours` | 30 / 12 | 5 to 240 / 1 to 72 | Global | Sign-in sessions |

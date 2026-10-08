@@ -136,12 +136,12 @@ export function Dialog({ title, onClose, children, footer, wide }: { title: stri
   return (
     <div className="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className={`dialog ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={id} ref={ref}>
-        <header>
+        <div className="dhead">
           <h2 id={id}>{title}</h2>
           <button className="ghost icon" onClick={onClose} aria-label="Close">✕</button>
-        </header>
+        </div>
         <div className="body">{children}</div>
-        {footer && <footer>{footer}</footer>}
+        {footer && <div className="dfoot">{footer}</div>}
       </div>
     </div>
   );
@@ -190,7 +190,7 @@ export function Drawer({ title, onClose, children }: { title: ReactNode; onClose
   }, [onClose]);
   return (
     <aside className="drawer" role="dialog" aria-label={typeof title === "string" ? title : "Details"}>
-      <header><h2>{title}</h2><button className="ghost icon" onClick={onClose} aria-label="Close">✕</button></header>
+      <div className="dhead"><h2>{title}</h2><button className="ghost icon" onClick={onClose} aria-label="Close">✕</button></div>
       <div className="body">{children}</div>
     </aside>
   );

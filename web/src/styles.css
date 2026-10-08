@@ -267,13 +267,13 @@ table.data tr.clickable { cursor: pointer; }
 .overlay { position: fixed; inset: 0; background: rgba(5, 9, 13, 0.6); display: grid; place-items: center; z-index: 50; padding: var(--s5); }
 .dialog { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: var(--shadow); width: min(560px, 100%); max-height: 90vh; overflow: auto; display: flex; flex-direction: column; }
 .dialog.wide { width: min(880px, 100%); }
-.dialog header { padding: var(--s4); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: var(--s3); }
-.dialog header h2 { flex: 1; }
+.dialog .dhead { padding: var(--s4); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: var(--s3); }
+.dialog .dhead h2 { flex: 1; }
 .dialog .body { padding: var(--s4); display: flex; flex-direction: column; gap: var(--s3); }
-.dialog footer { padding: var(--s3) var(--s4); border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: var(--s2); flex-wrap: wrap; }
+.dialog .dfoot { padding: var(--s3) var(--s4); border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: var(--s2); flex-wrap: wrap; }
 .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100%); background: var(--surface); border-left: 1px solid var(--border-strong); box-shadow: var(--shadow); z-index: 40; display: flex; flex-direction: column; }
-.drawer header { padding: var(--s4); border-bottom: 1px solid var(--border); display: flex; gap: var(--s3); align-items: center; }
-.drawer header h2 { flex: 1; min-width: 0; }
+.drawer .dhead { padding: var(--s4); border-bottom: 1px solid var(--border); display: flex; gap: var(--s3); align-items: center; }
+.drawer .dhead h2 { flex: 1; min-width: 0; }
 .drawer .body { padding: var(--s4); overflow: auto; display: flex; flex-direction: column; gap: var(--s3); }
 .toasts { position: fixed; bottom: var(--s4); right: var(--s4); display: flex; flex-direction: column; gap: var(--s2); z-index: 60; max-width: 420px; }
 .toast { background: var(--raised); border: 1px solid var(--border-strong); border-left: 3px solid var(--info); border-radius: var(--radius); padding: var(--s3) var(--s4); box-shadow: var(--shadow); display: flex; gap: var(--s3); align-items: flex-start; }

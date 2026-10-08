@@ -464,7 +464,9 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		if time.Since(lastNudge) > 60*time.Second {
 			for _, d := range dbs {
 				spec, _ := o.dbSpec(bg, m, d)
-				o.eng.Nudge(bg, spec)
+				if err := o.eng.Nudge(bg, spec); err != nil {
+					op.LogDB("warn", d.SourceName, "nudge failed: %v", err)
+				}
 			}
 			lastNudge = time.Now()
 		}

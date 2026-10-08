@@ -301,7 +301,9 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		done = append(done, "stopped engine unit")
 	}
 	if _, err := os.Stat(filepath.Join(p.WorkDir, "schema", "source.db")); err == nil {
-		pg.WritePassFile(p.PassFile, d.SourceConn, d.TargetConn)
+		if err := pg.WritePassFile(p.PassFile, d.SourceConn, d.TargetConn); err != nil {
+			return done, fmt.Errorf("writing the password file for cleanup: %w", err)
+		}
 		if _, err := e.run(ctx, 2*time.Minute, p, "stream", "cleanup", "--source", d.SourceConn.WithDB(d.Source).URI(), "--target", d.TargetConn.WithDB(d.Target).URI(), "--dir", p.WorkDir); err == nil {
 			done = append(done, "pgcopydb stream cleanup")
 		}
@@ -311,7 +313,7 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		return done, fmt.Errorf("source: %w", err)
 	}
 	if src != nil {
-		ReleaseSlot(ctx, d.SourceConn.WithDB(d.Source), d.SlotName, 2*time.Second, 20*time.Second)
+		_, _, _ = ReleaseSlot(ctx, d.SourceConn.WithDB(d.Source), d.SlotName, 2*time.Second, 20*time.Second)
 		var n int
 		src.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&n)
 		if n > 0 {
@@ -365,7 +367,7 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		os.Remove(p.PassFile)
 		done = append(done, "removed work directory")
 	}
-	e.Runner.Forget(ctx, d.Instance)
+	_ = e.Runner.Forget(ctx, d.Instance)
 	return done, nil
 }
 
