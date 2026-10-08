@@ -186,6 +186,10 @@ if id upwell >/dev/null 2>&1; then say "service user" "unchanged"
 elif check; then would "service user" "create upwell"
 else useradd --system --home-dir "$DATA" --shell /usr/sbin/nologin upwell; say "service user" "created upwell"; CHANGED=1
 fi
+# The app reads its engine units' journal to explain failures before pgcopydb logs anything.
+if id upwell >/dev/null 2>&1 && ! id -nG upwell | grep -qw systemd-journal; then
+  if check; then would "service user" "add upwell to systemd-journal"; else usermod -aG systemd-journal upwell; say "service user" "added to systemd-journal"; CHANGED=1; fi
+fi
 dirs_ok=1
 for d in "$DATA" "$DATA/runs" "$LOGD"; do [[ -d $d && $(stat -c %U "$d" 2>/dev/null) == upwell ]] || dirs_ok=0; done
 [[ -d $ETC ]] || dirs_ok=0

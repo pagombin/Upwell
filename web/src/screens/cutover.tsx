@@ -50,7 +50,7 @@ export function CutoverTab() {
   const pauseStart = c?.writes_stopped_at || c?.started_at;
   const pauseMs = pauseStart ? (c?.ended_at || now) - pauseStart : 0;
   const retryable = m.flags.verdict === "NO-GO" && !endposSet;
-  const canStart = can("operator") && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
+  const canStart = can("operator") && !m.fixture && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
   return (
     <div className="stack" style={{ gap: 24 }}>
       <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
@@ -119,7 +119,7 @@ export function CutoverTab() {
         <Card title="After GO">
           <ol className="stack" style={{ margin: 0, paddingLeft: 18, gap: 8 }}>
             <li>Point every application at the target cluster and start writers there.</li>
-            <li>Mark applications as switched {m.flags.apps_switched ? <Pill kind="ok" text="Done" /> : m.flags.verdict === "GO" && can("operator") ? <button style={{ marginLeft: 8 }} onClick={() => setSwitched(true)}>Mark switched</button> : null}</li>
+            <li>Mark applications as switched {m.flags.apps_switched ? <Pill kind="ok" text="Done" /> : m.flags.verdict === "GO" && can("operator") && !m.fixture ? <button style={{ marginLeft: 8 }} onClick={() => setSwitched(true)}>Mark switched</button> : null}</li>
             <li>Read and keep the <Link to="../report">report</Link>.</li>
             <li>Clean up: removes slots, origins and the heartbeat schema.</li>
           </ol>
@@ -204,7 +204,8 @@ export function VerificationTab() {
   const byDb = useMemo(() => {
     const g = new Map<string, VerificationRow[]>();
     for (const r of ver.data?.results || []) { if (!g.has(r.database)) g.set(r.database, []); g.get(r.database)!.push(r); }
-    return [...g.entries()];
+    // Failed databases first, so a NO-GO's cause is at the top.
+    return [...g.entries()].sort((a, b) => Number(b[1].some((r) => r.result === "blocker")) - Number(a[1].some((r) => r.result === "blocker")) || a[0].localeCompare(b[0]));
   }, [ver.data]);
   const m = view.data!.migration;
   return (
@@ -212,7 +213,7 @@ export function VerificationTab() {
       <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
       <div className="row">
         <span className="muted" style={{ flex: 1 }}>Upwell never accepts the engine's own success: each database is checked for the final heartbeat, the target origin position, the schema, row counts and row checksums.</span>
-        {can("operator") && m.flags.verdict && !m.flags.cleaned_up && <button disabled={!!busy} onClick={async () => { const r = await run("v", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/verify`)); if (r) ops.open(r.operation_id, "Verify again"); }}>Verify again</button>}
+        {can("operator") && !m.fixture && m.flags.verdict && !m.flags.cleaned_up && <button disabled={!!busy} onClick={async () => { const r = await run("v", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/verify`)); if (r) ops.open(r.operation_id, "Verify again"); }}>Verify again</button>}
       </div>
       {ver.error ? <ErrorState error={ver.error} retry={ver.refresh} /> : !ver.data ? <Skeleton lines={8} /> : byDb.length === 0 ? (
         <Empty title="Not verified yet">Verification runs as part of the cutover, after every database drains to its end position.</Empty>

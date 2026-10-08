@@ -196,6 +196,9 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	default:
 		cls, reason = engine.FailTransient, firstNonEmpty(classes.lastError, "the engine exited unexpectedly")
 	}
+	if classes.lastError == "" && st.Detail != "" {
+		reason += " (" + st.Detail + ")"
+	}
 	o.endAttempt(ctx, d, st.ExitCode, reason)
 	if st.ExitCode != nil {
 		reason = fmt.Sprintf("%s (exit code %d)", reason, *st.ExitCode)

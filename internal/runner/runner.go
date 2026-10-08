@@ -36,6 +36,10 @@ type Status struct {
 	Procs    []int `json:"procs"`
 	ExitCode *int  `json:"exit_code,omitempty"`
 	Known    bool  `json:"known"`
+	// Detail explains a unit that ended without success in the runner's own
+	// terms (systemd's Result and the unit's last journal lines), for when
+	// the engine wrote nothing to its log.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Runner manages units.
@@ -129,7 +133,7 @@ func (s *Systemd) Stop(ctx context.Context, inst string, _ time.Duration) error 
 
 // Status reads ActiveState, MainPID, ExecMainStatus and the cgroup's processes.
 func (s *Systemd) Status(ctx context.Context, inst string) (Status, error) {
-	out, err := systemctl(ctx, "show", "-p", "ActiveState,SubState,MainPID,ExecMainStatus,ExecMainCode,ControlGroup,LoadState", s.UnitName(inst))
+	out, err := systemctl(ctx, "show", "-p", "ActiveState,SubState,MainPID,ExecMainStatus,ExecMainCode,ControlGroup,LoadState,Result", s.UnitName(inst))
 	if err != nil {
 		return Status{}, err
 	}
@@ -149,6 +153,17 @@ func (s *Systemd) Status(ctx context.Context, inst string) (Status, error) {
 	if !st.Active && kv["ExecMainCode"] != "" && kv["ExecMainCode"] != "0" {
 		if c, err := strconv.Atoi(kv["ExecMainStatus"]); err == nil {
 			st.ExitCode = &c
+		}
+	}
+	if !st.Active && kv["Result"] != "" && kv["Result"] != "success" {
+		st.Detail = "systemd: unit result " + kv["Result"]
+		// The journal says why systemd could not run it (for example a
+		// sandboxing or environment-file error). Best effort: the upwell user
+		// reads it through the systemd-journal group.
+		if j, err := exec.CommandContext(ctx, "journalctl", "-u", s.UnitName(inst), "-n", "3", "-o", "cat", "--no-pager").Output(); err == nil {
+			if lines := strings.TrimSpace(string(j)); lines != "" {
+				st.Detail += ": " + strings.ReplaceAll(lines, "\n", " / ")
+			}
 		}
 	}
 	return st, nil

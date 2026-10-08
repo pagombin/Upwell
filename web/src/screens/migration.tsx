@@ -77,6 +77,7 @@ function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => voi
   const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | null>(null);
   const m = v.migration, f = m.flags;
   if (!can("operator")) return null;
+  if (m.fixture) return <div className="actions"><span className="small muted">Demonstration data: actions are turned off</span></div>;
   const inCutover = !!f.cutover && !f.cutover.ended_at;
   const mid = m.id;
   return (
