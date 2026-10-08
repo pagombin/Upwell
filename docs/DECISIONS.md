@@ -94,3 +94,6 @@ With test_decoding, pgcopydb 0.18 cannot parse a logical decoding message and it
 
 ## D31. Log lines from before an attempt are never classified against it
 The tailer resumes at its stored offset, so the last lines of a stopped run (for example "Apply process has terminated") could be read after the next attempt started and counted against it. Lines timestamped before the attempt began (by less than 30 minutes, so a clock or time-zone difference can never hide real errors) are now indexed but not classified. Stall detection (D26) also stays out of drains, where apply exiting at the end position is expected.
+
+## D32. A target with no heartbeat at all counts as behind
+Heartbeat lag was measured only once the target held at least one heartbeat row. When the target applied nothing from the start of streaming (F2 after a privilege was revoked), the lag condition read "Not measured yet" for ever, which blocked the cutover but gave no explanation. Lag is now measured from the oldest source heartbeat when the target has none, so the readiness gate says how far behind the target is. Found by the regression run (TestS02PrivilegeLostMidStream), which now checks both layers: readiness refuses the cutover, and an operator who raises the limit still gets NO-GO.

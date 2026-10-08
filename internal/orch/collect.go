@@ -206,6 +206,11 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 					var sMax, tMax *time.Time
 					s.QueryRow(ctx, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&sMax)
 					t.QueryRow(ctx, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&tMax)
+					if sMax != nil && tMax == nil {
+						// No heartbeat has reached the target at all: it is at
+						// least as far behind as the oldest one on the source.
+						s.QueryRow(ctx, `SELECT min(written_at) FROM upwell.heartbeat`).Scan(&tMax)
+					}
 					if sMax != nil && tMax != nil {
 						c.put(ctx, m.ID, d.SourceName, "heartbeat_latency_s", sMax.Sub(*tMax).Seconds(), ts)
 					}

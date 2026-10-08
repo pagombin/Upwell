@@ -142,6 +142,26 @@ func TestS02PrivilegeLostMidStream(t *testing.T) {
 	time.Sleep(6 * time.Second)
 	w.Stop()
 	e.waitDBState(id, name, 2*time.Minute, orch.DInSync)
+	// First line of defence: nothing reaches the target, so the heartbeat
+	// latency grows and the readiness gate refuses the cutover before anyone
+	// stops writers.
+	setSetting(t, e, "cutover_max_lag_seconds", 15)
+	var rd struct {
+		Ready      bool             `json:"ready"`
+		Conditions []orch.Condition `json:"conditions"`
+	}
+	e.waitFor(3*time.Minute, "the lag condition to fail", func() bool {
+		e.do("GET", "/api/v1/migrations/"+id+"/cutover/readiness", nil, &rd, 200)
+		for _, c := range rd.Conditions {
+			if c.Key == "lag" && !c.OK && strings.Contains(c.Detail, "behind") {
+				t.Logf("readiness refuses: %s: %s", c.Label, c.Detail)
+				return !rd.Ready
+			}
+		}
+		return false
+	})
+	// Second line: an operator who raises the limit still gets NO-GO.
+	setSetting(t, e, "cutover_max_lag_seconds", 86400)
 	op := e.startCutover(id)
 	v := e.migration(id)
 	if v.Migration.Flags.Verdict != "NO-GO" {
@@ -226,4 +246,11 @@ func TestVerificationChecksumMismatch(t *testing.T) {
 		t.Fatalf("expected a checksum blocker naming public.orders: %+v", ver.Results)
 	}
 	e.cleanup(id, "Checksum")
+}
+
+func setSetting(t *testing.T, e *Env, key string, v any) {
+	t.Helper()
+	if _, _, err := e.Orch.SettingsService().Set(context.Background(), key, v, "test"); err != nil {
+		t.Fatal(err)
+	}
 }
