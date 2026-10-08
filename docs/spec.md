@@ -17,6 +17,10 @@ Conventions:
 
 Definition of done for any feature: it works from the UI and the API, it writes structured logs and audit events, it survives an app restart and a droplet reboot in the state the operator expects, it has unit tests and at least one integration test against real PostgreSQL, and its failure modes produce an actionable message (what happened, what it means, what to do).
 
+## Phase 0 amendments (accepted Oct 8, 2026)
+
+The Phase 0 findings ([docs/phase0/findings.md](phase0/findings.md)) proposed fourteen changes. All fourteen are accepted and applied in the sections below; each amended passage cites its change number (PC1 to PC14). In short: engines run from a template unit (PC1); every stop is a SIGKILL of the whole cgroup after 10 s (PC2); the drain nudges immediately (PC3); preflight gains `target_apply_privileges` and per-database freeze availability (PC4); pgcopydb's own positions are never proof (PC5); cleanup drops origins by name and handles runs that never reached CDC (PC6); metrics use a series-plus-samples shape (PC7); prune is never called (PC8); upstream reports (PC9); slot loss is classified by `wal_status` (PC10); preflight compares WAL rate with receive throughput (PC11); the coordinator is never used (PC12); the cutover requires proof that the last writes arrived (PC13); base-copy failure is detected from the log (PC14).
+
 ## Product summary
 
 Upwell moves a customer's databases from a Standard cluster to an Advanced cluster with the application online until a short, measured write pause at cutover. It wraps proven tooling (pgcopydb first) in a guided, observable, auditable workflow that a support engineer can run confidently on databases from a few GB to multiple TB.
@@ -73,7 +77,7 @@ The product is **Upwell**: data rising steadily from Standard to Advanced, in Di
 | Binary and CLI | `upwell` (`upwell serve`, `upwell selftest`, `upwell migrate ...`) |
 | Installer | `install.sh`, published as `install-upwell.sh` |
 | App service and health timer | `upwell.service`, `upwell-health.timer` |
-| Engine units | `upwell-eng-<migration>-<db>.service` |
+| Engine units | `upwell-eng@<migration>-<db>.service`, instances of the installed template `upwell-eng@.service` (PC1) |
 | Service user and group | `upwell` |
 | Paths | `/etc/upwell`, `/var/lib/upwell`, `/var/log/upwell` |
 | Replication slots, origins, publications | `upwell_<migration>_<db>`, lowercase, at most 63 characters |
@@ -99,7 +103,7 @@ The browser, Prometheus and the DO API talk only to the app. The app controls en
 | API layer | REST for commands and queries, Server-Sent Events (SSE) for live streams (progress, logs, events). Authentication, RBAC and audit on every mutating call. |
 | Orchestrator | Owns the migration state machine. Runs preflight, launches and supervises engine units, drives cutover, applies retry policy, reconciles state after restart or reboot. Single writer for migration state. |
 | Engine interface | The contract every engine implements (see Engine interface). The pgcopydb engine translates it into pgcopydb commands, files and signals. |
-| Engine units | One systemd transient service per database being migrated (`upwell-eng-<migration>-<db>.service`), created with `systemd-run`. systemd tracks every child process in the unit's cgroup, so stopping the unit stops all of them. |
+| Engine units | One systemd service instance per database being migrated (`upwell-eng@<migration>-<db>.service`), an instance of the template `upwell-eng@.service` that the installer ships. The template fixes the user, the engine binary and the kill settings; the app supplies only the engine's arguments through a per-run environment file (PC1). systemd tracks every child process in the unit's cgroup, so stopping the unit stops all of them. |
 | Collectors | Goroutines that sample source, target, engine and host metrics on an interval, write them to the metrics store and publish them to the event bus. |
 | Check registry | Preflight and verification checks as independent, versioned units with IDs, levels and remediation text. |
 | Logger | Structured logging for the app, plus capture and parsing of every engine log line, all addressable by migration, database and component. |
@@ -116,7 +120,7 @@ Technology choices, with the reason for each:
 - **systemd** for the app service, the watchdog and every engine unit. Ubuntu 24.04 LTS is the supported OS; 22.04 should work.
 - **No external services** required: no Redis, no message broker, no separate database server, no internet access after install (the DO API is optional).
 
-Why engine processes run in systemd units rather than as children of the app: the harness proved that pgcopydb's sub-processes can ignore SIGTERM and outlive their parent, and that a dead main process can leave sub-processes streaming and holding the replication slot. A cgroup-scoped unit with `KillMode=control-group` and a stop timeout followed by SIGKILL stops every process reliably, and the unit outlives app restarts. **Verify in Phase 0**: pgcopydb runs correctly under `systemd-run`, and stopping the unit leaves no process behind and frees the replication slot within the measured time.
+Why engine processes run in systemd units rather than as children of the app: the harness proved that pgcopydb's sub-processes can ignore SIGTERM and outlive their parent, and that a dead main process can leave sub-processes streaming and holding the replication slot. A cgroup-scoped unit with `KillMode=control-group` and a stop timeout followed by SIGKILL stops every process reliably, and the unit outlives app restarts. Phase 0 (S01) proved the cgroup mechanics: stopping every process in the group frees the slot in about 40 ms. It also showed pgcopydb ignores SIGTERM and SIGINT while streaming, so every stop is a SIGKILL of the cgroup (PC2). systemd's own behavior is still to be confirmed on a droplet.
 
 ## Engine interface
 
@@ -159,8 +163,8 @@ type Capabilities struct {
 | `Start` / `Resume` | Launch the run (as a systemd unit) and return a handle that survives app restarts (unit name, work directory, slot, origin). `Resume` must refuse when `Capabilities` says resume is unsafe at that point. |
 | `Observe` | Cheap, safe to call every few seconds. Returns phase, bytes and rows copied, active work, CDC positions, backlog, errors seen. Never blocks longer than its timeout. |
 | `SetEndPosition` | Tells a streaming run where to stop. Idempotent. |
-| `Stop` | `graceful` (let it finish the current transaction) or `immediate`. Must leave no process and must release the replication slot within a bounded time, or report that it could not. |
-| `Verify` | Schema comparison, row counts, sequence checks, optional data checksums. Results use the same check model as preflight. |
+| `Stop` | `graceful` (let it finish the current transaction) or `immediate`. Must leave no process and must release the replication slot within a bounded time, or report that it could not. An engine that cannot stop gracefully says so in `Capabilities`; pgcopydb cannot, so its stops are always immediate (PC2). |
+| `Verify` | Schema comparison, row counts, sequence checks, data checksums. Results use the same check model as preflight. The engine's own success or positions are never accepted as proof (PC5, PC13). |
 | `Cleanup` | Removes everything the engine created on source and target (slots, publications, origins, sentinel objects), with direct SQL fallbacks if the engine's own cleanup fails. |
 | `ParseLog` | Turns one raw engine log line into a structured record (time, level, step, table, message), so the UI can filter and highlight. |
 
@@ -171,11 +175,12 @@ type Capabilities struct {
 | `Start` | `pgcopydb clone --follow` (or without `--follow` for offline) with `--dir`, `--slot-name`, `--origin`, `--table-jobs`, `--index-jobs`, `--split-tables-larger-than`, `--skip-extensions`, `--no-owner`, `--skip-ext-comments` when supported, `--plugin` only when set |
 | `Resume` | Same command plus `--resume --not-consistent`. Allowed only after the base copy finished (CDC phase). During the base copy, resume takes a new snapshot that pgcopydb itself says cannot guarantee consistency, so the engine refuses and the orchestrator offers a database restart instead. |
 | `Observe` | `pgcopydb stream sentinel get --dir` (plain-text output, not `--json`), the pgcopydb log, `pg_stat_progress_copy` and `pg_stat_progress_create_index` on the target, `pg_replication_slots` on the source |
-| `SetEndPosition` | `pgcopydb stream sentinel set endpos --current --dir` |
-| `Stop` | `systemctl stop` on the unit (cgroup-wide), then wait for the slot to be inactive; after 15 s terminate a stale walsender that still holds the slot (same role, no superuser needed) |
+| `SetEndPosition` | `pgcopydb stream sentinel set endpos --current --dir`, immediately followed by `pg_logical_emit_message(true, 'upwell', 'drain nudge')` in the database (PC3) |
+| `Stop` | `systemctl stop` on the unit: SIGTERM, then SIGKILL of the whole cgroup after 10 s (PC2), then wait for the slot to be inactive; after 15 s terminate a stale walsender that still holds the slot (same role, no superuser needed) |
 | `SyncSequences` | `pgcopydb copy sequences` (clone already syncs them at endpos; this is a safety net) |
-| `Verify` | `pgcopydb compare schema`; exact `count(*)` for tables under a size threshold; planner-estimate comparison above it; sequence comparison; optional `pgcopydb compare data` |
-| `Cleanup` | `pgcopydb stream cleanup`, then direct drops of any remaining slot, publication and origin |
+| `Verify` | Schema comparison from the catalogs; exact `count(*)` for tables under a size threshold, planner-estimate comparison above it; order-independent row checksums on every table the verification window allows; sequence comparison; final heartbeat present; target origin progress (PC13) |
+| `Cleanup` | `pgcopydb stream cleanup` when a work directory exists, then direct drops of any remaining slot and publication on the source and of the origin **by name** on the target (origins live in a shared catalog and survive dropping the target database), also for runs that never reached CDC (PC6) |
+| Never used | The follow coordinator (`--host`/`--port`) and `stream prune` (PC8, PC12): coordinator traffic preceded silent loss in Phase 0 (F9), and 0.18 already prunes applied files every 5 minutes |
 | Roles | `pgcopydb copy roles`, falling back to `pg_dumpall --roles-only` with `\restrict` lines stripped and pre-existing target roles skipped |
 
 **Future MySQL engine**: the interface deliberately speaks in generic terms (positions, phases, end position) so a MySQL engine can map them to its own concepts. Which MySQL tooling to wrap is an open question for a separate design; nothing in this release may assume PostgreSQL outside the pgcopydb engine package and the PostgreSQL check pack.
@@ -271,6 +276,9 @@ Preflight runs in the background and streams results to the UI as each check fin
 | `dst_database` | Database | Hard if cannot create | Target database exists or can be created with matching locale |
 | `extensions` | Database | Hard | Every source extension is available on the target |
 | `slot_exists`, `origin_exists`, `publication_exists` | Database | Hard | No leftovers from a previous run (unless resuming) |
+| `target_apply_privileges` (new, PC4) | Database | Hard | The target user can EXECUTE the `pg_replication_origin_*` functions and SET `session_replication_role` (without it pgcopydb 0.18 silently applies nothing: F2) |
+| `write_freeze_available` (new, PC4) | Database | Info | The admin owns the source database (or is a member of its owner) and is a member of `pg_signal_backend`; otherwise the freeze option is hidden for that database |
+| `cdc_throughput` (new, PC11) | Clusters | Warning | Sampled source WAL rate against the receive rate measured or calibrated on this droplet |
 | `connections` | Clusters | Acceptable | Free connections cover what every engine unit will open |
 | `session_timeouts` | Source | Acceptable | Engine sessions run with statement and idle timeouts disabled |
 | `slot_wal_cap` | Source | Warning | `max_slot_wal_keep_size` covers the WAL the slots will retain |
@@ -285,15 +293,25 @@ Each database runs as one systemd transient unit whose main process is pgcopydb 
 
 Launch shape (the orchestrator builds this from `Engine.Plan`; values illustrative):
 
-```bash
-systemd-run --unit=upwell-eng-m42-orders --collect \
-  --property=KillMode=control-group --property=TimeoutStopSec=30 \
-  --property=StandardOutput=append:/var/lib/upwell/runs/m42/orders/engine.log \
-  --property=StandardError=append:/var/lib/upwell/runs/m42/orders/engine.log \
-  --property=EnvironmentFile=/var/lib/upwell/runs/m42/orders/engine.env \
-  --uid=upwell --gid=upwell \
-  /usr/bin/pgcopydb clone --follow --dir /var/lib/upwell/runs/m42/orders/clone --slot-name upwell_m42_orders --origin upwell_m42_orders
+```ini
+# /etc/systemd/system/upwell-eng@.service (installed once; PC1)
+[Service]
+Type=simple
+User=upwell
+Group=upwell
+EnvironmentFile=/var/lib/upwell/runs/%i/engine.env
+ExecStart=/usr/local/bin/pgcopydb $UPWELL_ENGINE_ARGS
+StandardOutput=append:/var/lib/upwell/runs/%i/engine.log
+StandardError=append:/var/lib/upwell/runs/%i/engine.log
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=10
+SendSIGKILL=yes
 ```
+
+A stop sends SIGTERM to every process in the cgroup and SIGKILL to all of them 10 s later (PC2). The SIGTERM lets the apply process exit cleanly; the receive process ignores it (F3), so in practice the SIGKILL ends every streaming run.
+
+The app writes `engine.env` (`UPWELL_ENGINE_ARGS=clone --follow --dir ... --slot-name upwell_m42_orders --origin upwell_m42_orders`) and runs `systemctl start upwell-eng@m42-orders.service`. Values in the arguments never contain spaces.
 
 The environment file (mode 0600, owned by the service user) holds the connection URIs without passwords; passwords reach libpq through a per-run `PGPASSFILE` that is deleted when the run ends. Secrets never appear in the command line, the unit properties or the logs.
 
@@ -307,7 +325,9 @@ The environment file (mode 0600, owned by the service user) holds the connection
 | Slot | `pg_replication_slots` on the source | Active, `wal_status`, retained bytes, headroom |
 | Log | New lines in `engine.log`, parsed by `Engine.ParseLog` | Errors, step changes, warnings |
 
-With pgcopydb as the unit's main process, when it exits systemd stops every remaining process in the cgroup, so leftover sub-processes cannot keep streaming or hold the slot. **Verify in Phase 0** by killing the main process with SIGKILL during CDC and confirming the unit stops all sub-processes and the slot becomes inactive. The harness showed that without this, a dead main process left sub-processes streaming and holding the slot.
+With pgcopydb as the unit's main process, when it exits systemd stops every remaining process in the cgroup, so leftover sub-processes cannot keep streaming or hold the slot. Phase 0 (S01, scenario B) confirmed on 0.18 that without this, a dead main process leaves sub-processes streaming and holding the slot.
+
+**Base-copy failure (PC14).** A failed base copy does not end the run: pgcopydb's main and receive processes keep streaming (F10). The supervisor treats `clone process ... has terminated`, `Failed to clone source database` and any `ERROR` line during the base copy as a database failure, stops the unit itself and marks the database Restart required.
 
 **Retry policy**
 
@@ -315,7 +335,7 @@ With pgcopydb as the unit's main process, when it exits systemd stops every rema
 | --- | --- | --- |
 | Transient, during CDC | Connection reset, network timeout, server restart, too many connections for a moment | Automatic resume with exponential backoff: 10 s, then x2, capped at 10 min, with jitter; at most 5 attempts per hour per database, then Needs attention |
 | Transient, during base copy | Same as above | No automatic restart by default (restarting a multi-TB copy is a business decision). Setting `auto_restart_base_copy` (off) allows it for databases under a size limit |
-| Slot invalidated | `wal_status = lost` | Restart required for that database; never automatic |
+| Slot invalidated | `wal_status = lost`, or the log line `can no longer get changes from replication slot` (PC10). Never classified by exit code: pgcopydb's 12 means several things | Restart required for that database; never automatic |
 | Permanent | Authentication failed, permission denied, schema or restore error, disk full, out of memory | Needs attention, with the classified cause and remediation |
 | App-side queries | Collector or check query fails | Up to 3 quick retries (1, 2, 4 s), then mark the metric stale and raise an alert after 3 stale samples |
 | DO API | HTTP 429 or 5xx | Honor `Retry-After`, otherwise backoff 2 s to 60 s, 6 attempts |
@@ -329,21 +349,22 @@ Before any relaunch (automatic or manual), the orchestrator must:
 
 **Per-database restart from zero** (a gap in the harness, required here): stop the unit, drop and recreate the target database (or drop its migrated objects when the target database holds other data), drop the slot, publication and origin, wipe the database's work directory, and start a fresh attempt while the other databases keep streaming. Requires an Operator to confirm with the database name typed in.
 
-**Disk protection**: at 85% work-volume use raise a critical alert; at 95% stop the database with the largest staging growth gracefully rather than letting the volume fill. Whether pgcopydb can prune already-applied change files while running (`pgcopydb stream prune`) is **verify in Phase 0**.
+**Disk protection**: at 85% work-volume use raise a critical alert; at 95% stop the database with the largest staging growth rather than letting the volume fill. Upwell never calls `pgcopydb stream prune`: 0.18 removes applied change files itself every 5 minutes. Staging per database is the received-but-unapplied changes plus up to about 2 GB for the CDC file pair being written (rotation at 1 GiB of `output.db`) (PC8).
 
 ## Cutover
 
 Cutover is one guided, coordinated operation across every database of the migration, run from a dedicated Cutover console screen. It ends in a single verdict: GO only if every database verifies. The write pause is measured from the moment writes stop to the verdict, and shown as a live timer.
 
-1. **Readiness gate.** Every database is In sync, with backlog under the threshold (default 16 MiB each) for at least 60 seconds, no red alerts, and verification dry-run checks pass (schema compare is cheap and can run before writes stop). The console shows each condition with a tick.
+1. **Readiness gate.** Every database is In sync (as reported by the engine, which is progress, not proof: PC5), with backlog under the threshold (default 16 MiB each) for at least 60 seconds, no red alerts, and verification dry-run checks pass (schema compare is cheap and can run before writes stop). The console shows each condition with a tick.
 2. **Stop writes.** Two paths, chosen in the console:
    1. **Manual (default):** the operator confirms the customer has stopped every writer. The app lists active client sessions on every migrated source database, then samples row-change counters twice, 10 seconds apart. If rows are still changing, it refuses to continue unless an Admin overrides with a typed confirmation, recorded in the audit log.
    2. **Write freeze (optional, off by default):** the console first shows a preview of exactly what it will run. For each source database it sets `default_transaction_read_only = on`, then terminates client sessions other than the engine's and the app's own. It requires the operator to type the cluster name. The freeze is a strong guard, not a lock: a session can still turn read-only off for itself, which the preview states. Whether the Standard admin user may run `ALTER DATABASE` and terminate other roles' sessions on Aiven-backed clusters is **verify in Phase 0**; if not, the option is hidden for those clusters.
-3. **Set end positions** for every database at the current source position (idempotent per database).
-4. **Drain**: wait until every engine reaches its end position and exits cleanly. Per-database progress is shown. If replay does not move for 60 seconds, emit a transactional logical decoding message in each database (no data change) so streams pass the end position.
-5. **Sync sequences** in every database.
-6. **Verify** every database (see Engine interface, `Verify`). Optional `ANALYZE` on the target afterwards.
-7. **Verdict and handover.** GO shows a post-cutover checklist: add application hosts to the target's trusted sources, switch connection strings for every database, refresh materialized views, reset role passwords if roles were copied without them, keep the source untouched until sign-off. NO-GO shows exactly which checks failed and the rollback path.
+3. **Final heartbeat (PC13).** In every database, record the source position, then write one heartbeat row with a unique token into the heartbeat table. This is the last write before the end position. Then emit a drain nudge every 5 s until each heartbeat is visible on the target (decision D10): pgcopydb 0.18 can drop the last transaction before an idle period when the end position arrives first (F9), and the heartbeat's arrival proves every earlier write arrived. If a heartbeat does not arrive within the drain timeout, the cutover stops here, before any end position is set, and streaming continues.
+4. **Set end positions** for every database at the current source position (idempotent per database), and immediately emit a transactional logical decoding message in each database (no data change) so idle streams pass the end position (PC3; without it an idle database never finished in Phase 0).
+5. **Drain**: wait until every engine reaches its end position and exits. Per-database progress is shown. After the drain, the target's replication origin must have reached the final heartbeat's position (the last real write before the end position); otherwise the database is NO-GO immediately (PC5, PC13).
+6. **Sync sequences** in every database.
+7. **Verify** every database (see Engine interface, `Verify`). GO requires, for every database: the final heartbeat row present on the target, the origin check passed, schema match, exact counts equal for tables under the threshold, and checksums equal for every table checksummed in the window. Optional `ANALYZE` on the target afterwards.
+8. **Verdict and handover.** GO shows a post-cutover checklist: add application hosts to the target's trusted sources, switch connection strings for every database, refresh materialized views, reset role passwords if roles were copied without them, keep the source untouched until sign-off. NO-GO shows exactly which checks failed and the rollback path.
 
 **Rollback**, available until the operator marks applications as switched:
 
@@ -492,7 +513,7 @@ Every default below is editable in Settings by an Admin. Settings marked "per mi
 | `target_maintenance_work_mem` | unset | size | Per migration | Index build memory for engine sessions |
 | `create_target_databases` | true | true, false | Per migration | Create missing target databases with source locale |
 | `copy_roles` | true | true, false | Per migration | Copy cluster roles once |
-| `heartbeat` | false | true, false | Per migration | Heartbeat table for end-to-end CDC latency (writes to source) |
+| `heartbeat` | true for online migrations (PC13) | true, false | Per migration | Heartbeat table for end-to-end CDC latency and the final cutover heartbeat (writes to source). Turning it off removes a GO requirement and is recorded as an accepted risk |
 | `wal_sample_seconds` | 60 | 10 to 600 | Global | Source WAL rate sampling in preflight |
 | `assumed_throughput_mibs` | 102 (measured in the team's test migration) | 1 to 2000 | Global | Estimates before a throughput sample exists |
 | `long_transaction_minutes` | 5 | 1 to 120 | Global | Warning threshold in preflight |
@@ -504,7 +525,8 @@ Every default below is editable in Settings by an Admin. Settings marked "per mi
 | `cutover_stable_seconds` | 60 (new) | 0 to 600 | Global | How long the backlog must stay under threshold |
 | `cutover_write_sample_seconds` | 10 | 5 to 120 | Global | Row-change sampling window after writers stop |
 | `cutover_drain_timeout_seconds` | 1800 | 60 to 86400 | Global | Maximum wait for drain |
-| `cutover_nudge_seconds` | 60 | 10 to 600 | Global | Emit a logical message if replay stalls |
+| `cutover_nudge_seconds` | 0 (PC3) | 0 to 600 | Global | Delay before the drain nudge; 0 nudges immediately after setting the end position |
+| `verify_checksum_budget_seconds` | 600 (new) | 0 to 86400 | Per migration | Time the verification may spend on row checksums per database; tables beyond the budget are reported as not checksummed |
 | `analyze_after_go` | false | true, false | Per migration | ANALYZE target databases after GO |
 | `write_freeze_offered` | false | true, false | Global | Whether the freeze option appears in the console at all |
 | `retry_base_seconds` / `retry_cap_seconds` | 10 / 600 | 1 to 3600 | Global | Backoff for automatic resume |
@@ -575,7 +597,7 @@ The app holds credentials to a customer's production databases and reads their c
 **Process and host hardening**:
 
 - The app runs as an unprivileged `upwell` user.
-- Managing engine units needs systemd rights. Grant them through a polkit rule that allows only units named `upwell-eng-*`, not root. **Verify in Phase 0** on Ubuntu 24.04.
+- Managing engine units needs systemd rights. Grant them through a polkit rule that allows only start, stop, restart and reset-failed of instances of `upwell-eng@.service` (PC1). A rule over transient units would let the service user run any command as root, because polkit cannot inspect a transient unit's properties. **Verify in Phase 0** on Ubuntu 24.04.
 - Commands are executed with argument arrays, never through a shell with interpolated input.
 - SQL identifiers are quoted by the driver.
 - Database names are validated against an allowed pattern before use.
@@ -616,7 +638,7 @@ sudo bash install.sh --uninstall --purge-data
 Update rules:
 
 1. **Safe while a migration runs.** Updating the app restarts only `upwell.service`; engine units keep running and the orchestrator re-attaches to them on start (see Watchdog).
-2. **Never swap the engine under a running copy.** If any `upwell-eng-*` unit is active, the installer refuses to change pgcopydb or PostgreSQL client packages and says which migration to finish or pause first. App-only updates still proceed.
+2. **Never swap the engine under a running copy.** If any `upwell-eng@*` unit is active, the installer refuses to change pgcopydb or PostgreSQL client packages and says which migration to finish or pause first. App-only updates still proceed.
 3. **Store schema changes** are forward-only, versioned, and preceded by a copy of the store file (`store.db.bak-<version>`). A failed migration of the schema restores the copy and the previous binary automatically.
 4. **Verify before switching**: the new binary must pass `upwell selftest` (config readable, store opens, key decrypts a canary, port bindable) before the service is restarted on it.
 5. **Offline installs** use a bundle tarball containing the binary, the manifest and `.deb` files for the pinned dependencies.
@@ -714,7 +736,7 @@ The `host_resources` check compares the droplet with this table, warns when it i
 
 ## Data model
 
-One SQLite file (`/var/lib/upwell/store.db`, WAL mode, foreign keys on) holds all durable state. Tables below are the minimum; the agent may add columns and indexes. Every table has `id` (ULID), `created_at`, and `updated_at` where rows change.
+One SQLite file (`/var/lib/upwell/store.db`, WAL mode, foreign keys on) holds all durable state. Tables below are the minimum; the agent may add columns and indexes. Every table has `id` (ULID), `created_at`, and `updated_at` where rows change, except metric samples and rollups (PC7).
 
 | Table | Key fields | Notes |
 | --- | --- | --- |
@@ -733,7 +755,8 @@ One SQLite file (`/var/lib/upwell/store.db`, WAL mode, foreign keys on) holds al
 | `preflight_runs` | migration\_id, started\_at, ended\_at, summary |  |
 | `check_results` | run\_id, check\_id, check\_version, scope, database, level, hard, message, evidence (JSON), evidence\_hash, remediation |  |
 | `acceptances` | migration\_id, check\_id, scope, evidence\_hash, reason, accepted\_by, accepted\_at, lapsed\_at |  |
-| `metrics` | migration\_id, database (nullable), name, ts, value | Narrow table; raw and rollup tables share the shape |
+| `metric_series` | migration\_id, database (nullable), name | One row per series (PC7) |
+| `metric_samples`, `metric_rollups_1m`, `metric_rollups_15m` | series\_id, ts, value (rollups add min, max, last) | Primary key (series\_id, ts), WITHOUT ROWID, no surrogate ID: the exception to the ULID rule (PC7; 0.50 GB instead of 2.45 GB in Phase 0) |
 | `alerts` | migration\_id, rule, scope, severity, state, first\_at, last\_at, acked\_by, ack\_note, resolved\_at |  |
 | `events` | migration\_id, database, type, severity, message, data (JSON), ts | The timeline |
 | `log_index` | migration\_id, database, attempt, component, level, ts, file, offset, length, step, table\_name | Points into log files; full text stays on disk |
@@ -807,8 +830,13 @@ Each behavior below was found while building and testing the harness (PostgreSQL
 | `en_US.UTF-8`, `en_US.utf-8` and `en_US.utf8` sort identically, with the same collation version | Reproduced on glibc 2.39 | Normalize locale names before comparing, plus a sort-order probe |
 | Logical decoding does not carry schema changes, sequence values, large objects or unlogged tables | PostgreSQL documentation | Schema freeze guidance, sequence sync at cutover, warnings in preflight |
 | A Standard cluster offered 20 replication slots and WAL senders, and `doadmin` had REPLICATION | Observed in a real preflight run | Do not assume these limits; check them per cluster |
-| Emitting a logical decoding message lets a stalled stream pass its end position | Not proven (never triggered in tests) | **Verify in Phase 0** before relying on it |
-| `pgcopydb stream prune` frees applied change files during a run | Not proven | **Verify in Phase 0** before using it in the disk guard |
+| An idle database never reaches its end position; a logical decoding message gets it there in about 0.4 s | Reproduced in Phase 0 (S05) | Nudge immediately after setting each end position (PC3) |
+| 0.18 prunes applied CDC files itself every 5 minutes; `stream prune` works but is not needed | Reproduced in Phase 0 (S08) | Never call prune (PC8) |
+| Without SET on `session_replication_role` on the target, 0.18 applies nothing and reports success | Reproduced in Phase 0 (S02, F2) | Hard preflight check; independent verification (PC4, PC13) |
+| 0.18 intermittently never applies the last large transactions before the end position and reports success | Reproduced in Phase 0 (S09, F9: 5 of 7 runs) | Final heartbeat, origin check and data verification gate GO (PC13); report upstream (PC9) |
+| The receive process ignores SIGTERM and SIGINT while streaming | Reproduced in Phase 0 (S01, F3) | Stop by SIGKILL of the cgroup (PC2) |
+| A failed base copy leaves the main and receive processes streaming | Reproduced in Phase 0 (F10) | Detect from the log and stop the unit (PC14) |
+| Replication origins survive dropping the target database | Reproduced in Phase 0 (F4) | Cleanup drops origins by name (PC6) |
 
 ## Testing strategy
 
@@ -891,6 +919,7 @@ The biggest risk is relying on engine and platform behavior that has not been pr
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
 | pgcopydb defects in new versions (the harness hit a CDC apply bug in 0.15) | Failed or stuck migrations | Pin tested versions in the manifest; run the integration and fault suites before raising a pin |
+| pgcopydb 0.18 silent-loss and stop defects found in Phase 0 (F2, F3, F9, F10) | Data loss reported as success | Data-safety gate before GO (PC13); report upstream with the S02 and S09 reproductions (PC9); rerun S09 before raising the pin |
 | Standard (Aiven-backed) restrictions differ from test clusters | Checks pass in CI but fail in production | Phase 0 against a real Standard cluster; pilot migrations before customer rollout |
 | Long snapshots bloat busy source tables | Customer-visible slowdown during multi-day copies | Live bloat visibility, warnings, and table splitting to shorten the copy |
 | Slot invalidation or source disk pressure from retained WAL | Restart from zero, or source outage | Preflight estimate, headroom forecast, critical alerts before the limit |

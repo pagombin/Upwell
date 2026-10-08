@@ -3,3 +3,10 @@ spikes/**/s06
 *.db
 *.db-shm
 *.db-wal
+node_modules/
+web/dist/
+/upwell
+/bin/
+test-results/
+playwright-report/
+e2e/.auth/
