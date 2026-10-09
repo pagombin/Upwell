@@ -24,22 +24,20 @@ type Capabilities struct {
 
 // DatabaseSpec describes one database run.
 type DatabaseSpec struct {
-	MigrationID   string
-	Source        string // source database name
-	Target        string // target database name
-	SourceConn    pg.Conn
-	TargetConn    pg.Conn
-	Instance      string
-	SlotName      string
-	OriginName    string
-	Plugin        string // empty: engine default
-	RunDir        string
-	TableJobs     int
-	IndexJobs     int
-	SplitLarger   string
-	SyncCommitOff bool
-	MaintWorkMem  string
-	ExtraArgs     []string // test hook only; never set from the API
+	MigrationID string
+	Source      string // source database name
+	Target      string // target database name
+	SourceConn  pg.Conn
+	TargetConn  pg.Conn
+	Instance    string
+	SlotName    string
+	OriginName  string
+	Plugin      string // empty: engine default
+	RunDir      string
+	TableJobs   int
+	IndexJobs   int
+	SplitLarger string
+	ExtraArgs   []string // test hook only; never set from the API
 }
 
 // RunPlan is the exact command for one database: what the dry run shows.

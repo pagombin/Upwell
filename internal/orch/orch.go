@@ -90,6 +90,20 @@ func (o *Orchestrator) Engine() engine.Engine { return o.eng }
 // Runner returns the runner.
 func (o *Orchestrator) Runner() runner.Runner { return o.run }
 
+// tryLock is lock without waiting.
+func (o *Orchestrator) tryLock(id string) (func(), bool) {
+	var full string
+	if err := o.st.DB.QueryRow(`SELECT id FROM migrations WHERE id = ? OR short_id = ? LIMIT 1`, id, id).Scan(&full); err == nil {
+		id = full
+	}
+	v, _ := o.migMu.LoadOrStore(id, &sync.Mutex{})
+	m := v.(*sync.Mutex)
+	if !m.TryLock() {
+		return nil, false
+	}
+	return m.Unlock, true
+}
+
 func (o *Orchestrator) lock(id string) func() {
 	// The API accepts the full or the short ID; lock on the full one so every
 	// caller, the supervisor included, shares one mutex per migration.

@@ -81,10 +81,13 @@ The verdict is decided per database and the migration is GO only if every databa
 | --- | --- |
 | Final heartbeat on the target | A row written to the source after writers stopped reached the target, so everything committed before it did too |
 | Target origin reached the heartbeat position | The target's replication origin advanced at least to the WAL position just before that heartbeat |
-| Schema | The same tables, columns and indexes exist on both sides |
-| Row counts | Exact counts match for every table up to `exact_count_max_mb` (1 GB by default); larger tables are compared by estimate and shown as such |
+| Schema | The same tables and columns (with NOT NULL, identity and generated expressions) exist on both sides |
+| Schema objects | The same indexes, constraints (including NOT VALID ones), triggers, views, functions, partitions and enum values |
+| Row counts | Exact counts match for every table up to `exact_count_max_mb` (1 GB by default); a larger table outside the checksum window is only checked for being empty or truncated on the target, and is listed as not counted |
 | Checksums | Row checksums match for every table that fits in the time budget (`verify_checksum_budget_seconds`, smallest first); tables beyond the budget are listed as not checksummed |
-| Sequences | Target sequences are at or past the source's values |
+| Sequences | Target sequences are at or past the source's values (in their direction, for descending ones) |
+| Large objects and materialized views | Large objects match exactly; materialized views match (refreshed on the target when the source refreshed them while streaming) |
+| Engine reached the end position | The engine applied everything up to the end position; a database that did not drain is NO-GO |
 
 **GO** (green) means applications may switch to the target. **NO-GO** (red) means at least one check failed: do not switch; the source is unchanged, so restart writers there and read the failed checks. If the final heartbeat never arrives, the cutover stops with NO-GO before any end position is set, and the cutover can be retried after you fix the cause. Turning the heartbeat off is possible but is recorded as an accepted risk in the report.
 
@@ -96,7 +99,9 @@ The verdict is decided per database and the migration is GO only if every databa
 - **F11, apply rate.** In the build container pgcopydb 0.18 applied about 190 rows a second for a large transaction and about 5 transactions a second for small ones (the target itself accepted 17,000 inserts a second). If that holds on a droplet, an online migration only keeps up with databases that commit a few transactions a second. Preflight's `apply_rate` check compares each database's commit rate with `assumed_apply_tps`, and the cutover gate requires the target to be less than `cutover_max_lag_seconds` behind. **Measure this first on the droplet** with `dev/demo-data.sh write` against a test migration.
 - **F12, pgcopydb's internal catalog lock.** pgcopydb's processes share a SQLite file and sometimes fail with "database is locked". During the base copy Upwell restarts the database from zero once automatically; during streaming it stops the stalled engine and resumes it (F13).
 - **Roles are copied without passwords.** A non-superuser cannot read role passwords, so login roles are created on the target without one; the migration's events list them. Set their passwords on the target before switching applications.
-- **DDL is not streamed.** Schema changes made on the source during a migration do not reach the target; verification then ends NO-GO (tested). Freeze schema changes until the cutover.
+- **Connection poolers.** Use the cluster's direct port when it has one. Behind a pooler, Upwell and pgcopydb work in session mode (tested with PgBouncer); transaction mode is refused by the connection test and preflight because the engine's session settings would be lost.
+- **DDL is not streamed.** Schema changes made on the source during a migration (a new table or partition, a changed column, a new enum value) do not reach the target. Upwell notices within a minute (a critical alert and a readiness condition that blocks the cutover), and verification would end NO-GO anyway (tested). Freeze schema changes until the cutover, or apply the same change on the target.
+- **Large objects are not streamed.** They are copied during the base copy and compared at verification; a change made while streaming ends NO-GO.
 - Write freeze is not available, so stopping writers is manual. Only online mode is available. One migration runs at a time per operator action (no queue).
 - systemd as PID 1, the polkit rule, the watchdog and reboot recovery could not be exercised in the build container; they are implemented to spec and marked "needs droplet" in `docs/PROGRESS.md`.
 

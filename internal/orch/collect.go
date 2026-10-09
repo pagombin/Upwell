@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pagombin/upwell/internal/pg"
+	"github.com/pagombin/upwell/internal/pgpack"
 	"github.com/pagombin/upwell/internal/store"
 )
 
@@ -28,6 +29,7 @@ type collector struct {
 	stale     map[string]int
 	last      map[string]float64
 	lastWrite time.Time
+	drift     map[string][]string // database ID -> schema differences seen while streaming
 }
 
 type prevSample struct {
@@ -36,7 +38,7 @@ type prevSample struct {
 }
 
 func newCollector(o *Orchestrator) *collector {
-	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}}
+	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string][]string{}}
 }
 
 func (c *collector) seriesID(ctx context.Context, mig, db, name string) int64 {
@@ -213,6 +215,21 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 					}
 					if sMax != nil && tMax != nil {
 						c.put(ctx, m.ID, d.SourceName, "heartbeat_latency_s", sMax.Sub(*tMax).Seconds(), ts)
+					}
+					t.Close(ctx)
+				}
+				s.Close(ctx)
+			}
+		}
+		// Schema drift: DDL on the source is not streamed. Catch it within a
+		// minute instead of at the cutover's verification.
+		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|drift", 60*time.Second) {
+			if s, err := pg.Connect(ctx, src.WithDB(d.SourceName), 20*time.Second); err == nil {
+				if t, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 20*time.Second); err == nil {
+					if diff, err := pgpack.SchemaDrift(ctx, s, t); err == nil {
+						c.mu.Lock()
+						c.drift[d.ID] = diff
+						c.mu.Unlock()
 					}
 					t.Close(ctx)
 				}
@@ -512,6 +529,9 @@ func (a *alerter) evaluate(ctx context.Context, m Migration, dbs []Database) {
 			}
 			a.cond(ctx, growing, m.ID, "backlog_growing", d.SourceName, "warning", d.SourceName+": the change backlog grew for 5 consecutive samples")
 		}
+		drift := a.o.metrics.Drift(d.ID)
+		a.cond(ctx, len(drift) > 0 && activeDB[d.State], m.ID, "schema_drift", d.SourceName, "critical",
+			fmt.Sprintf("%s: the schema changed on the source while streaming (%s). Schema changes are not streamed: apply the same change on the target, or restart this database from zero, before the cutover.", d.SourceName, strings.Join(limitStrings(drift, 3), "; ")))
 		if lat, ok := a.o.metrics.Last(m.ID, d.SourceName, "heartbeat_latency_s"); ok {
 			lim := float64(g.Int("alert_heartbeat_seconds"))
 			a.cond(ctx, d.State == DInSync && lim > 0 && lat > lim, m.ID, "heartbeat_latency", d.SourceName, "warning", fmt.Sprintf("%s: heartbeat latency is %.0f s", d.SourceName, lat))
@@ -633,4 +653,19 @@ func humanDuration(s float64) string {
 		return fmt.Sprintf("%d s", int(d.Seconds()))
 	}
 	return d.String()
+}
+
+// Drift returns the schema differences last seen for a database while it
+// streamed.
+func (c *collector) Drift(dbID string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.drift[dbID]...)
+}
+
+func limitStrings(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return append(append([]string(nil), s[:n]...), fmt.Sprintf("and %d more", len(s)-n))
 }

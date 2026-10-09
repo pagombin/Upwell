@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -190,11 +193,19 @@ func (s *Server) setupCreate(w http.ResponseWriter, r *http.Request) error {
 	if n > 0 {
 		return apiErr(409, "already_set_up", "Upwell is already set up. Sign in instead.", "")
 	}
+	if !s.loginLimit.Allow(clientIP(r)) {
+		return tooManyAttempts()
+	}
 	want := s.setupToken()
-	if want == "" || in.SetupToken != want {
+	if want == "" || subtle.ConstantTimeCompare([]byte(in.SetupToken), []byte(want)) != 1 {
 		return apiErr(403, "bad_setup_token", "The setup token is not correct.", "install.sh printed it; it is also in "+s.Cfg.SetupToken+" on the droplet.")
 	}
-	u, err := s.Auth.CreateUser(r.Context(), in.Username, in.Password, auth.RoleAdmin)
+	// The count and the insert share one write-locked transaction, so two
+	// concurrent setups cannot both create an Admin.
+	u, err := s.Auth.CreateFirstAdmin(r.Context(), in.Username, in.Password)
+	if errors.Is(err, auth.ErrAlreadySetUp) {
+		return apiErr(409, "already_set_up", "Upwell is already set up. Sign in instead.", "")
+	}
 	if err != nil {
 		return badRequest(err.Error())
 	}
@@ -214,19 +225,40 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &in); err != nil {
 		return err
 	}
-	tok, sess, err := s.Auth.Login(r.Context(), strings.TrimSpace(strings.ToLower(in.Username)), in.Password, clientIP(r), r.UserAgent())
-	a := audit.Actor{Username: in.Username, IP: clientIP(r)}
+	if !s.loginLimit.Allow(clientIP(r)) {
+		return tooManyAttempts()
+	}
+	username := strings.TrimSpace(strings.ToLower(in.Username))
+	tok, sess, err := s.Auth.Login(r.Context(), username, in.Password, clientIP(r), r.UserAgent())
 	if err != nil {
-		s.Audit.Append(r.Context(), a, "auth.login_failed", in.Username, nil, map[string]any{"reason": err.Error()})
+		// A mistyped username is sometimes a password typed in the wrong
+		// field: name only users that exist, others by a hash prefix.
+		a := audit.Actor{IP: clientIP(r)}
+		target := failedLoginTarget(username)
+		if id, lerr := s.Auth.UserIDByName(r.Context(), username); lerr == nil && id != "" {
+			a.UserID, a.Username, target = id, username, username
+		}
+		s.Audit.Append(r.Context(), a, "auth.login_failed", target, nil, map[string]any{"reason": err.Error()})
 		if errors.Is(err, auth.ErrBadCredentials) || errors.Is(err, auth.ErrLocked) || errors.Is(err, auth.ErrDisabled) {
 			return apiErr(401, "bad_credentials", err.Error(), "")
 		}
 		return err
 	}
-	a.UserID = sess.User.ID
+	a := audit.Actor{UserID: sess.User.ID, Username: sess.User.Username, IP: clientIP(r)}
 	s.Audit.Append(r.Context(), a, "auth.login", sess.User.ID, nil, nil)
 	http.SetCookie(w, &http.Cookie{Name: "upwell_session", Value: tok, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, Expires: time.UnixMilli(sess.ExpiresAt)})
 	return writeJSON(w, 200, map[string]any{"user": sess.User, "csrf_token": sess.CSRF, "expires_at": sess.ExpiresAt})
+}
+
+// failedLoginTarget names an unknown username in the audit log without
+// recording what was typed: "unknown:" and a 12-hex-digit SHA-256 prefix.
+func failedLoginTarget(username string) string {
+	sum := sha256.Sum256([]byte(username))
+	return "unknown:" + hex.EncodeToString(sum[:])[:12]
+}
+
+func tooManyAttempts() error {
+	return apiErr(429, "too_many_attempts", "Too many attempts from this address. Wait a minute and try again.", "")
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) error {
@@ -274,13 +306,19 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	sess := session(r)
-	var hash string
-	s.Store.DB.QueryRowContext(r.Context(), `SELECT password_hash FROM users WHERE id=?`, sess.User.ID).Scan(&hash)
-	if !auth.CheckPassword(hash, in.Current) {
+	if err := auth.ValidatePassword(in.New); err != nil {
+		return badRequest(err.Error())
+	}
+	ok, err := s.Auth.VerifyUserPassword(r.Context(), sess.User.ID, in.Current)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return apiErr(400, "bad_password", "The current password is not correct.", "")
 	}
-	if err := s.Auth.SetPassword(r.Context(), sess.User.ID, in.New); err != nil {
-		return badRequest(err.Error())
+	// Other sessions of this user end; this one stays signed in.
+	if err := s.Auth.SetPassword(r.Context(), sess.User.ID, in.New, sess.ID); err != nil {
+		return err
 	}
 	s.Audit.Append(r.Context(), actor(r), "auth.password_changed", sess.User.ID, nil, nil)
 	return writeJSON(w, 200, map[string]any{"ok": true})
@@ -317,9 +355,10 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) error {
+	// Fields left out of the body stay as they are.
 	var in struct {
-		Role     string  `json:"role"`
-		Disabled bool    `json:"disabled"`
+		Role     *string `json:"role"`
+		Disabled *bool   `json:"disabled"`
 		Password *string `json:"password"`
 	}
 	if err := decode(r, &in); err != nil {
@@ -330,18 +369,36 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if id == session(r).User.ID && (in.Role != auth.RoleAdmin || in.Disabled) {
+	self := session(r)
+	if id == self.User.ID && ((in.Role != nil && *in.Role != auth.RoleAdmin) || (in.Disabled != nil && *in.Disabled)) {
 		return badRequest("You cannot remove your own Admin role or disable yourself.")
 	}
-	if err := s.Auth.UpdateUser(r.Context(), id, in.Role, in.Disabled); err != nil {
-		return badRequest(err.Error())
+	if in.Role != nil && !auth.ValidRole(*in.Role) {
+		return badRequest("role must be viewer, operator or admin")
 	}
 	if in.Password != nil {
-		if err := s.Auth.SetPassword(r.Context(), id, *in.Password); err != nil {
+		if err := auth.ValidatePassword(*in.Password); err != nil {
 			return badRequest(err.Error())
 		}
 	}
-	after, _ := s.Auth.GetUser(r.Context(), id)
+	ch := auth.UserChange{Role: in.Role, Disabled: in.Disabled, Password: in.Password}
+	if id == self.User.ID {
+		ch.KeepSessionID = self.ID // an Admin resetting their own password stays signed in
+	}
+	// Validated above; one transaction applies everything or nothing.
+	if err := s.Auth.UpdateUser(r.Context(), id, ch); err != nil {
+		return err
+	}
+	after, err := s.Auth.GetUser(r.Context(), id)
+	if err != nil {
+		after = before
+		if in.Role != nil {
+			after.Role = *in.Role
+		}
+		if in.Disabled != nil {
+			after.Disabled = *in.Disabled
+		}
+	}
 	s.Audit.Append(r.Context(), actor(r), "user.update", id, before, map[string]any{"role": after.Role, "disabled": after.Disabled, "password_reset": in.Password != nil})
 	return writeJSON(w, 200, after)
 }
@@ -1149,7 +1206,7 @@ func (s *Server) system(w http.ResponseWriter, r *http.Request) error {
 		"store":    map[string]any{"path": s.Cfg.StorePath(), "bytes": storeSize, "schema_version": schema},
 		"logs":     map[string]any{"dir": s.Cfg.LogDir, "bytes": dirSize(s.Cfg.LogDir)},
 		"runs":     map[string]any{"dir": s.Cfg.RunsDir(), "bytes": dirSize(s.Cfg.RunsDir())},
-		"watchdog": map[string]any{"healthy": ok, "late": late, "beats": s.Health.Beats(), "systemd": os.Getenv("NOTIFY_SOCKET") != ""},
+		"watchdog": map[string]any{"healthy": ok, "late": late, "beats": s.Health.Beats(), "systemd": UnderSystemd()},
 		"ready":    ready, "ready_detail": readyDetail, "tls": s.TLSInfo(), "rebooted": s.Orch.Rebooted, "reconciled": s.Orch.Reconciled,
 		"updates": map[string]any{"available": false, "note": "Updates are applied by running install.sh again."},
 		"dev":     s.Cfg.Dev, "units": s.engineUnits(ctx),
@@ -1183,7 +1240,7 @@ func (s *Server) engineUnits(ctx context.Context) []map[string]any {
 // restartApp exits so systemd restarts the service. Engines run in their own
 // units and keep running; reconciliation reattaches them on start.
 func (s *Server) restartApp(w http.ResponseWriter, r *http.Request) error {
-	if os.Getenv("NOTIFY_SOCKET") == "" {
+	if !UnderSystemd() {
 		return apiErr(409, "no_systemd", "Upwell is not running under systemd here, so it would not come back after exiting.", "Restart it with your process manager, or on the droplet run: sudo systemctl restart upwell")
 	}
 	s.Audit.Append(r.Context(), actor(r), "system.restart", "upwell", nil, nil)

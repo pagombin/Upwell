@@ -66,6 +66,7 @@ var Catalog = []check.Definition{
 	cd("network", check.ScopeClusters, "Network path", "warning"),
 	cd("connect", check.ScopeClusters, "Clusters reachable", "hard"),
 	cd("trusted_sources", check.ScopeClusters, "Droplet allowed on both clusters", "hard"),
+	cd("session_pinning", check.ScopeClusters, "Sessions keep their settings (no transaction pooling)", "hard"),
 	cd("same_cluster", check.ScopeClusters, "Source and target are different", "hard"),
 	cd("version_order", check.ScopeClusters, "Target version at least source version", "hard"),
 	cd("primary", check.ScopeClusters, "Both endpoints are primaries", "hard"),
@@ -88,6 +89,9 @@ var Catalog = []check.Definition{
 	cd("read_privs", check.ScopeDatabase, "Read access to every table", "hard"),
 	cd("publication_privs", check.ScopeDatabase, "Decoding plugin", "hard"),
 	cd("replica_identity", check.ScopeDatabase, "Updates and deletes can replay", "hard"),
+	cd("row_security", check.ScopeDatabase, "Every row is readable (row-level security)", "hard"),
+	cd("identity_full_types", check.ScopeDatabase, "Full replica identity on comparable columns", "hard"),
+	cd("identity_full_duplicates", check.ScopeDatabase, "Full replica identity without a unique key", "warning"),
 	cd("large_objects", check.ScopeDatabase, "Large objects", "warning"),
 	cd("unlogged_tables", check.ScopeDatabase, "Unlogged tables", "warning"),
 	cd("materialized_views", check.ScopeDatabase, "Materialized views", "warning"),
@@ -368,6 +372,8 @@ func (r *Runner) clusterChecks(ctx context.Context) {
 		conn.QueryRow(ctx, `SHOW server_version`).Scan(&vs)
 		ok(r, "connect", side.name, "", fmt.Sprintf("Connected to PostgreSQL %s as %s.", vs, side.c.User), map[string]any{"server_version": vs}, t)
 		ok(r, "trusted_sources", side.name, "", "Confirmed by connecting (the DigitalOcean API check is coming soon).", map[string]any{"method": "connect"}, t)
+		t = time.Now()
+		r.sessionCheck(ctx, side.name, conn, side.c, t)
 		if side.name == "source" {
 			r.src, r.srcVer = conn, ver
 		} else {
@@ -491,18 +497,88 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	}
 	t = time.Now()
 	// Read the timeouts an engine session inherits, on a connection that does
-	// not set its own statement timeout.
-	var stmt, idle, idleSess string
-	if tc, err := pg.Connect(ctx, e.Source, 0); err == nil {
-		tc.QueryRow(ctx, `SELECT current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout'), COALESCE(current_setting('idle_session_timeout', true),'0')`).Scan(&stmt, &idle, &idleSess)
+	// not set its own statement timeout, and compare them with the estimated
+	// base copy: pgcopydb holds its snapshot in a transaction that stays idle
+	// for the whole copy, and a large table's COPY is one statement.
+	ms := map[string]int64{}
+	var readErr error
+	if tc, err := pg.Connect(ctx, e.Source, 0); err != nil {
+		readErr = err
+	} else {
+		if rows, err := tc.Query(ctx, `SELECT name, setting::bigint FROM pg_settings WHERE name IN ('statement_timeout','idle_in_transaction_session_timeout','idle_session_timeout')`); err == nil {
+			for rows.Next() {
+				var n string
+				var v int64
+				if rows.Scan(&n, &v) == nil {
+					ms[n] = v
+				}
+			}
+			rows.Close()
+		} else {
+			readErr = err
+		}
+		// ALTER DATABASE ... SET and ALTER ROLE ... IN DATABASE ... SET apply
+		// only inside the migrated databases, not the maintenance database.
+		names := make([]string, 0, len(e.Databases))
+		for _, d := range e.Databases {
+			names = append(names, d.Source)
+		}
+		if cfgs, err := pg.QueryStrings(ctx, tc, `SELECT unnest(s.setconfig) FROM pg_db_role_setting s JOIN pg_database d ON d.oid=s.setdatabase
+			WHERE d.datname = ANY($1) AND s.setrole IN (0, (SELECT oid FROM pg_roles WHERE rolname=current_user))`, names); err == nil {
+			for _, kv := range cfgs {
+				k, v, _ := strings.Cut(kv, "=")
+				if k == "idle_session_timeout" {
+					if n := settingMillis(v); n > 0 && (ms[k] == 0 || n < ms[k]) {
+						ms[k] = n
+					}
+				}
+			}
+		}
 		tc.Close(ctx)
 	}
-	ev = map[string]any{"statement_timeout": stmt, "idle_in_transaction_session_timeout": idle, "idle_session_timeout": idleSess}
-	if stmt != "0" || idle != "0" || idleSess != "0" {
-		r.emit("session_timeouts", "", "", check.Blocker, false, fmt.Sprintf("Sessions for %s inherit timeouts (statement %s, idle in transaction %s, idle %s) that can cut long COPY or decoding sessions.", e.Source.User, stmt, idle, idleSess),
-			"Clear them for the admin role (ALTER ROLE ... RESET statement_timeout) or accept the risk.", ev, t)
-	} else {
-		ok(r, "session_timeouts", "", "", "No statement or idle timeouts apply to engine sessions.", ev, t)
+	var srcBytes int64
+	for _, d := range e.Databases {
+		var b int64
+		if r.src != nil && r.src.QueryRow(ctx, `SELECT pg_database_size($1)`, d.Source).Scan(&b) == nil {
+			srcBytes += b
+		}
+	}
+	mibs := e.Settings.Float("assumed_throughput_mibs")
+	if mibs <= 0 {
+		mibs = 102
+	}
+	copySecs := float64(srcBytes) / (mibs * 1024 * 1024)
+	need := 3 * copySecs
+	if need < 6*3600 {
+		need = 6 * 3600
+	}
+	// pgcopydb sets statement_timeout and idle_in_transaction_session_timeout
+	// to 0 in every session it opens (copydb.h COMMON_GUC_SETTINGS and
+	// srcSettings), and so do pg_dump and pg_restore, so those two cannot cut
+	// the copy. idle_session_timeout is not overridden.
+	var cleared []string
+	for _, k := range []struct{ name, label string }{{"statement_timeout", "statement"}, {"idle_in_transaction_session_timeout", "idle in transaction"}} {
+		if v := ms[k.name]; v > 0 {
+			cleared = append(cleared, fmt.Sprintf("%s %s", k.label, humanDuration(float64(v)/1000)))
+		}
+	}
+	note := ""
+	if len(cleared) > 0 {
+		note = fmt.Sprintf(" The role's other timeouts (%s) do not matter: pgcopydb and pg_dump clear them in their own sessions.", strings.Join(cleared, ", "))
+	}
+	ev = map[string]any{"timeouts_ms": ms, "_estimated_copy_seconds": copySecs, "_required_seconds": need, "cleared_by_engine": []string{"statement_timeout", "idle_in_transaction_session_timeout"}}
+	idleSess := float64(ms["idle_session_timeout"]) / 1000
+	switch {
+	case readErr != nil:
+		r.emit("session_timeouts", "", "", check.Warning, false, "Could not read the session timeouts that apply to engine sessions: "+readErr.Error(), "Run preflight again.", ev, t)
+	case idleSess > 0 && idleSess < need:
+		r.emit("session_timeouts", "", "", check.Blocker, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, shorter than %s (three times the estimated base copy, at least 6 hours). pgcopydb does not override it, so an engine connection waiting for others could be closed.%s", e.Source.User, humanDuration(idleSess), humanDuration(need), note),
+			"Clear it for the admin role (ALTER ROLE "+pg.QuoteIdent(e.Source.User)+" RESET idle_session_timeout) or accept the risk.", ev, t)
+	case idleSess > 0:
+		r.emit("session_timeouts", "", "", check.Warning, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, long enough for the estimated base copy of %s.%s", e.Source.User, humanDuration(idleSess), humanDuration(copySecs), note),
+			"Nothing to do unless the copy runs far slower than estimated.", ev, t)
+	default:
+		ok(r, "session_timeouts", "", "", "No timeout can cut the engine's sessions."+note, ev, t)
 	}
 }
 
@@ -567,7 +643,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 
 	t = time.Now()
 	noRead, _ := pg.QueryStrings(ctx, sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p','S') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+		WHERE c.relkind IN ('r','p','S') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT has_table_privilege(c.oid,'SELECT') ORDER BY 1 LIMIT 50`)
 	if len(noRead) > 0 {
 		r.emit("read_privs", "", d.Source, check.Blocker, true, fmt.Sprintf("%s cannot read %d table(s) or sequence(s), for example %s.", e.Source.User, len(noRead), noRead[0]), "Grant SELECT on them to the admin user, or migrate as their owner.", map[string]any{"unreadable": noRead}, t)
@@ -591,7 +667,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 
 	t = time.Now()
 	noIdent, _ := pg.QueryStrings(ctx, sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')
 		ORDER BY 1 LIMIT 100`)
 	if len(noIdent) > 0 {
@@ -605,9 +681,52 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		ok(r, "replica_identity", "", d.Source, "Every table can replay updates and deletes.", map[string]any{"tables": []string{}}, t)
 	}
 
+	// Row-level security that applies to the admin user: the engine's COPY
+	// would return only the rows its policies allow, silently.
+	t = time.Now()
+	rls, _ := pg.QueryStrings(ctx, sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE c.relkind IN ('r','p') AND c.relrowsecurity AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		AND NOT (SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname=current_user)
+		AND (c.relforcerowsecurity OR NOT pg_has_role(c.relowner, 'USAGE'))
+		ORDER BY 1 LIMIT 100`)
+	if len(rls) > 0 {
+		r.emit("row_security", "", d.Source, check.Blocker, true, fmt.Sprintf("%d table(s) have row-level security that applies to %s (for example %s): the copy would contain only the rows its policies allow, and verification cannot read them all.", len(rls), e.Source.User, rls[0]),
+			"Disable or relax the policies for the migration (ALTER TABLE ... NO FORCE ROW LEVEL SECURITY when the admin user owns the table), or migrate with a user that bypasses row-level security.", map[string]any{"tables": rls}, t)
+	} else {
+		ok(r, "row_security", "", d.Source, "No row-level security hides rows from the migration.", map[string]any{}, t)
+	}
+
+	// REPLICA IDENTITY FULL: the engine finds the old row by comparing every
+	// column. Types without an equality operator (json, xml, the geometric
+	// types) make that comparison fail, so updates and deletes cannot apply.
+	t = time.Now()
+	noEq, _ := pg.QueryStrings(ctx, sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
+		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+		JOIN pg_type ty ON ty.oid=a.atttypid LEFT JOIN pg_type el ON el.oid=ty.typelem AND ty.typlen=-1 AND ty.typelem<>0
+		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		AND (ty.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle') OR el.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle'))
+		ORDER BY 1 LIMIT 100`)
+	if len(noEq) > 0 {
+		r.emit("identity_full_types", "", d.Source, check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", len(noEq), noEq[0]),
+			"Give these tables a primary key (or a unique index used with REPLICA IDENTITY USING INDEX), or change json columns to jsonb, then run preflight again.", map[string]any{"columns": noEq}, t)
+	} else {
+		ok(r, "identity_full_types", "", d.Source, "Tables with full replica identity have only comparable columns.", map[string]any{}, t)
+	}
+	t = time.Now()
+	fullNoKey, _ := pg.QueryStrings(ctx, sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisunique AND i.indpred IS NULL)
+		ORDER BY 1 LIMIT 100`)
+	if len(fullNoKey) > 0 {
+		r.emit("identity_full_duplicates", "", d.Source, check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", len(fullNoKey), fullNoKey[0]),
+			"Add a primary key if the table can hold identical rows.", map[string]any{"tables": fullNoKey}, t)
+	} else {
+		ok(r, "identity_full_duplicates", "", d.Source, "Every table with full replica identity has a unique key.", map[string]any{}, t)
+	}
+
 	simple := []struct{ id, q, msg, fix string }{
-		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards.", "Avoid changing large objects during the migration, or re-copy them after cutover."},
-		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema')`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated."},
+		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards; verification compares them, so any change during the migration ends NO-GO.", "Do not change large objects while the migration runs."},
+		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated."},
 		{"materialized_views", `SELECT count(*) FROM pg_matviews`, "%d materialized view(s) are created but must be refreshed on the target after cutover.", "Refresh them after cutover (it is in the post-cutover checklist)."},
 		{"foreign_servers", `SELECT count(*) FROM pg_foreign_server`, "%d foreign server(s) need their user mappings and credentials re-created on the target.", "Re-create user mappings on the target after cutover."},
 		{"event_triggers", `SELECT count(*) FROM pg_event_trigger`, "%d event trigger(s) are not copied by the engine.", "Re-create them on the target after cutover."},
@@ -680,7 +799,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 	t = time.Now()
 	objQ := `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p','S','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' ORDER BY 1`
+		WHERE c.relkind IN ('r','p','S','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ORDER BY 1`
 	srcObjs, _ := pg.QueryStrings(ctx, sc, objQ)
 	var dstObjs []string
 	if tc != nil {
@@ -1017,4 +1136,57 @@ func humanDuration(s float64) string {
 		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 	return fmt.Sprintf("%dd %dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
+// sessionCheck: the engine sets session_replication_role and the replication
+// origin once per session and holds its snapshot in one transaction. Behind
+// a pooler in transaction mode those would land on other server connections,
+// and changes would be applied without them (or not at all).
+func (r *Runner) sessionCheck(ctx context.Context, side string, conn *pgx.Conn, at pg.Conn, t time.Time) {
+	ss, err := pg.ProbeSession(ctx, conn, at)
+	ev := map[string]any{"client_addr": ss.ClientAddr, "proxy_likely": ss.ProxyLikely, "backend_pids": ss.PIDs}
+	switch {
+	case err != nil:
+		ev["error"] = err.Error()
+		r.emit("session_pinning", side, "", check.Blocker, true, fmt.Sprintf("Upwell could not confirm that %s sessions keep their settings: %v", side, err), "Connect directly to PostgreSQL, not through a connection pooler.", ev, t)
+	case !ss.Pinned:
+		r.emit("session_pinning", side, "", check.Blocker, true, fmt.Sprintf("Consecutive transactions on one %s connection reached different server sessions (backend PIDs %v): a connection pooler in transaction mode sits in between, and the engine's session settings would be lost.", side, ss.PIDs),
+			"Use the cluster's direct port, or a pooler in session mode.", ev, t)
+	case ss.ProxyLikely:
+		r.emit("session_pinning", side, "", check.Warning, false, fmt.Sprintf("PostgreSQL sees the %s connection coming from %s, not from this droplet: a pooler or proxy probably sits in between. Sessions kept their settings in this test, which is what the engine needs; a pooler in transaction mode under load would not.", side, orUnknown(ss.ClientAddr)),
+			"Prefer the cluster's direct port if it has one; otherwise make sure the pooler runs in session mode.", ev, t)
+	default:
+		ok(r, "session_pinning", side, "", "Sessions keep their settings (no transaction pooling).", ev, t)
+	}
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "an unknown address"
+	}
+	return s
+}
+
+// settingMillis parses a time setting as stored by ALTER ... SET ("5min",
+// "1h", "30000"); a bare number is milliseconds.
+func settingMillis(v string) int64 {
+	v = strings.Trim(strings.TrimSpace(v), "'")
+	units := []struct {
+		suf string
+		ms  float64
+	}{{"ms", 1}, {"min", 60000}, {"s", 1000}, {"h", 3600000}, {"d", 86400000}}
+	for _, u := range units {
+		if strings.HasSuffix(v, u.suf) {
+			f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(v, u.suf)), 64)
+			if err != nil {
+				return 0
+			}
+			return int64(f * u.ms)
+		}
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0
+	}
+	return int64(f)
 }

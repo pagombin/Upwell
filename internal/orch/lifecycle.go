@@ -216,6 +216,15 @@ func TestConnection(ctx context.Context, c pg.Conn, kind string) []ProbeResult {
 	} else {
 		out = append(out, ProbeResult{"tls", c.SSLMode == "disable", "The connection is not encrypted."})
 	}
+	if ss, err := pg.ProbeSession(ctx, conn, c); err != nil {
+		out = append(out, ProbeResult{"session", false, "Could not confirm that sessions keep their settings: " + err.Error()})
+	} else if !ss.Pinned {
+		out = append(out, ProbeResult{"session", false, "A connection pooler in transaction mode is in between: use the direct port."})
+	} else if ss.ProxyLikely {
+		out = append(out, ProbeResult{"session", true, "A pooler or proxy is probably in between (PostgreSQL sees " + orDash(ss.ClientAddr) + "); sessions kept their settings."})
+	} else {
+		out = append(out, ProbeResult{"session", true, "Sessions keep their settings (no transaction pooling)."})
+	}
 	var repl, super, createdb bool
 	conn.QueryRow(ctx, `SELECT rolreplication, rolsuper, rolcreatedb FROM pg_roles WHERE rolname=current_user`).Scan(&repl, &super, &createdb)
 	if kind == "source" {
@@ -512,7 +521,7 @@ func (o *Orchestrator) dbSpec(ctx context.Context, m Migration, d Database) (eng
 	spec := engine.DatabaseSpec{MigrationID: m.ID, Source: d.SourceName, Target: d.TargetName, SourceConn: src, TargetConn: dst,
 		Instance: d.Instance, SlotName: d.SlotName, OriginName: d.OriginName, Plugin: d.Plugin,
 		RunDir: filepath.Join(o.cfg.RunsDir(), d.Instance), TableJobs: tj, IndexJobs: ij, SplitLarger: v.Str("split_tables_larger_than"),
-		SyncCommitOff: v.Bool("target_synchronous_commit_off"), MaintWorkMem: v.Str("target_maintenance_work_mem")}
+	}
 	if o.testHooks.ExtraEngineArgs != nil {
 		spec.ExtraArgs = o.testHooks.ExtraEngineArgs(d.SourceName)
 	}
@@ -569,7 +578,10 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 	}
 	// The data-safety gate starts here: re-check the apply privileges inside the
 	// database the engine will apply into (function grants are per database).
-	if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err == nil {
+	if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err != nil {
+		done("failed: " + err.Error())
+		return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not connect to target database "+d.TargetName+" to confirm the apply privileges, so it did not start the engine (finding F2): "+err.Error()+". Nothing was copied; restart it from zero once the target is reachable.")
+	} else {
 		ver, _ := pg.ServerVersionNum(ctx, tc)
 		ap := pgpack.TargetApplyPrivileges(ctx, tc, ver)
 		tc.Close(ctx)
@@ -696,8 +708,10 @@ func (o *Orchestrator) resumeDB(ctx context.Context, m Migration, d Database, wh
 		done("failed: " + err.Error())
 		return err
 	}
+	// A database with an end position is mid-cutover: it resumes draining
+	// (afterExit stores stopped, so its earlier state is not a guide).
 	state := DCatchUp
-	if d.State == DDraining {
+	if d.EndPos != "" {
 		state = DDraining
 	}
 	o.setDB(ctx, d.ID, map[string]any{"state": state, "next_retry_at": nil, "last_error": nil, "error_class": nil})
@@ -789,6 +803,9 @@ func (o *Orchestrator) ResumeDatabase(ctx context.Context, a audit.Actor, id, db
 	if err != nil {
 		return d, err
 	}
+	if m.Flags.Aborted || m.Flags.CleanedUp || m.Flags.CleanupRunning {
+		return d, uerr("aborted", "The migration is aborted or being cleaned up.", "")
+	}
 	if activeDB[d.State] {
 		return d, uerr("running", d.SourceName+" is already running.", "")
 	}
@@ -798,7 +815,19 @@ func (o *Orchestrator) ResumeDatabase(ctx context.Context, a audit.Actor, id, db
 	if err := o.resumeDB(ctx, m, d, "resumed by "+a.Username); err != nil {
 		return d, err
 	}
-	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Paused = false })
+	// Resuming one database un-pauses the migration only when nothing else is
+	// left paused; otherwise pending databases would launch unasked.
+	if dbs, err := o.ListDatabases(ctx, m.ID); err == nil {
+		still := false
+		for _, x := range included(dbs) {
+			if x.ID != d.ID && (x.State == DStopped || x.State == DPending) {
+				still = true
+			}
+		}
+		if !still {
+			o.updateFlags(ctx, m.ID, func(f *Flags) { f.Paused = false })
+		}
+	}
 	o.audit.Append(ctx, a, "database.resume", m.ID, map[string]any{"database": d.SourceName, "state": d.State}, nil)
 	o.refreshState(ctx, m.ID)
 	return o.GetDatabase(ctx, m.ID, d.ID)
@@ -843,7 +872,7 @@ func (o *Orchestrator) RestartDatabase(ctx context.Context, a audit.Actor, id, d
 		return d, err
 	}
 	o.setDB(ctx, d.ID, map[string]any{"state": DPending, "base_copy_done": 0, "last_error": nil, "error_class": nil, "next_retry_at": nil, "retry_count": 0,
-		"hb_before_lsn": nil, "hb_token": nil, "endpos": nil, "origin_lsn": nil, "verdict": nil, "in_sync_since": nil, "replay_lsn": nil, "write_lsn": nil})
+		"hb_before_lsn": nil, "hb_token": nil, "endpos": nil, "origin_lsn": nil, "verdict": nil, "in_sync_since": nil, "replay_lsn": nil, "write_lsn": nil, "drained": 0, "auto_restarts": 0})
 	done("reset")
 	o.audit.Append(ctx, a, "database.restart", m.ID, map[string]any{"database": d.SourceName, "state": d.State}, map[string]any{"state": DPending})
 	o.Event(ctx, m.ID, d.SourceName, "restart", "warning", d.SourceName+" restarted from zero by "+a.Username, nil)
@@ -865,8 +894,11 @@ func resetTargetDB(ctx context.Context, spec engine.DatabaseSpec) error {
 	if err != nil {
 		return err
 	}
-	srcRels, _ := pg.QueryStrings(ctx, src, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'`)
+	srcRels, err := pg.QueryStrings(ctx, src, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'`)
 	src.Close(ctx)
+	if err != nil {
+		return fmt.Errorf("listing the source's relations: %w", err)
+	}
 	dst, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), time.Minute)
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") {
@@ -874,27 +906,38 @@ func resetTargetDB(ctx context.Context, spec engine.DatabaseSpec) error {
 		}
 		return err
 	}
-	dstRels, _ := pg.QueryStrings(ctx, dst, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%'`)
+	// relkind first, so each object is dropped with the right command.
+	dstRels, err := pg.QueryStrings(ctx, dst, `SELECT c.relkind::text||' '||format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND NOT c.relispartition AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'`)
+	if err != nil {
+		dst.Close(ctx)
+		return fmt.Errorf("listing the target's relations: %w", err)
+	}
 	srcSet := map[string]bool{}
 	for _, r := range srcRels {
 		srcSet[r] = true
 	}
 	onlyOurs := true
-	for _, r := range dstRels {
-		if !srcSet[r] {
+	for _, kr := range dstRels {
+		if _, r, _ := strings.Cut(kr, " "); !srcSet[r] {
 			onlyOurs = false
 		}
 	}
 	if !onlyOurs {
-		for _, r := range dstRels {
-			if srcSet[r] {
-				dst.Exec(ctx, `DROP TABLE IF EXISTS `+r+` CASCADE`)
-				dst.Exec(ctx, `DROP VIEW IF EXISTS `+r+` CASCADE`)
-				dst.Exec(ctx, `DROP MATERIALIZED VIEW IF EXISTS `+r+` CASCADE`)
-				dst.Exec(ctx, `DROP SEQUENCE IF EXISTS `+r+` CASCADE`)
+		cmd := map[string]string{"r": "TABLE", "p": "TABLE", "f": "FOREIGN TABLE", "v": "VIEW", "m": "MATERIALIZED VIEW", "S": "SEQUENCE"}
+		for _, kr := range dstRels {
+			k, r, _ := strings.Cut(kr, " ")
+			if !srcSet[r] {
+				continue
+			}
+			if _, err := dst.Exec(ctx, `DROP `+cmd[k]+` IF EXISTS `+r+` CASCADE`); err != nil {
+				dst.Close(ctx)
+				return fmt.Errorf("dropping %s on the target: %w", r, err)
 			}
 		}
-		dst.Exec(ctx, `DROP SCHEMA IF EXISTS upwell CASCADE`)
+		if _, err := dst.Exec(ctx, `DROP SCHEMA IF EXISTS upwell CASCADE`); err != nil {
+			dst.Close(ctx)
+			return fmt.Errorf("dropping the upwell schema on the target: %w", err)
+		}
 		dst.Close(ctx)
 		return nil
 	}
@@ -991,8 +1034,28 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 	if m.Flags.Aborted || m.Flags.CleanedUp {
 		return m, uerr("already_aborted", "The migration is already aborted.", "")
 	}
-	if m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0 && m.Flags.Cutover.Phase != "readiness" && m.Flags.Cutover.Phase != "writers" && m.Flags.Cutover.Phase != "heartbeat" && m.Flags.Cutover.Phase != "await" {
+	// Check and mark aborted in one step, so a cutover worker moving to its
+	// end positions (a check-and-set on the same flags) either wins and this
+	// refuses, or sees the abort and stops.
+	tooLate := false
+	var cutOp string
+	o.updateFlags(ctx, m.ID, func(f *Flags) {
+		if c := f.Cutover; c != nil && c.EndedAt == 0 {
+			if c.Phase != "readiness" && c.Phase != "writers" && c.Phase != "heartbeat" && c.Phase != "await" {
+				tooLate = true
+				return
+			}
+			cutOp = c.OpID
+			c.EndedAt = store.Now()
+			c.Verdict = "aborted"
+		}
+		f.Aborted = true
+	})
+	if tooLate {
 		return m, uerr("cutover_running", "End positions are already set; the cutover cannot be aborted now.", "Wait for the verdict.")
+	}
+	if cancel, ok := cutoverCancels.Load(cutOp); ok && cutOp != "" {
+		cancel.(context.CancelFunc)()
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	for _, d := range included(dbs) {
@@ -1004,13 +1067,6 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 			o.setDB(ctx, d.ID, map[string]any{"state": DStopped, "next_retry_at": nil})
 		}
 	}
-	o.updateFlags(ctx, m.ID, func(f *Flags) {
-		f.Aborted = true
-		if f.Cutover != nil && f.Cutover.EndedAt == 0 {
-			f.Cutover.EndedAt = store.Now()
-			f.Cutover.Verdict = "aborted"
-		}
-	})
 	o.audit.Append(ctx, a, "migration.abort", m.ID, map[string]any{"state": m.State}, nil)
 	o.Event(ctx, m.ID, "", "aborted", "warning", "Migration aborted by "+a.Username+"; clean up removes its slots, publications and origins", nil)
 	o.refreshState(ctx, m.ID)
@@ -1024,7 +1080,7 @@ func (o *Orchestrator) MarkSwitched(ctx context.Context, a audit.Actor, id, conf
 	if err != nil {
 		return m, err
 	}
-	if m.Flags.Verdict != "GO" {
+	if m.Flags.Verdict != "GO" || m.Flags.Aborted {
 		return m, uerr("not_go", "Applications can be marked switched only after a GO verdict.", "")
 	}
 	if confirm != m.Name {
@@ -1049,6 +1105,9 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 	if m.Flags.CleanedUp {
 		return nil, uerr("cleaned", "This migration is already cleaned up.", "")
 	}
+	if m.Flags.CleanupRunning {
+		return nil, uerr("cleanup_running", "Clean up is already running.", "Watch its progress on the migration's overview.")
+	}
 	ok := m.Flags.Aborted || m.Flags.Verdict != "" || !m.Flags.Started
 	if !ok {
 		return nil, uerr("running", "Clean up is available after the verdict or after aborting.", "Abort the migration first, or finish the cutover.")
@@ -1067,6 +1126,14 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 	o.updateFlags(ctx, m.ID, func(f *Flags) { f.CleanupRunning = true })
 	go func() {
 		bg := context.Background()
+		// Hold the migration lock for the whole cleanup: the supervisor skips
+		// the migration meanwhile, so no automatic resume restarts an engine
+		// whose slot and work directory are being removed.
+		unlock := o.lock(m.ID)
+		defer unlock()
+		for _, d := range included(dbs) {
+			o.setDB(bg, d.ID, map[string]any{"next_retry_at": nil})
+		}
 		var failed []string
 		for _, d := range included(dbs) {
 			op.StepStart("db:"+d.SourceName, "")
@@ -1100,7 +1167,13 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 				o.st.DB.ExecContext(bg, `UPDATE connections SET password_secret_id=NULL WHERE id=?`, cid)
 			}
 		}
-		os.RemoveAll(filepath.Join(o.cfg.DataDir, "ca"))
+		// Only this migration's CA files: other migrations' engines read theirs
+		// whenever they reconnect.
+		for _, cid := range []string{m.SourceConnID, m.TargetConnID} {
+			if cid != "" {
+				os.Remove(filepath.Join(o.cfg.DataDir, "ca", cid+".pem"))
+			}
+		}
 		op.StepEnd("credentials", "done", "")
 		o.updateFlags(bg, m.ID, func(f *Flags) { f.CleanupRunning = false; f.CleanedUp = true; f.Paused = false })
 		o.Event(bg, m.ID, "", "cleaned_up", "info", "Cleanup finished: slots, publications, origins, heartbeat tables and credentials removed", nil)
@@ -1108,4 +1181,11 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 		op.Finish(nil, map[string]any{"databases": len(included(dbs))})
 	}()
 	return op, nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "no client address"
+	}
+	return s
 }

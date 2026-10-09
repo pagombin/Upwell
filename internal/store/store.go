@@ -108,6 +108,37 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
+// Immediate runs fn inside a BEGIN IMMEDIATE transaction on one connection.
+// The write lock is taken at the start, so a read followed by a write inside
+// fn cannot race another writer, even one in another process (the CLI and the
+// service share the file). fn's error rolls the transaction back.
+func (s *Store) Immediate(ctx context.Context, fn func(c *sql.Conn) error) (err error) {
+	c, err := s.DB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if _, err := c.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	defer func() {
+		rec := recover()
+		if err != nil || rec != nil {
+			// A background context: the rollback must run even when ctx ended,
+			// or the pooled connection would keep the transaction open.
+			_, _ = c.ExecContext(context.Background(), `ROLLBACK`)
+		}
+		if rec != nil {
+			panic(rec)
+		}
+	}()
+	if err = fn(c); err != nil {
+		return err
+	}
+	_, err = c.ExecContext(ctx, `COMMIT`)
+	return err
+}
+
 // LatestSchemaVersion is the highest schema migration shipped in this binary.
 func LatestSchemaVersion() int {
 	entries, _ := fs.ReadDir(migrationFiles, "migrations")

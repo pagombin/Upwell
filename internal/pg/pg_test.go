@@ -1,6 +1,7 @@
 package pg
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -46,5 +47,15 @@ func TestQuote(t *testing.T) {
 	}
 	if QuoteLiteral("it's") != "'it''s'" {
 		t.Fatal(QuoteLiteral("it's"))
+	}
+}
+
+func TestExplainStartupParameter(t *testing.T) {
+	err := Explain(errors.New("failed to connect to `user=doadmin database=defaultdb`: 159.89.220.21:5432: server error: FATAL: unsupported startup parameter: statement_timeout (SQLSTATE 08P01)"))
+	if strings.Contains(err.Error(), "did not answer in time") || !strings.Contains(err.Error(), "pooler") {
+		t.Fatalf("explained as %q", err)
+	}
+	if err := Explain(errors.New("dial tcp 10.0.0.1:5432: i/o timeout")); !strings.Contains(err.Error(), "did not answer in time") {
+		t.Fatalf("a real timeout explained as %q", err)
 	}
 }

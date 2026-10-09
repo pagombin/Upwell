@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -138,7 +139,16 @@ func open(cfg config.Config, createKey bool, stderrLogs bool) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng := pgcopydb.New(cfg.Engine.Pgcopydb, r)
+	pgc := cfg.Engine.Pgcopydb
+	if _, err := os.Stat(pgc); err != nil {
+		// A pgcopydb installed elsewhere (for example the PGDG package in
+		// /usr/bin) is used rather than failing every check.
+		if p, lerr := exec.LookPath("pgcopydb"); lerr == nil {
+			lg.Logf("warn", "app", "", "pgcopydb is not at the configured path %s; using %s from the PATH", pgc, p)
+			pgc = p
+		}
+	}
+	eng := pgcopydb.New(pgc, r)
 	a.orch = orch.New(orch.Deps{Config: cfg, Store: st, Vault: a.vault, Engine: eng, Runner: r, Logger: lg, Bus: b, Audit: a.audit, Settings: a.set})
 	g, _ := a.set.Global(context.Background())
 	lg.SetLevel(g.Str("log_level"))
@@ -436,6 +446,20 @@ func migrateCmd(args []string) error {
 	return nil
 }
 
+// copyOwnership gives dst the owner, group and permission bits of src.
+func copyOwnership(src, dst string) error {
+	fi, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if err := os.Chown(dst, int(st.Uid), int(st.Gid)); err != nil {
+			return err
+		}
+	}
+	return os.Chmod(dst, fi.Mode().Perm())
+}
+
 func keyCmd(args []string) error {
 	if len(args) == 0 || args[0] != "rotate" {
 		return errors.New("usage: upwell key rotate (stop upwell.service first)")
@@ -460,6 +484,13 @@ func keyCmd(args []string) error {
 	nk, err := secrets.LoadOrCreateKey(tmp, true)
 	if err != nil {
 		return err
+	}
+	// The new key gets the old key's owner, group and mode (the service
+	// reads it as the upwell user); this runs before any secret is
+	// re-encrypted so a failure here changes nothing.
+	if err := copyOwnership(cfg.MasterKey, tmp); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("new master key: %w", err)
 	}
 	newBox, _ := secrets.New(nk)
 	if err := (&secrets.Vault{Box: oldBox, Store: st}).Rotate(context.Background(), newBox); err != nil {

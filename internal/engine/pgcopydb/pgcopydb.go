@@ -108,9 +108,9 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	}
 	pass := filepath.Join(d.RunDir, "pgpass")
 	env := map[string]string{"PGPASSFILE": pass, "PGAPPNAME": "upwell-engine"}
-	if d.SyncCommitOff {
-		env["PGOPTIONS"] = "-c synchronous_commit=off"
-	}
+	// No PGOPTIONS: a pooler such as PgBouncer refuses startup options, and
+	// pgcopydb already sets synchronous_commit, maintenance_work_mem and the
+	// timeouts with SET in its own sessions (copydb.c dstSettings).
 	return engine.RunPlan{Instance: d.Instance, Unit: e.Runner.UnitName(d.Instance), Binary: e.Binary, Args: args, Env: env,
 		RunDir: d.RunDir, WorkDir: work, LogFile: filepath.Join(d.RunDir, "engine.log"), PassFile: pass, Resume: resume,
 		Display: e.Binary + " " + strings.Join(args, " ")}, nil

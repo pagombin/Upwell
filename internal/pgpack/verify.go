@@ -48,10 +48,17 @@ type tableInfo struct {
 }
 
 func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) {
-	rows, err := c.Query(ctx, `SELECT format('%I.%I', n.nspname, c.relname), pg_total_relation_size(c.oid), GREATEST(c.reltuples,0)::bigint,
-		(SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod), ',' ORDER BY a.attnum) FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped)
+	// A partitioned parent has no storage of its own: its size is its
+	// partitions', so the budget orders it correctly. The column signature
+	// includes NOT NULL, identity and generated expressions and defaults.
+	rows, err := c.Query(ctx, `SELECT format('%I.%I', n.nspname, c.relname),
+		CASE WHEN c.relkind='p' THEN (SELECT COALESCE(sum(pg_total_relation_size(pt.relid)),0)::bigint FROM pg_partition_tree(c.oid) pt) ELSE pg_total_relation_size(c.oid) END,
+		GREATEST(c.reltuples,0)::bigint,
+		c.relkind::text || '|' || COALESCE((SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod)||CASE WHEN a.attnotnull THEN ' not null' ELSE '' END||
+			CASE WHEN a.attidentity<>'' THEN ' identity '||a.attidentity::text ELSE '' END||CASE WHEN a.attgenerated<>'' THEN ' generated '||COALESCE(pg_get_expr(d.adbin,d.adrelid),'') ELSE '' END,
+			',' ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),'')
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND NOT c.relispartition`)
+		WHERE c.relkind IN ('r','p') AND c.relpersistence<>'t' AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND NOT c.relispartition`)
 	if err != nil {
 		return nil, err
 	}
@@ -59,23 +66,76 @@ func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) 
 	out := map[string]tableInfo{}
 	for rows.Next() {
 		var t tableInfo
-		var cols *string
-		if err := rows.Scan(&t.Name, &t.Bytes, &t.Est, &cols); err != nil {
+		if err := rows.Scan(&t.Name, &t.Bytes, &t.Est, &t.Columns); err != nil {
 			return nil, err
-		}
-		if cols != nil {
-			t.Columns = *cols
 		}
 		out[t.Name] = t
 	}
 	return out, rows.Err()
 }
 
+// schemaObjects lists what pg_dump recreates besides table columns: indexes,
+// constraints (validated or not), triggers, views, materialized views and
+// functions, as comparable strings keyed by kind. NOT NULL constraints are in
+// the column signature (PostgreSQL 18 also lists them in pg_constraint).
+func schemaObjects(ctx context.Context, c *pgx.Conn) (map[string]map[string]bool, error) {
+	const userNS = `n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'`
+	queries := map[string]string{
+		"index": `SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+			WHERE ` + userNS + ` AND c.relpersistence<>'t' AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=i.indexrelid AND d.deptype='e')`,
+		"constraint": `SELECT format('%I.%I', n.nspname, c.relname)||' '||co.conname||' '||pg_get_constraintdef(co.oid)||CASE WHEN co.convalidated THEN '' ELSE ' NOT VALID' END
+			FROM pg_constraint co JOIN pg_class c ON c.oid=co.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+			WHERE ` + userNS + ` AND c.relpersistence<>'t' AND co.contype IN ('p','u','f','c','x') AND co.conislocal`,
+		"trigger": `SELECT format('%I.%I', n.nspname, c.relname)||' '||t.tgname||' '||t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+			WHERE ` + userNS + ` AND NOT t.tgisinternal`,
+		"view": `SELECT c.relkind::text||' '||format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+			WHERE ` + userNS + ` AND c.relkind IN ('v','m') AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=c.oid AND d.deptype='e')`,
+		"partition": `SELECT format('%I.%I', n.nspname, c.relname)||' '||pg_get_expr(c.relpartbound, c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+			WHERE ` + userNS + ` AND c.relispartition AND c.relkind IN ('r','p')`,
+		"enum": `SELECT format('%I.%I', n.nspname, t.typname)||' '||string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
+			FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid JOIN pg_namespace n ON n.oid=t.typnamespace WHERE ` + userNS + ` GROUP BY n.nspname, t.typname`,
+		"function": `SELECT format('%I.%I', n.nspname, p.proname)||'('||pg_get_function_identity_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+			WHERE ` + userNS + ` AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=p.oid AND d.deptype='e')`,
+	}
+	out := map[string]map[string]bool{}
+	for kind, q := range queries {
+		vals, err := pg.QueryStrings(ctx, c, q)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", kind, err)
+		}
+		m := map[string]bool{}
+		for _, v := range vals {
+			m[v] = true
+		}
+		out[kind] = m
+	}
+	return out, nil
+}
+
+// prepareVerifySession fixes everything that changes a row's text form or
+// could cut or filter Upwell's own queries: the role's timeouts (pgcopydb
+// clears them in its sessions, Upwell must too), row-level security (with
+// row_security off a query errors instead of silently returning fewer rows),
+// and the output settings, so the same row hashes the same on both servers.
+func prepareVerifySession(ctx context.Context, c *pgx.Conn) error {
+	stmts := []string{"SET statement_timeout = 0", "SET lock_timeout = 0", "SET idle_in_transaction_session_timeout = 0", "SET row_security = off",
+		"SET TimeZone = 'UTC'", "SET DateStyle = 'ISO, YMD'", "SET IntervalStyle = 'postgres'", "SET extra_float_digits = 3", "SET bytea_output = 'hex'", "SET lc_monetary = 'C'"}
+	if v, err := pg.ServerVersionNum(ctx, c); err == nil && v >= 140000 {
+		stmts = append(stmts, "SET idle_session_timeout = 0")
+	}
+	for _, q := range stmts {
+		if _, err := c.Exec(ctx, q); err != nil {
+			return fmt.Errorf("%s: %w", q, err)
+		}
+	}
+	return nil
+}
+
 // rowsHash returns count and the order-independent sum of 60-bit row hashes (D4).
 func rowsHash(ctx context.Context, c *pgx.Conn, table string) (int64, string, error) {
 	var n int64
 	var sum *string
-	err := c.QueryRow(ctx, fmt.Sprintf(`SELECT count(*), COALESCE(sum(('x'||substr(md5(t::text),1,15))::bit(60)::bigint),0)::text FROM %s t`, table)).Scan(&n, &sum)
+	err := c.QueryRow(ctx, fmt.Sprintf(`SELECT count(*), COALESCE(sum(('x'||substr(md5(ROW(t.*)::text),1,15))::bit(60)::bigint),0)::text FROM %s t`, table)).Scan(&n, &sum)
 	if err != nil {
 		return 0, "", err
 	}
@@ -121,7 +181,8 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 		if origin == "" {
 			o, err := OriginProgress(ctx, in.TargetMaint, in.Origin)
 			if err != nil {
-				add(vres("origin_progress", db, check.Blocker, "Target origin reached the final heartbeat", "Could not read the target's replication origin: "+err.Error(), map[string]any{}))
+				o = ""
+				in.Origin += " (" + err.Error() + ")"
 			}
 			origin = o
 		}
@@ -148,6 +209,12 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 		return finish(out), nil
 	}
 	defer dst.Close(ctx)
+	for side, c := range map[string]*pgx.Conn{"source": src, "target": dst} {
+		if err := prepareVerifySession(ctx, c); err != nil {
+			add(vres("schema", db, check.Blocker, "Schema matches", "Cannot prepare the "+side+" session for verification: "+err.Error(), map[string]any{}))
+			return finish(out), nil
+		}
+	}
 
 	// 3. Schema: tables and columns.
 	st, err1 := listTables(ctx, src)
@@ -185,6 +252,30 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 		add(vres("schema", db, check.Blocker, "Schema matches", strings.Join(msg, "; ")+".", ev))
 	} else {
 		add(vres("schema", db, check.OK, "Schema matches", fmt.Sprintf("All %d tables exist on the target with the same columns.", len(st)), ev))
+	}
+	// Indexes, constraints, triggers, views and functions.
+	so, e1 := schemaObjects(ctx, src)
+	do, e2 := schemaObjects(ctx, dst)
+	if e1 != nil || e2 != nil {
+		add(vres("schema_objects", db, check.Blocker, "Indexes, constraints and other objects match", fmt.Sprintf("Could not list schema objects: %v %v", e1, e2), map[string]any{}))
+	} else {
+		var objMissing []string
+		counts := map[string]int{}
+		for _, kind := range []string{"index", "constraint", "trigger", "view", "function", "partition", "enum"} {
+			counts[kind] = len(so[kind])
+			for v := range so[kind] {
+				if !do[kind][v] {
+					objMissing = append(objMissing, kind+" "+v)
+				}
+			}
+		}
+		sort.Strings(objMissing)
+		oev := map[string]any{"missing_or_different_on_target": limitList(objMissing, 100), "counts": counts}
+		if len(objMissing) > 0 {
+			add(vres("schema_objects", db, check.Blocker, "Indexes, constraints and other objects match", fmt.Sprintf("%d object(s) are missing or different on the target: %s.", len(objMissing), strings.Join(limitList(objMissing, 3), "; ")), oev))
+		} else {
+			add(vres("schema_objects", db, check.OK, "Indexes, constraints and other objects match", fmt.Sprintf("%d indexes, %d constraints, %d triggers, %d views and %d functions match.", counts["index"], counts["constraint"], counts["trigger"], counts["view"], counts["function"]), oev))
+		}
 	}
 	if len(extra) > 0 {
 		add(vres("target_only_objects", db, check.Warning, "Objects only on the target", fmt.Sprintf("%d table(s) exist only on the target (for example %s); they were left untouched.", len(extra), extra[0]), map[string]any{"tables": limitList(extra, 50)}))
@@ -245,6 +336,12 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			}
 		} else {
 			estOnly = append(estOnly, t.Name)
+			// Not counted: at least catch a table that is empty or far
+			// smaller on the target (its storage, since planner estimates
+			// are not refreshed until ANALYZE).
+			if dtb := dt[t.Name].Bytes; t.Bytes > 0 && dtb*10 < t.Bytes {
+				countFail = append(countFail, fmt.Sprintf("%s (too large to count; %s on the source but only %s on the target)", t.Name, humanBytes(float64(t.Bytes)), humanBytes(float64(dtb))))
+			}
 		}
 	}
 	ev = map[string]any{"exact": exactN, "mismatches": countFail, "estimated_only": estOnly}
@@ -254,7 +351,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 		add(vres("row_counts", db, check.OK, "Row counts match", fmt.Sprintf("Exact counts match for %d table(s).", exactN), ev))
 	}
 	if len(estOnly) > 0 {
-		add(vres("row_estimates", db, check.Warning, "Large tables compared by estimate", fmt.Sprintf("%d table(s) above the exact-count limit and outside the checksum window were compared by planner estimates only.", len(estOnly)), map[string]any{"tables": limitList(estOnly, 50)}))
+		add(vres("row_estimates", db, check.Warning, "Large tables not counted", fmt.Sprintf("%d table(s) above the exact-count limit and outside the checksum window were not counted; only their size on disk was compared, which catches an empty or truncated table but not missing rows. Raise exact_count_max_mb or verify_checksum_budget_seconds to compare them fully.", len(estOnly)), map[string]any{"tables": limitList(estOnly, 50)}))
 	}
 	ev = map[string]any{"checksummed": summedN, "mismatches": sumFail, "not_checksummed": limitList(notSummed, 100)}
 	switch {
@@ -264,6 +361,60 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 		add(vres("checksums", db, check.Warning, "Row checksums match", fmt.Sprintf("Checksums match for %d table(s); %d table(s) did not fit in the verification window and were not checksummed.", summedN, len(notSummed)), ev))
 	default:
 		add(vres("checksums", db, check.OK, "Row checksums match", fmt.Sprintf("Checksums match for all %d table(s).", summedN), ev))
+	}
+
+	// Large objects: logical decoding does not carry them, so changes made
+	// while streaming never reach the target.
+	srcLO, srcErr := largeObjects(ctx, src)
+	dstLO, dstErr := largeObjects(ctx, dst)
+	lev := map[string]any{"source": srcLO, "target": dstLO}
+	switch {
+	case srcErr != nil || dstErr != nil:
+		add(vres("large_objects", db, check.Blocker, "Large objects match", fmt.Sprintf("Could not read the large objects to compare them: %v %v", srcErr, dstErr), lev))
+	case srcLO.Count == 0 && dstLO.Count == 0:
+		add(vres("large_objects", db, check.OK, "Large objects match", "No large objects.", lev))
+	case srcLO != dstLO:
+		add(vres("large_objects", db, check.Blocker, "Large objects match", fmt.Sprintf("Large objects differ (source %d, target %d, or different contents). Changes to large objects are not streamed, so those made after the base copy are missing on the target.", srcLO.Count, dstLO.Count), lev))
+	default:
+		add(vres("large_objects", db, check.OK, "Large objects match", fmt.Sprintf("All %d large objects match.", srcLO.Count), lev))
+	}
+
+	// Materialized views: their contents are not streamed. A view refreshed on
+	// the source while streaming is stale on the target; refreshing it there
+	// (from data already verified above) brings it level.
+	mvs, err := pg.QueryStrings(ctx, src, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE c.relkind='m' AND c.relispopulated AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') ORDER BY 1`)
+	if err != nil {
+		add(vres("materialized_views", db, check.Blocker, "Materialized views match", "Could not list materialized views: "+err.Error(), map[string]any{}))
+	} else if len(mvs) > 0 {
+		var refreshed, differ []string
+		for _, mv := range mvs {
+			if ctx.Err() != nil {
+				return finish(out), ctx.Err()
+			}
+			an, as, e1 := rowsHash(ctx, src, mv)
+			bn, bs, e2 := rowsHash(ctx, dst, mv)
+			if e1 == nil && e2 == nil && an == bn && as == bs {
+				continue
+			}
+			if _, err := dst.Exec(ctx, "REFRESH MATERIALIZED VIEW "+mv); err == nil {
+				bn, bs, e2 = rowsHash(ctx, dst, mv)
+				if e1 == nil && e2 == nil && an == bn && as == bs {
+					refreshed = append(refreshed, mv)
+					continue
+				}
+			}
+			differ = append(differ, mv)
+		}
+		mev := map[string]any{"views": len(mvs), "refreshed_on_target": refreshed, "different": differ}
+		switch {
+		case len(differ) > 0:
+			add(vres("materialized_views", db, check.Warning, "Materialized views match", fmt.Sprintf("%d materialized view(s) differ even after refreshing them on the target (%s): the source's copy is older than its data. Applications reading them will see fresher results on the target.", len(differ), strings.Join(limitList(differ, 5), ", ")), mev))
+		case len(refreshed) > 0:
+			add(vres("materialized_views", db, check.OK, "Materialized views match", fmt.Sprintf("All %d materialized views match; %d were refreshed on the target because the source refreshed them while streaming.", len(mvs), len(refreshed)), mev))
+		default:
+			add(vres("materialized_views", db, check.OK, "Materialized views match", fmt.Sprintf("All %d materialized views match.", len(mvs)), mev))
+		}
 	}
 
 	// 5. Sequences.
@@ -290,22 +441,48 @@ func finish(rs []check.Result) VerifyResult {
 	return VerifyResult{Results: rs, GO: g}
 }
 
-func sequenceValues(ctx context.Context, c *pgx.Conn) (map[string]int64, error) {
-	rows, err := c.Query(ctx, `SELECT format('%I.%I', schemaname, sequencename), COALESCE(last_value, 0) FROM pg_sequences WHERE schemaname <> 'upwell'`)
+type seqVal struct {
+	v    int64
+	desc bool
+}
+
+func sequenceValues(ctx context.Context, c *pgx.Conn) (map[string]seqVal, error) {
+	rows, err := c.Query(ctx, `SELECT format('%I.%I', schemaname, sequencename), last_value, start_value, increment_by < 0 FROM pg_sequences WHERE schemaname <> 'upwell'`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]int64{}
+	out := map[string]seqVal{}
 	for rows.Next() {
 		var n string
-		var v int64
-		if err := rows.Scan(&n, &v); err != nil {
+		var last *int64
+		var start int64
+		var desc bool
+		if err := rows.Scan(&n, &last, &start, &desc); err != nil {
 			return nil, err
 		}
-		out[n] = v
+		// Never called: the next value is the start, one step "before" it.
+		var v int64
+		switch {
+		case last != nil:
+			v = *last
+		case desc:
+			v = start + 1
+		default:
+			v = start - 1
+		}
+		out[n] = seqVal{v, desc}
 	}
 	return out, rows.Err()
+}
+
+// behind reports whether target t would hand out a value the source already
+// used: for an ascending sequence t < s, for a descending one t > s.
+func behind(s, t seqVal) bool {
+	if s.desc {
+		return t.v > s.v
+	}
+	return t.v < s.v
 }
 
 func compareSequences(ctx context.Context, src, dst *pgx.Conn) ([]string, int, error) {
@@ -319,8 +496,8 @@ func compareSequences(ctx context.Context, src, dst *pgx.Conn) ([]string, int, e
 	}
 	var diff []string
 	for n, v := range s {
-		if dv, ok := d[n]; !ok || dv < v {
-			diff = append(diff, fmt.Sprintf("%s (source %d, target %d)", n, v, d[n]))
+		if dv, ok := d[n]; !ok || behind(v, dv) {
+			diff = append(diff, fmt.Sprintf("%s (source %d, target %d)", n, v.v, d[n].v))
 		}
 	}
 	sort.Strings(diff)
@@ -351,10 +528,10 @@ func SyncSequences(ctx context.Context, srcC, dstC pg.Conn) (int, error) {
 	n := 0
 	for name, v := range sv {
 		cur, ok := dv[name]
-		if !ok || cur >= v || v == 0 {
+		if !ok || !behind(v, cur) {
 			continue
 		}
-		if _, err := dst.Exec(ctx, `SELECT setval($1::regclass, $2)`, name, v); err != nil {
+		if _, err := dst.Exec(ctx, `SELECT setval($1::regclass, $2)`, name, v.v); err != nil {
 			return n, fmt.Errorf("sequence %s: %w", name, err)
 		}
 		n++
@@ -375,4 +552,93 @@ func WriteActivity(ctx context.Context, c pg.Conn) (int64, []string, error) {
 	sessions, _ := pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' ('||COALESCE(application_name,'')||', '||state||')' FROM pg_stat_activity
 		WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND COALESCE(application_name,'') NOT LIKE 'upwell%' AND COALESCE(application_name,'') NOT LIKE 'pgcopydb%' ORDER BY 1 LIMIT 50`)
 	return n, sessions, nil
+}
+
+// SchemaDrift lists the differences that logical decoding cannot carry and
+// that would break or invalidate a migration if found only at the cutover:
+// tables and their columns (a new partition, an added column) and enum
+// labels (a value added on the source makes the engine's apply fail). It
+// reads only the catalogs, so it is cheap enough to run while streaming.
+func SchemaDrift(ctx context.Context, src, dst *pgx.Conn) ([]string, error) {
+	st, err := listTables(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+	dt, err := listTables(ctx, dst)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for name, s := range st {
+		d, ok := dt[name]
+		switch {
+		case !ok:
+			out = append(out, "table "+name+" exists only on the source")
+		case d.Columns != s.Columns:
+			out = append(out, "table "+name+" has different columns")
+		}
+	}
+	// Partitions (listTables lists only top-level tables): next month's
+	// partition created on the source is the usual case.
+	const parts = `SELECT format('%I.%I', n.nspname, c.relname)||' '||pg_get_expr(c.relpartbound, c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE c.relispartition AND c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell')`
+	sp, err := pg.QueryStrings(ctx, src, parts)
+	if err != nil {
+		return nil, err
+	}
+	dp, err := pg.QueryStrings(ctx, dst, parts)
+	if err != nil {
+		return nil, err
+	}
+	havePart := map[string]bool{}
+	for _, x := range dp {
+		havePart[x] = true
+	}
+	for _, x := range sp {
+		if !havePart[x] {
+			name, _, _ := strings.Cut(x, " ")
+			out = append(out, "partition "+name+" exists only on the source")
+		}
+	}
+	const enums = `SELECT format('%I.%I', n.nspname, t.typname)||' '||string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
+		FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid JOIN pg_namespace n ON n.oid=t.typnamespace
+		WHERE n.nspname NOT IN ('pg_catalog','information_schema','upwell') GROUP BY n.nspname, t.typname`
+	se, err := pg.QueryStrings(ctx, src, enums)
+	if err != nil {
+		return nil, err
+	}
+	de, err := pg.QueryStrings(ctx, dst, enums)
+	if err != nil {
+		return nil, err
+	}
+	have := map[string]bool{}
+	for _, x := range de {
+		have[x] = true
+	}
+	for _, x := range se {
+		if !have[x] {
+			name, _, _ := strings.Cut(x, " ")
+			out = append(out, "enum "+name+" has different values")
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+type loSummary struct {
+	Count int64  `json:"count"`
+	Sum   string `json:"checksum"`
+}
+
+// largeObjects returns the number of large objects and an order-independent
+// checksum of their contents (lo_get needs read access: the owner, or
+// lo_compat_privileges).
+func largeObjects(ctx context.Context, c *pgx.Conn) (loSummary, error) {
+	var s loSummary
+	var sum *string
+	err := c.QueryRow(ctx, `SELECT count(*), COALESCE(sum(('x'||substr(md5(m.oid::text||':'||md5(lo_get(m.oid))),1,15))::bit(60)::bigint),0)::text FROM pg_largeobject_metadata m`).Scan(&s.Count, &sum)
+	if sum != nil {
+		s.Sum = *sum
+	}
+	return s, err
 }

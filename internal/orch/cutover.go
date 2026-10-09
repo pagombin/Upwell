@@ -74,6 +74,14 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 			}
 			out = append(out, lc)
 		}
+		// DDL is not streamed: a schema changed on the source ends NO-GO at
+		// verification, so refuse the cutover now and say why.
+		sc := Condition{Key: "schema", Label: d.SourceName + " schema unchanged", Database: d.SourceName, OK: true, Detail: "Same tables, columns and enum values on both sides"}
+		if drift := o.metrics.Drift(d.ID); len(drift) > 0 {
+			sc.OK = false
+			sc.Detail = "Changed on the source: " + strings.Join(limitStrings(drift, 3), "; ")
+		}
+		out = append(out, sc)
 	}
 	alerts, _ := o.ListAlerts(ctx, "firing", 100)
 	crit := 0
@@ -102,7 +110,13 @@ type CutoverParams struct {
 var cutoverCancels sync.Map // op id -> context.CancelFunc
 
 // StartCutover runs the coordinated cutover as an operation.
+// cutoverStartMu serialises cutover starts and re-verifications, so two
+// requests cannot both pass the "already running" check.
+var cutoverStartMu sync.Mutex
+
 func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id, key string, p CutoverParams) (*Operation, error) {
+	cutoverStartMu.Lock()
+	defer cutoverStartMu.Unlock()
 	m, err := o.GetMigration(ctx, id)
 	if err != nil {
 		return nil, err
@@ -181,6 +195,12 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	go func() {
 		defer cancel()
 		defer cutoverCancels.Delete(op.ID)
+		defer func() {
+			if r := recover(); r != nil {
+				o.logf("error", "orchestrator", m.ID, "", op.ID, "cutover worker crashed: %v", r)
+				op.Finish(fmt.Errorf("the cutover stopped on an internal error: %v", r), nil)
+			}
+		}()
 		o.cutoverWorker(cctx, m, inc, op, a, role, p)
 	}()
 	return op, nil
@@ -219,7 +239,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		return
 	}
 	v := o.Settings(bg, m)
-	cur, _ := o.GetMigration(bg, m.ID)
+	cur, err := o.GetMigration(bg, m.ID)
+	if err != nil || cur.Flags.Cutover == nil || cur.Flags.Cutover.OpID != op.ID || ctx.Err() != nil {
+		fail("readiness", errors.New("the cutover was cancelled"))
+		return
+	}
 	phase := cur.Flags.Cutover.Phase
 	past := func(ph string) bool {
 		order := []string{"readiness", "writers", "heartbeat", "await", "endpos", "drain", "origin", "sequences", "verify", "done"}
@@ -403,7 +427,36 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	}
 
 	// 4. End positions, then an immediate nudge (PC3). No abort after this.
-	o.setPhase(bg, m.ID, "endpos")
+	// Every database must be streaming: an end position on a unit that is
+	// not running would never be reached (or would look reached).
+	if !past("endpos") {
+		var notStreaming []string
+		for _, d := range dbs {
+			cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+			if cur.EndPos == "" && cur.State != DInSync && cur.State != DCatchUp {
+				notStreaming = append(notStreaming, d.SourceName+" ("+Label(cur.State)+")")
+			}
+		}
+		if len(notStreaming) > 0 {
+			fail("endpos", fmt.Errorf("not streaming, so end positions were not set and streaming continues: %s. Resume or fix these databases and run the cutover again", strings.Join(notStreaming, ", ")))
+			return
+		}
+	}
+	// Check-and-set against an abort racing this step: only the cutover
+	// that is still current, and not cancelled, may move past the point of
+	// no return.
+	moved := past("endpos") // a continued cutover is already past this point
+	o.updateFlags(bg, m.ID, func(f *Flags) {
+		if !moved && ctx.Err() == nil && f.Cutover != nil && f.Cutover.OpID == op.ID && !f.Aborted {
+			f.Cutover.Phase = "endpos"
+			moved = true
+		}
+	})
+	if !moved {
+		fail("endpos", errors.New("the cutover was cancelled before end positions were set; streaming continues"))
+		return
+	}
+	o.refreshState(bg, m.ID)
 	op.StepStart("endpos", "")
 	for _, d := range dbs {
 		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
@@ -421,7 +474,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 				o.finishCutover(bg, m, op, a, err)
 				return
 			}
-			o.setDB(bg, d.ID, map[string]any{"endpos": lsn, "state": DDraining})
+			o.setDB(bg, d.ID, map[string]any{"endpos": lsn, "state": DDraining, "drained": 0})
 			op.LogDB("info", d.SourceName, "end position set to %s", lsn)
 		} else if cur.State == DInSync || cur.State == DCatchUp {
 			o.setDB(bg, d.ID, map[string]any{"state": DDraining})
@@ -456,7 +509,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		undrained = nil
 		for _, d := range included(cur) {
 			switch {
-			case d.State == DDrained || d.State == DVerified:
+			case d.Drained:
 				drained++
 			case d.State == DFailed || d.State == DRestartRequired || (d.State == DStopped && d.NextRetryAt == nil):
 				broken = append(broken, d.SourceName+" ("+Label(d.State)+": "+d.LastError+")")
@@ -490,6 +543,23 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	o.verifyPhase(bg, m, op, a)
 }
 
+// stopUndrained stops the engine of every database that did not reach its end
+// position, so nothing keeps applying to the target after the verdict, and
+// returns their names.
+func (o *Orchestrator) stopUndrained(ctx context.Context, m Migration, dbs []Database) map[string]bool {
+	out := map[string]bool{}
+	for _, d := range dbs {
+		if d.Drained {
+			continue
+		}
+		out[d.SourceName] = true
+		if st, _ := o.run.Status(ctx, d.Instance); st.Active {
+			o.mustStop(ctx, m, d, "did not reach its end position during the cutover")
+		}
+	}
+	return out
+}
+
 // verifyPhase runs the origin check, sequence sync, verification and verdict.
 func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operation, a audit.Actor) {
 	src, dst, err := o.Conns(ctx, m)
@@ -501,6 +571,8 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	inc := included(dbs)
 	hbOn := v.Bool("heartbeat")
+	// Only a database whose engine reached the end position can be GO.
+	undrained := o.stopUndrained(ctx, m, inc)
 
 	// 6. Origin progress (D3).
 	o.setPhase(ctx, m.ID, "origin")
@@ -567,9 +639,13 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			res.GO = false
 			res.Results = append(res.Results, check.Result{CheckID: "verify_error", Level: check.Blocker, Hard: true, Title: "Verification completed", Message: err.Error(), Database: d.SourceName})
 		}
-		if msg, bad := originFail[d.SourceName]; bad {
+		if _, bad := originFail[d.SourceName]; bad {
 			res.GO = false
-			_ = msg
+		}
+		if undrained[d.SourceName] {
+			res.GO = false
+			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName,
+				Message: "The engine did not reach this database's end position during the cutover, so changes before it may be missing on the target."})
 		}
 		for _, r := range res.Results {
 			o.st.DB.ExecContext(ctx, `INSERT INTO verifications(id,migration_id,database,run_id,check_id,result,title,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -608,6 +684,9 @@ func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Opera
 	op.StepStart("verdict", "")
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	goAll := ferr == nil
+	if cur, err := o.GetMigration(ctx, m.ID); err != nil || cur.Flags.Aborted {
+		goAll = false
+	}
 	var failed []string
 	for _, d := range included(dbs) {
 		if d.Verdict != "GO" {
@@ -699,9 +778,14 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 
 // Reverify re-runs the origin check and verification after a drain.
 func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key string) (*Operation, error) {
+	cutoverStartMu.Lock()
+	defer cutoverStartMu.Unlock()
 	m, err := o.GetMigration(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if m.Flags.Verifying || (m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0) {
+		return nil, uerr("busy", "A cutover or verification is already running.", "Wait for its verdict.")
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	for _, d := range included(dbs) {

@@ -80,6 +80,25 @@ fi
 
 engines_active() { systemctl list-units --no-legend --state=active 'upwell-eng@*' 2>/dev/null | awk '{print $1}' | grep -c . || true; }
 sha() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+# backup_store DEST: a consistent copy of the store. sqlite3's online backup
+# (run as upwell, so no root-owned -wal/-shm files appear) works while the
+# service runs; without sqlite3 the service is stopped and the database is
+# copied with its WAL (the service is started again further down).
+backup_store() {
+  local src=$DATA/store.db dest=$1 x
+  rm -f "$dest" "$dest-wal" "$dest-shm"
+  if command -v sqlite3 >/dev/null 2>&1; then
+    runuser -u upwell -- sqlite3 "$src" ".timeout 10000" ".backup '$dest'" >>"$LOGFILE" 2>&1 || return 1
+  else
+    systemctl stop upwell.service >>"$LOGFILE" 2>&1 || return 1
+    cp -p "$src" "$dest" || return 1
+    for x in wal shm; do
+      if [[ -f $src-$x ]]; then cp -p "$src-$x" "$dest-$x" || return 1; fi
+    done
+  fi
+  [[ -s $dest ]] || return 1
+  chmod 0600 "$dest"
+}
 
 # ---------- uninstall and rollback
 
@@ -114,7 +133,8 @@ fi
 
 # ---------- packages
 
-PKGS=(curl ca-certificates gnupg ufw chrony jq openssl)
+# sqlite3 takes consistent backups of the store before an upgrade.
+PKGS=(curl ca-certificates gnupg ufw chrony jq openssl sqlite3)
 # polkit lets the upwell user start and stop its engine units (the rule below).
 if apt-cache show polkitd >/dev/null 2>&1; then PKGS+=(polkitd); else PKGS+=(policykit-1); fi
 missing=()
@@ -129,23 +149,25 @@ fi
 
 # ---------- PostgreSQL clients (newest major from PGDG)
 
+PG_CLIENT_MIN=17
 client_major() { for v in 18 17 16 15 14; do dpkg-query -W -f='${Status}' "postgresql-client-$v" 2>/dev/null | grep -q "install ok installed" && { echo "$v"; return; }; done; }
 have=$(client_major || true)
-if [[ -n $have ]]; then say "postgresql client" "unchanged ($have)"
-elif check; then would "postgresql client" "add the PGDG repository and install the newest client"
+if [[ -n $have && $have -ge $PG_CLIENT_MIN ]]; then say "postgresql client" "unchanged ($have)"
+elif check; then would "postgresql client" "add the PGDG repository and install the newest client (found ${have:-none}, need $PG_CLIENT_MIN or newer)"
 else
-  if ! apt-cache policy postgresql-client-17 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-common >>"$LOGFILE" 2>&1
+  if ! apt-cache policy "postgresql-client-$PG_CLIENT_MIN" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-common >>"$LOGFILE" 2>&1 || fail "installing postgresql-common failed"
     yes | /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >>"$LOGFILE" 2>&1 || fail "could not add the PGDG apt repository"
   fi
-  for v in 18 17 16; do
+  old=$have; have=""
+  for v in 18 17; do
     if apt-cache policy "postgresql-client-$v" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "postgresql-client-$v" >>"$LOGFILE" 2>&1 || fail "installing postgresql-client-$v failed"
       have=$v; break
     fi
   done
-  [[ -n $have ]] || fail "no PostgreSQL client package is available"
-  say "postgresql client" "installed $have"; CHANGED=1
+  [[ -n $have ]] || fail "no PostgreSQL client $PG_CLIENT_MIN or newer is available (found ${old:-none})"
+  say "postgresql client" "installed $have${old:+ (was $old)}"; CHANGED=1
 fi
 
 # ---------- pgcopydb (pinned)
@@ -165,8 +187,18 @@ else
   cand=$(apt-cache policy pgcopydb 2>/dev/null | awk '/Candidate:/ {print $2}' | grep -oE '^[0-9]+\.[0-9]+' || true)
   if [[ -n $cand ]] && vge "$cand" "$PGCOPYDB_PIN"; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pgcopydb >>"$LOGFILE" 2>&1 || fail "installing the pgcopydb package failed"
-    ln -sf "$(command -v pgcopydb)" /usr/local/bin/pgcopydb 2>/dev/null || true
-    say "pgcopydb" "installed package $cand"
+    # Link the package's own binary explicitly: an older pgcopydb left in
+    # /usr/local/bin (a source build) would otherwise shadow it.
+    pkgbin=$(dpkg -L pgcopydb 2>/dev/null | grep -E '/s?bin/pgcopydb$' | sort | head -1 || true)
+    [[ -n $pkgbin ]] || pkgbin=/usr/bin/pgcopydb
+    [[ -x $pkgbin ]] || fail "the pgcopydb package is installed but its binary is not at $pkgbin"
+    if [[ $pkgbin != /usr/local/bin/pgcopydb ]]; then
+      rm -f /usr/local/bin/pgcopydb || fail "could not remove the old /usr/local/bin/pgcopydb"
+      ln -s "$pkgbin" /usr/local/bin/pgcopydb || fail "could not link /usr/local/bin/pgcopydb to $pkgbin"
+    fi
+    got=$(pgcopydb_version || true)
+    { [[ -n $got ]] && vge "$got" "$PGCOPYDB_PIN"; } || fail "/usr/local/bin/pgcopydb reports version ${got:-unknown}, not $PGCOPYDB_PIN or newer"
+    say "pgcopydb" "installed package $cand ($pkgbin)"
   else
     say "pgcopydb" "building $PGCOPYDB_TAG from source (the package is ${cand:-unavailable})"
     dev=$(client_major); dev=${dev:-16}
@@ -178,6 +210,16 @@ else
     say "pgcopydb" "installed $(pgcopydb_version) from source"
   fi
   CHANGED=1
+fi
+# The config names /usr/local/bin/pgcopydb; a pgcopydb that was already
+# installed elsewhere (for example the PGDG package in /usr/bin) is linked there.
+if [[ ! -x /usr/local/bin/pgcopydb ]]; then
+  found=$(command -v pgcopydb || true)
+  if [[ -z $found ]]; then
+    if check; then would "pgcopydb link" "link /usr/local/bin/pgcopydb after installing it"; else fail "pgcopydb is not on the PATH after installing it"; fi
+  elif check; then would "pgcopydb link" "link /usr/local/bin/pgcopydb to $found"
+  else ln -sf "$found" /usr/local/bin/pgcopydb; say "pgcopydb link" "linked /usr/local/bin/pgcopydb to $found"; CHANGED=1
+  fi
 fi
 
 # ---------- user and directories
@@ -244,10 +286,20 @@ elif [[ -n $BINARY ]]; then
 else
   # Build from this checkout. The UI is committed prebuilt (internal/webui/dist).
   [[ -f $REPO/go.mod && -d $REPO/cmd/upwell ]] || fail "no --binary given and $REPO is not an Upwell checkout"
-  GO=$(command -v go || true)
-  [[ -z $GO && -x /usr/local/go/bin/go ]] && GO=/usr/local/go/bin/go
+  # The build runs with GOTOOLCHAIN=local, so the Go found must be at least
+  # the version go.mod asks for (an apt golang can be older).
+  go_need=$(awk '$1 == "go" {print $2; exit}' "$REPO/go.mod")
+  go_need=${go_need:-1.0}
+  vge "$GO_VERSION" "$go_need" || fail "go.mod needs Go $go_need but this installer downloads Go $GO_VERSION; update GO_VERSION"
+  go_ok() { local v; v=$("$1" env GOVERSION 2>/dev/null) || return 1; v=${v#go}; v=${v%%[!0-9.]*}; [[ -n $v ]] && vge "$v" "$go_need"; }
+  GO=""
+  for g in "$(command -v go || true)" /usr/local/go/bin/go; do
+    if [[ -n $g && -x $g ]] && go_ok "$g"; then GO=$g; break; fi
+  done
   if [[ -z $GO ]]; then
-    if check; then would "go toolchain" "install Go $GO_VERSION to build Upwell"; GO=""
+    old_go=$(command -v go || true)
+    if [[ -n $old_go ]]; then say "go toolchain" "$old_go is $("$old_go" env GOVERSION 2>/dev/null || echo unknown), older than go.mod's $go_need"; fi
+    if check; then would "go toolchain" "install Go $GO_VERSION to /usr/local/go to build Upwell"; GO=""
     else
       arch=$(dpkg --print-architecture)
       file="go$GO_VERSION.linux-$arch.tar.gz"
@@ -276,7 +328,12 @@ if [[ -n $NEW ]]; then
     install -m 0755 "$NEW" "$BIN.new"
     [[ -x $BIN ]] && cp -p "$BIN" "$BIN.prev"
     # Store schema changes are forward-only: keep a copy of the store first.
-    [[ -f $DATA/store.db ]] && cp -p "$DATA/store.db" "$DATA/store.db.bak-$($BIN version 2>/dev/null | awk '{print $2}' || echo prev)" 2>/dev/null || true
+    if [[ -f $DATA/store.db ]]; then
+      bak="$DATA/store.db.bak-$($BIN version 2>/dev/null | awk '{print $2}' || true)"
+      [[ $bak != *- ]] || bak="${bak}prev"
+      backup_store "$bak" || { rm -f "$BIN.new"; fail "could not back up $DATA/store.db; nothing was changed"; }
+      say "store backup" "$bak"
+    fi
     mv -f "$BIN.new" "$BIN"
     say "upwell binary" "installed $($BIN version | awk '{print $2}')"; CHANGED=1; RESTART=1
   fi
@@ -322,18 +379,41 @@ fi
 
 # ---------- firewall: SSH and the HTTPS port only
 
+# SSH may listen on another port than 22: ask sshd itself, then the ssh.socket
+# unit (socket activation on Ubuntu 24.04), then the listening sockets. ufw is
+# never enabled while the SSH port is unknown, so this cannot lock anyone out.
+ports_of() { grep -oE '[0-9]+$' | sort -un | xargs; }
+ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | ports_of || true)
+if [[ -z $ssh_ports ]]; then
+  ssh_ports=$(systemctl show -p Listen ssh.socket 2>/dev/null | grep -oE ':[0-9]+ \(Stream\)' | grep -oE '[0-9]+' | ports_of || true)
+fi
+if [[ -z $ssh_ports ]]; then
+  ssh_ports=$(ss -Hltnp 2>/dev/null | awk '/"sshd"/ {print $4}' | ports_of || true)
+fi
+ssh_unknown=0
+if [[ -z $ssh_ports ]]; then
+  if ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE ':22$'; then ssh_ports=22
+  elif command -v sshd >/dev/null 2>&1; then ssh_unknown=1
+  fi
+fi
 need=()
 st=$(ufw status 2>/dev/null || true)
-grep -qE '^(22|OpenSSH)(/tcp)? +ALLOW' <<<"$st" || need+=("OpenSSH")
+for p in $ssh_ports; do
+  if [[ $p == 22 ]]; then grep -qE '^(22|OpenSSH)(/tcp)? +ALLOW' <<<"$st" || need+=("22/tcp")
+  else grep -qE "^$p(/tcp)? +ALLOW" <<<"$st" || need+=("$p/tcp")
+  fi
+done
 grep -qE "^$PORT/tcp +ALLOW" <<<"$st" || need+=("$PORT/tcp")
 if grep -q 'http_redirect: true' "$CFG" 2>/dev/null; then grep -qE '^80/tcp +ALLOW' <<<"$st" || need+=("80/tcp"); fi
 active=1; grep -q 'Status: active' <<<"$st" || active=0
-if [[ ${#need[@]} -eq 0 && $active -eq 1 ]]; then say "firewall" "unchanged"
+if [[ $active -eq 0 && $ssh_unknown -eq 1 ]]; then
+  say "firewall" "not enabled: could not find sshd's port (sshd -T failed) and SSH is not on 22; allow your SSH port with ufw, then run install.sh again"
+elif [[ ${#need[@]} -eq 0 && $active -eq 1 ]]; then say "firewall" "unchanged (ssh ${ssh_ports:-unknown})"
 elif check; then would "firewall" "allow ${need[*]:-nothing new}$([[ $active -eq 0 ]] && echo ' and enable ufw')"
 else
-  for r in "${need[@]}"; do ufw allow "$r" >>"$LOGFILE" 2>&1; done
-  [[ $active -eq 1 ]] || ufw --force enable >>"$LOGFILE" 2>&1
-  say "firewall" "allowed ${need[*]:-existing rules}; ufw active"; CHANGED=1
+  for r in "${need[@]}"; do ufw allow "$r" >>"$LOGFILE" 2>&1 || fail "ufw allow $r failed"; done
+  if [[ $active -eq 0 ]]; then ufw --force enable >>"$LOGFILE" 2>&1 || fail "ufw enable failed"; fi
+  say "firewall" "allowed ${need[*]:-existing rules} (ssh ${ssh_ports:-none}); ufw active"; CHANGED=1
 fi
 
 # ---------- service
@@ -375,8 +455,14 @@ echo
 [[ $CHANGED -eq 0 ]] && echo "Everything is up to date; nothing changed."
 echo "Upwell:       https://$ip$([[ $PORT != 443 ]] && echo ":$PORT")/"
 echo "Certificate:  SHA-256 $fp"
-if [[ -f $DATA/setup-token ]]; then
+# The token is wherever the config says (setup_token_file), else under data_dir.
+token_file=$(awk '/^setup_token_file:/ {print $2; exit}' "$CFG" 2>/dev/null | tr -d "\"'" || true)
+if [[ -z $token_file ]]; then
+  data_dir=$(awk '/^data_dir:/ {print $2; exit}' "$CFG" 2>/dev/null | tr -d "\"'" || true)
+  token_file=${data_dir:-$DATA}/setup-token
+fi
+if [[ -f $token_file ]]; then
   echo "First sign-in: open the URL, check the fingerprint above, and use this setup token:"
-  echo "               $(cat "$DATA/setup-token")"
+  echo "               $(cat "$token_file")"
 fi
 echo "Logs:         journalctl -u upwell -f   and   $LOGD/"

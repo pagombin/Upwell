@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -41,9 +42,29 @@ import (
 const (
 	sockDir  = "/var/tmp/upwell-spike"
 	srcPort  = 55432
-	dstPort  = 55433
 	password = "spike-password-not-secret"
 )
+
+// The target can be another cluster, for example a newer major version:
+// UPWELL_IT_DST_PORT=55434 UPWELL_IT_DST_SOCK=/var/tmp/upwell-pg18.
+var (
+	dstPort = envInt("UPWELL_IT_DST_PORT", 55433)
+	dstSock = envStr("UPWELL_IT_DST_SOCK", sockDir)
+)
+
+func envInt(k string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envStr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
 
 var srcConn = pg.Conn{Host: "127.0.0.1", Port: srcPort, User: "doadmin", Password: password, DBName: "defaultdb", SSLMode: "disable"}
 var dstConn = pg.Conn{Host: "127.0.0.1", Port: dstPort, User: "doadmin", Password: password, DBName: "defaultdb", SSLMode: "disable"}
@@ -218,7 +239,11 @@ func (e *Env) raw(method, path string) (int, string) {
 
 func superSQL(t *testing.T, port int, db, sql string) string {
 	t.Helper()
-	out, err := exec.Command("runuser", "-u", "postgres", "--", "psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-h", sockDir, "-p", fmt.Sprint(port), "-d", db, "-c", sql).CombinedOutput()
+	sock := sockDir
+	if port == dstPort {
+		sock = dstSock
+	}
+	out, err := exec.Command("runuser", "-u", "postgres", "--", "psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-h", sock, "-p", fmt.Sprint(port), "-d", db, "-c", sql).CombinedOutput()
 	if err != nil {
 		t.Fatalf("psql %s: %v: %s", sql, err, out)
 	}
@@ -368,7 +393,12 @@ func (e *Env) defineMigration(name string, dbs []string, overrides map[string]an
 	})
 	e.do("PUT", "/api/v1/migrations/"+m.ID+"/permission", map[string]any{"customer": "Test Customer", "account_id": "team-1", "ticket": "TEST-1", "granted_by": "tester@example.com", "granted_at": "2026-10-08", "scope": "test databases"}, nil, 200)
 	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/source", map[string]any{"host": "127.0.0.1", "port": srcPort, "user": "doadmin", "password": password, "sslmode": "disable"}, nil, 200)
-	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/target", map[string]any{"host": "127.0.0.1", "port": dstPort, "user": "doadmin", "password": password, "sslmode": "disable", "storage_gb": 100}, nil, 200)
+	tport := dstPort
+	if p, ok := overrides["_target_port"].(int); ok {
+		tport = p
+		delete(overrides, "_target_port")
+	}
+	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/target", map[string]any{"host": "127.0.0.1", "port": tport, "user": "doadmin", "password": password, "sslmode": "disable", "storage_gb": 100}, nil, 200)
 	e.do("POST", "/api/v1/migrations/"+m.ID+"/discover", nil, nil, 200)
 	var sel []map[string]any
 	for _, d := range dbs {

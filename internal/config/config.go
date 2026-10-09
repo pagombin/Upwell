@@ -47,7 +47,7 @@ func Default() Config {
 		TLSCert:       "/etc/upwell/tls/cert.pem",
 		TLSKey:        "/etc/upwell/tls/key.pem",
 		MasterKey:     "/etc/upwell/master.key",
-		SetupToken:    "/etc/upwell/setup-token",
+		SetupToken:    "/var/lib/upwell/setup-token", // under data_dir: the service deletes it after setup
 		Engine:        Engine{Runner: "auto", Pgcopydb: "pgcopydb"},
 	}
 }
@@ -65,8 +65,13 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
+	// The setup token follows data_dir unless the file names it explicitly.
+	c.SetupToken = ""
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
+	}
+	if c.SetupToken == "" && c.DataDir != "" {
+		c.SetupToken = filepath.Join(c.DataDir, "setup-token")
 	}
 	return c, c.Validate()
 }
