@@ -217,7 +217,7 @@ function StepDatabases({ v, onDone }: { v: MigrationView; onDone: () => void }) 
   );
 }
 
-const OPTION_KEYS = ["decoding_plugin", "table_jobs", "index_jobs", "max_concurrent_base_copies", "split_tables_larger_than", "heartbeat", "copy_roles", "create_target_databases", "target_synchronous_commit_off", "target_maintenance_work_mem", "exact_count_max_mb", "verify_checksum_budget_seconds", "cutover_lag_threshold_mb", "analyze_after_go"];
+const OPTION_KEYS = ["decoding_plugin", "table_jobs", "index_jobs", "max_concurrent_base_copies", "split_tables_larger_than", "heartbeat", "copy_roles", "create_target_databases", "exact_count_max_mb", "verify_checksum_budget_seconds", "cutover_lag_threshold_mb", "analyze_after_go"];
 
 function StepOptions({ v, onDone }: { v: MigrationView; onDone: () => void }) {
   const cat = useApi<SettingItem[]>("/api/v1/settings");

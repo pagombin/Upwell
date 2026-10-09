@@ -368,9 +368,23 @@ func (h *Health) Alive(deadline time.Duration) (bool, []string) {
 	return len(late) == 0, late
 }
 
+// notifySocket is systemd's NOTIFY_SOCKET, taken out of the environment at
+// start so child processes (pgcopydb, psql, systemctl) never write to it:
+// with NotifyAccess=main systemd logs every such message as a warning.
+var notifySocket = func() string {
+	s := os.Getenv("NOTIFY_SOCKET")
+	for _, k := range []string{"NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID"} {
+		_ = os.Unsetenv(k)
+	}
+	return s
+}()
+
+// UnderSystemd reports whether systemd supervises this process.
+func UnderSystemd() bool { return notifySocket != "" }
+
 // SDNotify sends a message to systemd when NOTIFY_SOCKET is set.
 func SDNotify(msg string) {
-	sock := os.Getenv("NOTIFY_SOCKET")
+	sock := notifySocket
 	if sock == "" {
 		return
 	}

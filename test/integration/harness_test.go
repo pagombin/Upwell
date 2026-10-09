@@ -368,7 +368,12 @@ func (e *Env) defineMigration(name string, dbs []string, overrides map[string]an
 	})
 	e.do("PUT", "/api/v1/migrations/"+m.ID+"/permission", map[string]any{"customer": "Test Customer", "account_id": "team-1", "ticket": "TEST-1", "granted_by": "tester@example.com", "granted_at": "2026-10-08", "scope": "test databases"}, nil, 200)
 	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/source", map[string]any{"host": "127.0.0.1", "port": srcPort, "user": "doadmin", "password": password, "sslmode": "disable"}, nil, 200)
-	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/target", map[string]any{"host": "127.0.0.1", "port": dstPort, "user": "doadmin", "password": password, "sslmode": "disable", "storage_gb": 100}, nil, 200)
+	tport := dstPort
+	if p, ok := overrides["_target_port"].(int); ok {
+		tport = p
+		delete(overrides, "_target_port")
+	}
+	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/target", map[string]any{"host": "127.0.0.1", "port": tport, "user": "doadmin", "password": password, "sslmode": "disable", "storage_gb": 100}, nil, 200)
 	e.do("POST", "/api/v1/migrations/"+m.ID+"/discover", nil, nil, 200)
 	var sel []map[string]any
 	for _, d := range dbs {

@@ -52,8 +52,6 @@ var Catalog = []Def{
 	def("index_jobs", "int", 0, 0, 32, "migration", "Migration defaults", "workers", "Parallel CREATE INDEX workers per database. 0 means automatic: half the CPU count (2 to 8) divided by databases, at least 1."),
 	{Key: "split_tables_larger_than", Type: "string", Default: "auto", Scope: "migration", Group: "Migration defaults", Description: "Same-table parallel copy: auto (largest table divided by table jobs when that is 10 GB or more), off, or a size such as 50GB."},
 	enum("decoding_plugin", "auto", []string{"auto", "pgoutput", "test_decoding", "wal2json"}, "migration", "Migration defaults", "Logical decoding plugin. Auto uses pgoutput and switches a database to test_decoding when pgoutput cannot work there."),
-	boolean("target_synchronous_commit_off", true, "migration", "Migration defaults", "Faster loading: engine sessions on the target run with synchronous_commit off."),
-	{Key: "target_maintenance_work_mem", Type: "string", Default: "", Scope: "migration", Group: "Migration defaults", Description: "Index build memory for engine sessions, such as 1GB. Empty leaves the server default."},
 	boolean("create_target_databases", true, "migration", "Migration defaults", "Create missing target databases with the source's encoding and locale."),
 	boolean("copy_roles", true, "migration", "Migration defaults", "Copy cluster roles once before the first database starts."),
 	boolean("heartbeat", true, "migration", "Data safety", "Heartbeat table for end-to-end latency and the final cutover heartbeat. Turning it off removes a GO requirement and is recorded as an accepted risk."),
@@ -278,6 +276,12 @@ func (s *Service) Set(ctx context.Context, key string, value any, by string) (an
 	return prev, cv, err
 }
 
+// Retired settings may still be stored in older migrations' overrides; they
+// are ignored. pgcopydb sets synchronous_commit and maintenance_work_mem in
+// its own sessions, and sending them as startup options broke connections
+// through PgBouncer.
+var Retired = map[string]bool{"target_synchronous_commit_off": true, "target_maintenance_work_mem": true}
+
 // ForMigration merges global values with per-migration overrides.
 func ForMigration(global Values, overrides map[string]any) (Values, error) {
 	out := Values{}
@@ -290,6 +294,9 @@ func ForMigration(global Values, overrides map[string]any) (Values, error) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
+		if Retired[k] {
+			continue
+		}
 		d, ok := Lookup(k)
 		if !ok || d.Scope != "migration" {
 			return nil, fmt.Errorf("%s cannot be set per migration", k)

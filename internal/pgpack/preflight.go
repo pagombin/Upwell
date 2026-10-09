@@ -66,6 +66,7 @@ var Catalog = []check.Definition{
 	cd("network", check.ScopeClusters, "Network path", "warning"),
 	cd("connect", check.ScopeClusters, "Clusters reachable", "hard"),
 	cd("trusted_sources", check.ScopeClusters, "Droplet allowed on both clusters", "hard"),
+	cd("session_pinning", check.ScopeClusters, "Sessions keep their settings (no transaction pooling)", "hard"),
 	cd("same_cluster", check.ScopeClusters, "Source and target are different", "hard"),
 	cd("version_order", check.ScopeClusters, "Target version at least source version", "hard"),
 	cd("primary", check.ScopeClusters, "Both endpoints are primaries", "hard"),
@@ -368,6 +369,8 @@ func (r *Runner) clusterChecks(ctx context.Context) {
 		conn.QueryRow(ctx, `SHOW server_version`).Scan(&vs)
 		ok(r, "connect", side.name, "", fmt.Sprintf("Connected to PostgreSQL %s as %s.", vs, side.c.User), map[string]any{"server_version": vs}, t)
 		ok(r, "trusted_sources", side.name, "", "Confirmed by connecting (the DigitalOcean API check is coming soon).", map[string]any{"method": "connect"}, t)
+		t = time.Now()
+		r.sessionCheck(ctx, side.name, conn, side.c, t)
 		if side.name == "source" {
 			r.src, r.srcVer = conn, ver
 		} else {
@@ -491,18 +494,64 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	}
 	t = time.Now()
 	// Read the timeouts an engine session inherits, on a connection that does
-	// not set its own statement timeout.
-	var stmt, idle, idleSess string
+	// not set its own statement timeout, and compare them with the estimated
+	// base copy: pgcopydb holds its snapshot in a transaction that stays idle
+	// for the whole copy, and a large table's COPY is one statement.
+	ms := map[string]int64{}
 	if tc, err := pg.Connect(ctx, e.Source, 0); err == nil {
-		tc.QueryRow(ctx, `SELECT current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout'), COALESCE(current_setting('idle_session_timeout', true),'0')`).Scan(&stmt, &idle, &idleSess)
+		if rows, err := tc.Query(ctx, `SELECT name, setting::bigint FROM pg_settings WHERE name IN ('statement_timeout','idle_in_transaction_session_timeout','idle_session_timeout')`); err == nil {
+			for rows.Next() {
+				var n string
+				var v int64
+				if rows.Scan(&n, &v) == nil {
+					ms[n] = v
+				}
+			}
+			rows.Close()
+		}
 		tc.Close(ctx)
 	}
-	ev = map[string]any{"statement_timeout": stmt, "idle_in_transaction_session_timeout": idle, "idle_session_timeout": idleSess}
-	if stmt != "0" || idle != "0" || idleSess != "0" {
-		r.emit("session_timeouts", "", "", check.Blocker, false, fmt.Sprintf("Sessions for %s inherit timeouts (statement %s, idle in transaction %s, idle %s) that can cut long COPY or decoding sessions.", e.Source.User, stmt, idle, idleSess),
-			"Clear them for the admin role (ALTER ROLE ... RESET statement_timeout) or accept the risk.", ev, t)
-	} else {
-		ok(r, "session_timeouts", "", "", "No statement or idle timeouts apply to engine sessions.", ev, t)
+	var srcBytes int64
+	for _, d := range e.Databases {
+		var b int64
+		if r.src != nil && r.src.QueryRow(ctx, `SELECT pg_database_size($1)`, d.Source).Scan(&b) == nil {
+			srcBytes += b
+		}
+	}
+	mibs := e.Settings.Float("assumed_throughput_mibs")
+	if mibs <= 0 {
+		mibs = 102
+	}
+	copySecs := float64(srcBytes) / (mibs * 1024 * 1024)
+	need := 3 * copySecs
+	if need < 6*3600 {
+		need = 6 * 3600
+	}
+	// pgcopydb sets statement_timeout and idle_in_transaction_session_timeout
+	// to 0 in every session it opens (copydb.h COMMON_GUC_SETTINGS and
+	// srcSettings), and so do pg_dump and pg_restore, so those two cannot cut
+	// the copy. idle_session_timeout is not overridden.
+	var cleared []string
+	for _, k := range []struct{ name, label string }{{"statement_timeout", "statement"}, {"idle_in_transaction_session_timeout", "idle in transaction"}} {
+		if v := ms[k.name]; v > 0 {
+			cleared = append(cleared, fmt.Sprintf("%s %s", k.label, humanDuration(float64(v)/1000)))
+		}
+	}
+	note := ""
+	if len(cleared) > 0 {
+		note = fmt.Sprintf(" The role's other timeouts (%s) do not matter: pgcopydb and pg_dump clear them in their own sessions.", strings.Join(cleared, ", "))
+	}
+	ev = map[string]any{"timeouts_ms": ms, "_estimated_copy_seconds": copySecs, "_required_seconds": need, "cleared_by_engine": []string{"statement_timeout", "idle_in_transaction_session_timeout"}}
+	idleSess := float64(ms["idle_session_timeout"]) / 1000
+	switch {
+	case idleSess > 0 && idleSess < need:
+		r.emit("session_timeouts", "", "", check.Blocker, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, shorter than %s (three times the estimated base copy, at least 6 hours). pgcopydb does not override it, so an engine connection waiting for others could be closed.%s", e.Source.User, humanDuration(idleSess), humanDuration(need), note),
+			"Clear it for the admin role (ALTER ROLE "+pg.QuoteIdent(e.Source.User)+" RESET idle_session_timeout) or accept the risk.", ev, t)
+	case idleSess > 0:
+		r.emit("session_timeouts", "", "", check.Warning, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, long enough for the estimated base copy of %s.%s", e.Source.User, humanDuration(idleSess), humanDuration(copySecs), note),
+			"Nothing to do unless the copy runs far slower than estimated.", ev, t)
+	default:
+		ok(r, "session_timeouts", "", "", "No timeout can cut the engine's sessions."+note, ev, t)
 	}
 }
 
@@ -1017,4 +1066,33 @@ func humanDuration(s float64) string {
 		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 	return fmt.Sprintf("%dd %dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
+// sessionCheck: the engine sets session_replication_role and the replication
+// origin once per session and holds its snapshot in one transaction. Behind
+// a pooler in transaction mode those would land on other server connections,
+// and changes would be applied without them (or not at all).
+func (r *Runner) sessionCheck(ctx context.Context, side string, conn *pgx.Conn, at pg.Conn, t time.Time) {
+	ss, err := pg.ProbeSession(ctx, conn, at)
+	ev := map[string]any{"client_addr": ss.ClientAddr, "proxy_likely": ss.ProxyLikely, "backend_pids": ss.PIDs}
+	switch {
+	case err != nil:
+		ev["error"] = err.Error()
+		r.emit("session_pinning", side, "", check.Blocker, true, fmt.Sprintf("Upwell could not confirm that %s sessions keep their settings: %v", side, err), "Connect directly to PostgreSQL, not through a connection pooler.", ev, t)
+	case !ss.Pinned:
+		r.emit("session_pinning", side, "", check.Blocker, true, fmt.Sprintf("Consecutive transactions on one %s connection reached different server sessions (backend PIDs %v): a connection pooler in transaction mode sits in between, and the engine's session settings would be lost.", side, ss.PIDs),
+			"Use the cluster's direct port, or a pooler in session mode.", ev, t)
+	case ss.ProxyLikely:
+		r.emit("session_pinning", side, "", check.Warning, false, fmt.Sprintf("PostgreSQL sees the %s connection coming from %s, not from this droplet: a pooler or proxy probably sits in between. Sessions kept their settings in this test, which is what the engine needs; a pooler in transaction mode under load would not.", side, orUnknown(ss.ClientAddr)),
+			"Prefer the cluster's direct port if it has one; otherwise make sure the pooler runs in session mode.", ev, t)
+	default:
+		ok(r, "session_pinning", side, "", "Sessions keep their settings (no transaction pooling).", ev, t)
+	}
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "an unknown address"
+	}
+	return s
 }

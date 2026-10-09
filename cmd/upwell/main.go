@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -138,7 +139,16 @@ func open(cfg config.Config, createKey bool, stderrLogs bool) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng := pgcopydb.New(cfg.Engine.Pgcopydb, r)
+	pgc := cfg.Engine.Pgcopydb
+	if _, err := os.Stat(pgc); err != nil {
+		// A pgcopydb installed elsewhere (for example the PGDG package in
+		// /usr/bin) is used rather than failing every check.
+		if p, lerr := exec.LookPath("pgcopydb"); lerr == nil {
+			lg.Logf("warn", "app", "", "pgcopydb is not at the configured path %s; using %s from the PATH", pgc, p)
+			pgc = p
+		}
+	}
+	eng := pgcopydb.New(pgc, r)
 	a.orch = orch.New(orch.Deps{Config: cfg, Store: st, Vault: a.vault, Engine: eng, Runner: r, Logger: lg, Bus: b, Audit: a.audit, Settings: a.set})
 	g, _ := a.set.Global(context.Background())
 	lg.SetLevel(g.Str("log_level"))

@@ -179,6 +179,16 @@ else
   fi
   CHANGED=1
 fi
+# The config names /usr/local/bin/pgcopydb; a pgcopydb that was already
+# installed elsewhere (for example the PGDG package in /usr/bin) is linked there.
+if [[ ! -x /usr/local/bin/pgcopydb ]]; then
+  found=$(command -v pgcopydb || true)
+  if [[ -z $found ]]; then
+    if check; then would "pgcopydb link" "link /usr/local/bin/pgcopydb after installing it"; else fail "pgcopydb is not on the PATH after installing it"; fi
+  elif check; then would "pgcopydb link" "link /usr/local/bin/pgcopydb to $found"
+  else ln -sf "$found" /usr/local/bin/pgcopydb; say "pgcopydb link" "linked /usr/local/bin/pgcopydb to $found"; CHANGED=1
+  fi
+fi
 
 # ---------- user and directories
 

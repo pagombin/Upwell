@@ -1149,7 +1149,7 @@ func (s *Server) system(w http.ResponseWriter, r *http.Request) error {
 		"store":    map[string]any{"path": s.Cfg.StorePath(), "bytes": storeSize, "schema_version": schema},
 		"logs":     map[string]any{"dir": s.Cfg.LogDir, "bytes": dirSize(s.Cfg.LogDir)},
 		"runs":     map[string]any{"dir": s.Cfg.RunsDir(), "bytes": dirSize(s.Cfg.RunsDir())},
-		"watchdog": map[string]any{"healthy": ok, "late": late, "beats": s.Health.Beats(), "systemd": os.Getenv("NOTIFY_SOCKET") != ""},
+		"watchdog": map[string]any{"healthy": ok, "late": late, "beats": s.Health.Beats(), "systemd": UnderSystemd()},
 		"ready":    ready, "ready_detail": readyDetail, "tls": s.TLSInfo(), "rebooted": s.Orch.Rebooted, "reconciled": s.Orch.Reconciled,
 		"updates": map[string]any{"available": false, "note": "Updates are applied by running install.sh again."},
 		"dev":     s.Cfg.Dev, "units": s.engineUnits(ctx),
@@ -1183,7 +1183,7 @@ func (s *Server) engineUnits(ctx context.Context) []map[string]any {
 // restartApp exits so systemd restarts the service. Engines run in their own
 // units and keep running; reconciliation reattaches them on start.
 func (s *Server) restartApp(w http.ResponseWriter, r *http.Request) error {
-	if os.Getenv("NOTIFY_SOCKET") == "" {
+	if !UnderSystemd() {
 		return apiErr(409, "no_systemd", "Upwell is not running under systemd here, so it would not come back after exiting.", "Restart it with your process manager, or on the droplet run: sudo systemctl restart upwell")
 	}
 	s.Audit.Append(r.Context(), actor(r), "system.restart", "upwell", nil, nil)

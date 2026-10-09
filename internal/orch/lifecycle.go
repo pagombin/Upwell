@@ -216,6 +216,15 @@ func TestConnection(ctx context.Context, c pg.Conn, kind string) []ProbeResult {
 	} else {
 		out = append(out, ProbeResult{"tls", c.SSLMode == "disable", "The connection is not encrypted."})
 	}
+	if ss, err := pg.ProbeSession(ctx, conn, c); err != nil {
+		out = append(out, ProbeResult{"session", false, "Could not confirm that sessions keep their settings: " + err.Error()})
+	} else if !ss.Pinned {
+		out = append(out, ProbeResult{"session", false, "A connection pooler in transaction mode is in between: use the direct port."})
+	} else if ss.ProxyLikely {
+		out = append(out, ProbeResult{"session", true, "A pooler or proxy is probably in between (PostgreSQL sees " + orDash(ss.ClientAddr) + "); sessions kept their settings."})
+	} else {
+		out = append(out, ProbeResult{"session", true, "Sessions keep their settings (no transaction pooling)."})
+	}
 	var repl, super, createdb bool
 	conn.QueryRow(ctx, `SELECT rolreplication, rolsuper, rolcreatedb FROM pg_roles WHERE rolname=current_user`).Scan(&repl, &super, &createdb)
 	if kind == "source" {
@@ -512,7 +521,7 @@ func (o *Orchestrator) dbSpec(ctx context.Context, m Migration, d Database) (eng
 	spec := engine.DatabaseSpec{MigrationID: m.ID, Source: d.SourceName, Target: d.TargetName, SourceConn: src, TargetConn: dst,
 		Instance: d.Instance, SlotName: d.SlotName, OriginName: d.OriginName, Plugin: d.Plugin,
 		RunDir: filepath.Join(o.cfg.RunsDir(), d.Instance), TableJobs: tj, IndexJobs: ij, SplitLarger: v.Str("split_tables_larger_than"),
-		SyncCommitOff: v.Bool("target_synchronous_commit_off"), MaintWorkMem: v.Str("target_maintenance_work_mem")}
+	}
 	if o.testHooks.ExtraEngineArgs != nil {
 		spec.ExtraArgs = o.testHooks.ExtraEngineArgs(d.SourceName)
 	}
@@ -1108,4 +1117,11 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 		op.Finish(nil, map[string]any{"databases": len(included(dbs))})
 	}()
 	return op, nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "no client address"
+	}
+	return s
 }

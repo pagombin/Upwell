@@ -6,11 +6,13 @@ package pg
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -58,8 +60,44 @@ func (c Conn) connString() string {
 	return u.String()
 }
 
-// Connect opens a connection with a statement timeout.
+// Connect opens a connection with a statement timeout. The timeout is a
+// startup parameter for a direct connection. A pooler such as PgBouncer
+// refuses unknown startup parameters; then Upwell reconnects without it and
+// sets the timeout only if the session is really its own, because in
+// transaction mode a SET would stay on a server connection that the
+// customer's application uses next.
 func Connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn, error) {
+	key := fmt.Sprintf("%s:%d", c.Host, c.Port)
+	if _, pooled := refusesStartupParams.Load(key); !pooled || stmtTimeout <= 0 {
+		conn, err := connect(ctx, c, stmtTimeout)
+		if err == nil || stmtTimeout <= 0 || !strings.Contains(err.Error(), "unsupported startup parameter") {
+			return conn, Explain(err)
+		}
+		refusesStartupParams.Store(key, true)
+	}
+	conn, err := connect(ctx, c, 0)
+	if err != nil {
+		return nil, Explain(err)
+	}
+	pinned, _, perr := sessionPinned(ctx, conn, c)
+	if perr != nil {
+		conn.Close(ctx)
+		return nil, Explain(perr)
+	}
+	if pinned {
+		if _, err := conn.Exec(ctx, "SET statement_timeout = "+strconv.Itoa(int(stmtTimeout/time.Millisecond)), pgx.QueryExecModeSimpleProtocol); err != nil {
+			conn.Close(ctx)
+			return nil, Explain(err)
+		}
+	}
+	return conn, nil
+}
+
+// refusesStartupParams remembers endpoints (host:port) that refused a
+// startup parameter, so each connection does not first get refused again.
+var refusesStartupParams sync.Map
+
+func connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn, error) {
 	cfg, err := pgx.ParseConfig(c.connString())
 	if err != nil {
 		return nil, fmt.Errorf("connection details for %s: %w", c.Host, err)
@@ -69,11 +107,101 @@ func Connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn,
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	conn, err := pgx.ConnectConfig(cctx, cfg)
-	if err != nil {
-		return nil, Explain(err)
+	return pgx.ConnectConfig(cctx, cfg)
+}
+
+// Session describes whether session state survives between transactions on
+// a connection, which the engine depends on (session_replication_role, the
+// replication origin, the exported snapshot).
+type Session struct {
+	ClientAddr  string `json:"client_addr"`
+	ProxyLikely bool   `json:"proxy_likely"`
+	Pinned      bool   `json:"pinned"`
+	PIDs        []int  `json:"backend_pids"`
+}
+
+// ProbeSession checks that consecutive transactions on c reach the same
+// server session. A client address that is not one of this host's own
+// suggests a pooler or proxy in between.
+func ProbeSession(ctx context.Context, c *pgx.Conn, at Conn) (Session, error) {
+	var s Session
+	var addr *string
+	if err := c.QueryRow(ctx, `SELECT host(inet_client_addr())`, pgx.QueryExecModeSimpleProtocol).Scan(&addr); err != nil {
+		return s, err
 	}
-	return conn, nil
+	if addr != nil {
+		s.ClientAddr = *addr
+	}
+	s.ProxyLikely = s.ClientAddr == "" || !localAddr(s.ClientAddr)
+	var err error
+	s.Pinned, s.PIDs, err = sessionPinned(ctx, c, at)
+	return s, err
+}
+
+// sessionPinned compares c's backend PID across transactions. A quiet pooler
+// in transaction mode would usually hand back the same server connection, so
+// a second client connection to the same address holds a transaction open in
+// between: in transaction mode it takes over c's server connection and c
+// moves to another. It changes no setting (the simple protocol, because
+// prepared statements do not survive transaction pooling).
+func sessionPinned(ctx context.Context, c *pgx.Conn, at Conn) (bool, []int, error) {
+	var pids []int
+	pinned := true
+	probe := func() error {
+		var pid int
+		if err := c.QueryRow(ctx, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid); err != nil {
+			return err
+		}
+		pids = append(pids, pid)
+		if pid != pids[0] {
+			pinned = false
+		}
+		return nil
+	}
+	if err := probe(); err != nil {
+		return false, pids, err
+	}
+	if other, err := connect(ctx, at, 0); err == nil {
+		if tx, err := other.Begin(ctx); err == nil {
+			var pid int
+			if tx.QueryRow(ctx, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid) == nil && pid == pids[0] {
+				pinned = false // another client got this connection's server session
+			}
+			err = probe()
+			_ = tx.Rollback(ctx)
+			if err != nil {
+				other.Close(ctx)
+				return false, pids, err
+			}
+		}
+		other.Close(ctx)
+	}
+	for i := 0; i < 3; i++ {
+		if err := probe(); err != nil {
+			return false, pids, err
+		}
+	}
+	return pinned, pids, nil
+}
+
+func localAddr(a string) bool {
+	ip := net.ParseIP(a)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return true
+	}
+	for _, ia := range addrs {
+		if n, ok := ia.(*net.IPNet); ok && n.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // PassLine returns a pgpass line for c.
@@ -155,7 +283,9 @@ func Explain(err error) error {
 		return fmt.Errorf("nothing is listening at that host and port (%v)", trim(m))
 	case strings.Contains(m, "no such host"):
 		return fmt.Errorf("the hostname does not resolve (%v)", trim(m))
-	case strings.Contains(m, "timeout") || strings.Contains(m, "deadline exceeded"):
+	case strings.Contains(m, "unsupported startup parameter"):
+		return fmt.Errorf("a connection pooler or proxy at this address refused a connection setting (%v)", trim(m))
+	case strings.Contains(m, "i/o timeout") || strings.Contains(m, "deadline exceeded") || strings.Contains(m, "timeout expired") || strings.Contains(m, "dial timeout"):
 		return fmt.Errorf("the server did not answer in time: check the host, port and trusted sources (%v)", trim(m))
 	case strings.Contains(m, "does not exist") && strings.Contains(m, "database"):
 		return fmt.Errorf("the database does not exist (%v)", trim(m))
