@@ -74,6 +74,14 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 			}
 			out = append(out, lc)
 		}
+		// DDL is not streamed: a schema changed on the source ends NO-GO at
+		// verification, so refuse the cutover now and say why.
+		sc := Condition{Key: "schema", Label: d.SourceName + " schema unchanged", Database: d.SourceName, OK: true, Detail: "Same tables, columns and enum values on both sides"}
+		if drift := o.metrics.Drift(d.ID); len(drift) > 0 {
+			sc.OK = false
+			sc.Detail = "Changed on the source: " + strings.Join(limitStrings(drift, 3), "; ")
+		}
+		out = append(out, sc)
 	}
 	alerts, _ := o.ListAlerts(ctx, "firing", 100)
 	crit := 0

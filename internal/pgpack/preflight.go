@@ -89,6 +89,8 @@ var Catalog = []check.Definition{
 	cd("read_privs", check.ScopeDatabase, "Read access to every table", "hard"),
 	cd("publication_privs", check.ScopeDatabase, "Decoding plugin", "hard"),
 	cd("replica_identity", check.ScopeDatabase, "Updates and deletes can replay", "hard"),
+	cd("identity_full_types", check.ScopeDatabase, "Full replica identity on comparable columns", "hard"),
+	cd("identity_full_duplicates", check.ScopeDatabase, "Full replica identity without a unique key", "warning"),
 	cd("large_objects", check.ScopeDatabase, "Large objects", "warning"),
 	cd("unlogged_tables", check.ScopeDatabase, "Unlogged tables", "warning"),
 	cd("materialized_views", check.ScopeDatabase, "Materialized views", "warning"),
@@ -678,8 +680,36 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		ok(r, "replica_identity", "", d.Source, "Every table can replay updates and deletes.", map[string]any{"tables": []string{}}, t)
 	}
 
+	// REPLICA IDENTITY FULL: the engine finds the old row by comparing every
+	// column. Types without an equality operator (json, xml, the geometric
+	// types) make that comparison fail, so updates and deletes cannot apply.
+	t = time.Now()
+	noEq, _ := pg.QueryStrings(ctx, sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
+		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+		JOIN pg_type ty ON ty.oid=a.atttypid LEFT JOIN pg_type el ON el.oid=ty.typelem AND ty.typlen=-1 AND ty.typelem<>0
+		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		AND (ty.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle') OR el.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle'))
+		ORDER BY 1 LIMIT 100`)
+	if len(noEq) > 0 {
+		r.emit("identity_full_types", "", d.Source, check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", len(noEq), noEq[0]),
+			"Give these tables a primary key (or a unique index used with REPLICA IDENTITY USING INDEX), or change json columns to jsonb, then run preflight again.", map[string]any{"columns": noEq}, t)
+	} else {
+		ok(r, "identity_full_types", "", d.Source, "Tables with full replica identity have only comparable columns.", map[string]any{}, t)
+	}
+	t = time.Now()
+	fullNoKey, _ := pg.QueryStrings(ctx, sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisunique AND i.indpred IS NULL)
+		ORDER BY 1 LIMIT 100`)
+	if len(fullNoKey) > 0 {
+		r.emit("identity_full_duplicates", "", d.Source, check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", len(fullNoKey), fullNoKey[0]),
+			"Add a primary key if the table can hold identical rows.", map[string]any{"tables": fullNoKey}, t)
+	} else {
+		ok(r, "identity_full_duplicates", "", d.Source, "Every table with full replica identity has a unique key.", map[string]any{}, t)
+	}
+
 	simple := []struct{ id, q, msg, fix string }{
-		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards.", "Avoid changing large objects during the migration, or re-copy them after cutover."},
+		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards; verification compares them, so any change during the migration ends NO-GO.", "Do not change large objects while the migration runs."},
 		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated."},
 		{"materialized_views", `SELECT count(*) FROM pg_matviews`, "%d materialized view(s) are created but must be refreshed on the target after cutover.", "Refresh them after cutover (it is in the post-cutover checklist)."},
 		{"foreign_servers", `SELECT count(*) FROM pg_foreign_server`, "%d foreign server(s) need their user mappings and credentials re-created on the target.", "Re-create user mappings on the target after cutover."},
