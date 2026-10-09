@@ -1,0 +1,32 @@
+[Unit]
+Description=Upwell migration console
+Documentation=https://github.com/pagombin/Upwell
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=upwell
+Group=upwell
+ExecStart=/usr/local/bin/upwell serve --config /etc/upwell/config.yaml
+Restart=always
+RestartSec=5
+WatchdogSec=30
+TimeoutStartSec=120
+# Engines run in their own upwell-eng@ units; stopping the app never touches them.
+KillMode=process
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/upwell /var/log/upwell
+Environment=HOME=/var/lib/upwell
+
+[Install]
+WantedBy=multi-user.target

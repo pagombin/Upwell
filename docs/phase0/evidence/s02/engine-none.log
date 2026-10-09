@@ -1,0 +1,15 @@
+2026-10-07 22:18:22.224 2939 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 22:18:22.224 2939 INFO   cli_common.c:1394         [SOURCE] Copying database from "postgres://doadmin@127.0.0.1:55432/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 22:18:22.224 2939 INFO   cli_common.c:1395         [TARGET] Copying database into "postgres://doadmin@127.0.0.1:55433/privs?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 22:18:22.286 2939 INFO   pgsql.c:5470              Creating publication "upwell_s02_none"
+2026-10-07 22:18:22.310 2939 INFO   pgsql.c:4145              Created logical replication slot "upwell_s02_none" with plugin "pgoutput" at 2/74E92170 and exported snapshot 00000003-00011B85-1
+2026-10-07 22:18:22.312 2939 INFO   ld_store.c:110            Creating output CDC file "/var/tmp/upwell-spike/runs/s02/none/clone/cdc/00000001-00000002-74E92170-output.db"
+2026-10-07 22:18:22.329 2939 ERROR  pgsql.c:2386              [TARGET 2950] ERROR:  permission denied for function pg_replication_origin_oid
+2026-10-07 22:18:22.329 2939 ERROR  pgsql.c:2386              [TARGET 2950] ERROR:  permission denied for function pg_replication_origin_oid
+2026-10-07 22:18:22.329 2939 ERROR  pgsql.c:2397              [TARGET 2950] SQL query: select pg_replication_origin_oid($1)
+2026-10-07 22:18:22.329 2939 ERROR  pgsql.c:2405              [TARGET 2950] SQL params: 'upwell_s02_none'
+2026-10-07 22:18:22.329 2939 ERROR  pgsql.c:4985              Failed to get replication origin oid for "upwell_s02_none"
+2026-10-07 22:18:46.398 3813 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 22:18:46.410 3813 INFO   cli_sentinel.c:600        Fetched endpos 2/74EBB1E0 from source database
+2026-10-07 22:18:46.446 3813 INFO   cli_sentinel.c:650        pgcopydb sentinel endpos has been set to 2/74EBB1E0
+2/74EBB1E0

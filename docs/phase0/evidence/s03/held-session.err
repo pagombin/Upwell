@@ -1,0 +1,6 @@
+FATAL:  terminating connection due to administrator command
+CONTEXT:  PL/pgSQL function inline_code_block line 1 at PERFORM
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost

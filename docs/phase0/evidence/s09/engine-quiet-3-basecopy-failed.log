@@ -1,0 +1,98 @@
+2026-10-07 21:45:48.726 19548 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 21:45:48.726 19548 INFO   cli_common.c:1394         [SOURCE] Copying database from "postgres://doadmin@127.0.0.1:55432/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 21:45:48.726 19548 INFO   cli_common.c:1395         [TARGET] Copying database into "postgres://doadmin@127.0.0.1:55433/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 21:45:48.793 19548 INFO   pgsql.c:5470              Creating publication "upwell_s09_quiet"
+2026-10-07 21:45:48.821 19548 INFO   pgsql.c:4145              Created logical replication slot "upwell_s09_quiet" with plugin "pgoutput" at 2/33834B38 and exported snapshot 00000003-000113E7-1
+2026-10-07 21:45:48.822 19548 INFO   ld_store.c:110            Creating output CDC file "/var/tmp/upwell-spike/runs/s09-quiet/clone/cdc/00000001-00000002-33834B38-output.db"
+2026-10-07 21:45:48.839 19548 INFO   ld_stream.c:2347          Created logical replication origin "upwell_s09_quiet" at LSN 2/33834B38
+2026-10-07 21:45:48.922 19548 INFO   copydb_schema.c:776       Fetched information for 3 tables (including 0 tables split in 0 partitions total), with an estimated total of 2 999 tuples and 280 kB on-disk
+2026-10-07 21:45:48.932 19548 INFO   copydb_schema.c:999       Fetched information for 4 indexes (supporting 3 constraints)
+2026-10-07 21:45:48.935 19548 INFO   sequences.c:78            Fetching information for 1 sequences
+2026-10-07 21:45:48.940 19548 INFO   copydb_schema.c:1242      Fetched information for 1 extensions
+2026-10-07 21:45:48.980 19548 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
+2026-10-07 21:45:48.987 19564 INFO   cli_clone_follow.c:981    STEP 1: fetch source database tables, indexes, and sequences
+2026-10-07 21:45:48.991 19565 INFO   ld_ipc.c:101              Listening on TCP socket: 127.0.0.1:57009
+2026-10-07 21:45:48.991 19565 INFO   follow_coordinator.c:43   Follow coordinator listening on 127.0.0.1:57009
+2026-10-07 21:45:48.993 19566 INFO   ld_stream.c:847           Resuming streaming at LSN 2/33834B38 (sentinel startpos)
+2026-10-07 21:45:48.994 19567 INFO   ld_apply.c:1374           Waiting until the pgcopydb sentinel apply is enabled
+2026-10-07 21:45:49.003 19566 INFO   ld_stream.c:870           Replication slot "upwell_s09_quiet" current lsn is 2/33834B00
+2026-10-07 21:45:49.013 19566 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s09-quiet/clone/cdc/00000001-00000002-33834B38-output.db"
+2026-10-07 21:45:49.014 19566 INFO   pgsql.c:4864              Reported write_lsn 2/33834B38, flush_lsn 2/33834B38, replay_lsn 0/0
+2026-10-07 21:45:49.048 19564 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
+2026-10-07 21:45:49.049 19564 INFO   cli_clone_follow.c:1022   STEP 2: dump the source database schema (pre/post data)
+2026-10-07 21:45:49.049 19564 INFO   pgcmd.c:470                /usr/bin/pg_dump -Fc --snapshot 00000003-000113E7-1 --section=pre-data --section=post-data --file /var/tmp/upwell-spike/runs/s09-quiet/clone/schema/schema.dump 'postgres://doadmin@127.0.0.1:55432/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
+2026-10-07 21:45:49.157 19564 INFO   cli_clone_follow.c:1030   STEP 3: restore the pre-data section to the target database
+2026-10-07 21:45:49.198 19564 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 4 --no-owner --use-list /var/tmp/upwell-spike/runs/s09-quiet/clone/schema/pre-filtered.list /var/tmp/upwell-spike/runs/s09-quiet/clone/schema/schema.dump
+2026-10-07 21:45:49.288 19593 INFO   vacuum.c:166              STEP 8: starting 4 VACUUM processes
+2026-10-07 21:45:49.288 19591 INFO   table-data.c:708          STEP 4: starting 4 table-data COPY processes
+2026-10-07 21:45:49.299 19592 INFO   indexes.c:218             STEP 6: starting 4 CREATE INDEX processes
+2026-10-07 21:45:49.299 19592 INFO   indexes.c:219             STEP 7: constraints are built by the CREATE INDEX processes
+2026-10-07 21:45:49.301 19564 INFO   blobs.c:74                Skipping large objects: none found.
+2026-10-07 21:45:49.305 19564 INFO   sequences.c:194           STEP 9: reset sequences values
+2026-10-07 21:45:49.306 19616 INFO   sequences.c:290           Set sequences values on the target database
+2026-10-07 21:45:54.430 19608 ERROR  catalog.c:11039           Failed to execute statement: update summary set done_time_epoch = $1, duration = $2 where pid = $3 and conoid = $4
+2026-10-07 21:45:54.430 19608 ERROR  catalog.c:11049           [SQLite 5: database is locked]: database is locked
+2026-10-07 21:45:54.430 19608 ERROR  catalog.c:11006           Failed to execute SQLite query, see above for details
+2026-10-07 21:45:54.430 19608 ERROR  catalog.c:6505            Failed to iterate over list of indexes, see above for details
+2026-10-07 21:45:54.430 19608 ERROR  indexes.c:532             Failed to create constraints for table public.orders
+2026-10-07 21:45:54.430 19608 ERROR  indexes.c:386             Failed to create index with oid 17099, see above for details
+2026-10-07 21:45:59.759 19608 ERROR  catalog.c:11039           Failed to execute statement: delete from process where pid = $1
+2026-10-07 21:45:59.759 19608 ERROR  catalog.c:11049           [SQLite 5: database is locked]: database is locked
+2026-10-07 21:45:59.759 19608 ERROR  catalog.c:11006           Failed to execute SQLite query, see above for details
+2026-10-07 21:45:59.759 19608 WARN   indexes.c:415             Failed to delete catalog process entry for pid 19608
+2026-10-07 21:45:59.759 19608 ERROR  catalog.c:1683            Failed to close "/var/tmp/upwell-spike/runs/s09-quiet/clone/schema/source.db":
+2026-10-07 21:45:59.759 19608 ERROR  catalog.c:1684            [SQLite]: unable to close due to unfinalized statements or unfinished backups
+2026-10-07 21:45:59.763 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B2D0, flush_lsn 2/33834B38, replay_lsn 0/0
+2026-10-07 21:45:59.819 19592 ERROR  copydb.c:777              Sub-process 19608 exited with code 12
+2026-10-07 21:45:59.819 19592 ERROR  indexes.c:159             Some INDEX worker process(es) have exited with error, see above for details
+2026-10-07 21:45:59.819 19592 ERROR  indexes.c:59              Failed to create indexes, see above for details
+2026-10-07 21:45:59.823 19564 ERROR  copydb.c:777              Sub-process 19592 exited with code 12
+2026-10-07 21:45:59.923 19564 ERROR  table-data.c:207          Some sub-processes have exited with error status, see above for details
+2026-10-07 21:45:59.923 19564 ERROR  table-data.c:214          Errors detected, see above for details
+2026-10-07 21:45:59.923 19564 FATAL  table-data.c:71           Failed to COPY the data, see above for details
+2026-10-07 21:45:59.923 19564 ERROR  cli_clone_follow.c:942    Failed to clone source database, see above for details
+2026-10-07 21:45:59.954 19548 ERROR  cli_clone_follow.c:1202   clone process 19564 has terminated [6]
+2026-10-07 21:46:00.008 19566 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000033"
+2026-10-07 21:46:00.104 19548 WARN   cli_clone_follow.c:739    Failed to clone the source database, see above for details
+2026-10-07 21:46:00.104 19548 FATAL  copydb.c:694              Terminating all processes in our process group
+2026-10-07 21:46:00.105 19567 INFO   ld_apply.c:1311           Apply process received a shutdown signal while waiting for apply mode, quitting now
+2026-10-07 21:46:00.105 19567 INFO   follow.c:797              Apply process has terminated
+2026-10-07 21:46:00.106 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:46:00.108 19566 INFO   ld_stream.c:735           Streamed up to write_lsn 2/3383B308, flush_lsn 2/3383B308, reconnecting in 1s 
+2026-10-07 21:46:01.119 19566 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s09-quiet/clone/cdc/00000001-00000002-33834B38-output.db"
+2026-10-07 21:46:01.120 19566 INFO   pgsql.c:4864              Reported write_lsn 2/33834B38, flush_lsn 2/33834B38, replay_lsn 0/0
+2026-10-07 21:46:11.128 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/33834B38, replay_lsn 0/0
+2026-10-07 21:46:21.136 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:46:31.146 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:46:41.155 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:46:51.165 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:47:01.175 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:47:11.184 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:47:21.194 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:47:31.203 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:47:41.213 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:47:51.222 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:48:01.232 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:48:11.241 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:48:21.251 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:48:31.260 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:48:41.270 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:48:51.271 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:49:01.279 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:49:11.287 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:49:21.295 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:49:31.303 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:49:41.312 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:49:51.319 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:01.327 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:11.336 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:21.346 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:31.355 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:41.363 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:49.049 19565 ERROR  ld_ipc.c:125              Poll failed on TCP socket: Interrupted system call
+2026-10-07 21:50:49.050 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0
+2026-10-07 21:50:49.050 19566 INFO   ld_stream.c:735           Streamed up to write_lsn 2/3383B308, flush_lsn 2/3383B308, reconnecting in 1s 
+2026-10-07 21:50:50.062 19566 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s09-quiet/clone/cdc/00000001-00000002-33834B38-output.db"
+2026-10-07 21:50:50.063 19566 INFO   pgsql.c:4864              Reported write_lsn 2/33834B38, flush_lsn 2/33834B38, replay_lsn 0/0
+2026-10-07 21:51:00.073 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/33834B38, replay_lsn 0/0
+2026-10-07 21:51:10.088 19566 INFO   pgsql.c:4864              Reported write_lsn 2/3383B308, flush_lsn 2/3383B308, replay_lsn 0/0

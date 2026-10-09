@@ -1,0 +1,6 @@
+{"step":"rotation","output_files":2,"ms_waited":8,"rotated_log_lines":1}
+{"step":"wait_until_prunable","ms":39}
+{"step":"P1_coordinator_dry_run","out":"    DRY RUN: would remove 1 CDC file pair(s), freeing 2035 MB (replay_lsn 0/0)","bytes_unchanged":false}
+{"step":"P2_coordinator_prune","out":"    Removed 1 CDC file pair(s), freed 2035 MB (replay_lsn 0/0)","bytes_before":2614919240,"bytes_after":480530504,"unit_still_running":true}
+{"step":"P3_direct_prune_while_running","out":"    Removed CDC replay file: /var/tmp/upwell-spike/runs/s08/clone/cdc/00000001-00000001-30D6A8D8-replay.db","bytes_before":2140430744,"bytes_after":4379032,"unit_still_running":true}
+{"step":"drain_and_compare","drain_ms":149951,"source":"3000000/2880000000","target":"2700000/2592000000","match":false,"engine_log_errors":0}

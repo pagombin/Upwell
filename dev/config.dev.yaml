@@ -1,0 +1,14 @@
+# Development configuration: everything under /var/tmp/upwell-dev, HTTPS on 8443.
+listen_address: 127.0.0.1
+https_port: 8443
+http_redirect: false
+data_dir: /var/tmp/upwell-dev/data
+log_dir: /var/tmp/upwell-dev/log
+tls_cert: /var/tmp/upwell-dev/tls/cert.pem
+tls_key: /var/tmp/upwell-dev/tls/key.pem
+master_key: /var/tmp/upwell-dev/master.key
+setup_token_file: /var/tmp/upwell-dev/setup-token
+engine:
+  runner: local
+  pgcopydb: pgcopydb
+dev: true

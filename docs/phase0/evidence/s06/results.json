@@ -1,0 +1,35 @@
+{
+  "base_copy_fraction": "first third",
+  "databases": 10,
+  "days": 7,
+  "interval_s": 5,
+  "raw_retention_h": 72,
+  "results": [
+    {
+      "variant": "spec",
+      "series": 423,
+      "raw_rows": 10648800,
+      "rollup_1m_rows": 3591840,
+      "rollup_15m_rows": 239456,
+      "file_bytes": 2449657856,
+      "bytes_per_row_overall": 169.17414470180307,
+      "load_seconds": 536.193810622,
+      "query_chart_6h_1series_ms": 0.73,
+      "query_overview_24h_all_db_backlog_ms": 12.068,
+      "projected_gb_30_day_run": 4.579314020241014
+    },
+    {
+      "variant": "compact",
+      "series": 423,
+      "raw_rows": 10648800,
+      "rollup_1m_rows": 3591840,
+      "rollup_15m_rows": 239456,
+      "file_bytes": 498282496,
+      "bytes_per_row_overall": 34.41154644278601,
+      "load_seconds": 90.660729276,
+      "query_chart_6h_1series_ms": 0.538,
+      "query_overview_24h_all_db_backlog_ms": 1.372,
+      "projected_gb_30_day_run": 0.9314737625030551
+    }
+  ]
+}

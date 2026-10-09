@@ -1,0 +1,174 @@
+2026-10-07 21:57:27.325 8374 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 21:57:27.325 8374 INFO   cli_common.c:1394         [SOURCE] Copying database from "postgres://doadmin@127.0.0.1:55432/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 21:57:27.325 8374 INFO   cli_common.c:1395         [TARGET] Copying database into "postgres://doadmin@127.0.0.1:55433/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+2026-10-07 21:57:27.389 8374 INFO   pgsql.c:5470              Creating publication "upwell_s09_poll"
+2026-10-07 21:57:27.413 8374 INFO   pgsql.c:4145              Created logical replication slot "upwell_s09_poll" with plugin "pgoutput" at 2/342044F0 and exported snapshot 00000003-00011449-1
+2026-10-07 21:57:27.414 8374 INFO   ld_store.c:110            Creating output CDC file "/var/tmp/upwell-spike/runs/s09-poll/clone/cdc/00000001-00000002-342044F0-output.db"
+2026-10-07 21:57:27.432 8374 INFO   ld_stream.c:2347          Created logical replication origin "upwell_s09_poll" at LSN 2/342044F0
+2026-10-07 21:57:27.507 8374 INFO   copydb_schema.c:776       Fetched information for 3 tables (including 0 tables split in 0 partitions total), with an estimated total of 2 999 tuples and 280 kB on-disk
+2026-10-07 21:57:27.516 8374 INFO   copydb_schema.c:999       Fetched information for 4 indexes (supporting 3 constraints)
+2026-10-07 21:57:27.518 8374 INFO   sequences.c:78            Fetching information for 1 sequences
+2026-10-07 21:57:27.523 8374 INFO   copydb_schema.c:1242      Fetched information for 1 extensions
+2026-10-07 21:57:27.558 8374 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
+2026-10-07 21:57:27.566 8390 INFO   cli_clone_follow.c:981    STEP 1: fetch source database tables, indexes, and sequences
+2026-10-07 21:57:27.570 8392 INFO   ld_ipc.c:101              Listening on TCP socket: 127.0.0.1:57009
+2026-10-07 21:57:27.570 8392 INFO   follow_coordinator.c:43   Follow coordinator listening on 127.0.0.1:57009
+2026-10-07 21:57:27.572 8394 INFO   ld_stream.c:847           Resuming streaming at LSN 2/342044F0 (sentinel startpos)
+2026-10-07 21:57:27.573 8395 INFO   ld_apply.c:1374           Waiting until the pgcopydb sentinel apply is enabled
+2026-10-07 21:57:27.581 8394 INFO   ld_stream.c:870           Replication slot "upwell_s09_poll" current lsn is 2/342044B8
+2026-10-07 21:57:27.592 8394 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s09-poll/clone/cdc/00000001-00000002-342044F0-output.db"
+2026-10-07 21:57:27.592 8394 INFO   pgsql.c:4864              Reported write_lsn 2/342044F0, flush_lsn 2/342044F0, replay_lsn 0/0
+2026-10-07 21:57:27.625 8390 INFO   copydb_schema.c:1717      Found 0 indexes (supporting 0 constraints) in the target database
+2026-10-07 21:57:27.626 8390 INFO   cli_clone_follow.c:1022   STEP 2: dump the source database schema (pre/post data)
+2026-10-07 21:57:27.626 8390 INFO   pgcmd.c:470                /usr/bin/pg_dump -Fc --snapshot 00000003-00011449-1 --section=pre-data --section=post-data --file /var/tmp/upwell-spike/runs/s09-poll/clone/schema/schema.dump 'postgres://doadmin@127.0.0.1:55432/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
+2026-10-07 21:57:27.722 8390 INFO   cli_clone_follow.c:1030   STEP 3: restore the pre-data section to the target database
+2026-10-07 21:57:27.769 8390 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 2 --no-owner --use-list /var/tmp/upwell-spike/runs/s09-poll/clone/schema/pre-filtered.list /var/tmp/upwell-spike/runs/s09-poll/clone/schema/schema.dump
+2026-10-07 21:57:27.852 8418 INFO   table-data.c:708          STEP 4: starting 2 table-data COPY processes
+2026-10-07 21:57:27.856 8420 INFO   vacuum.c:166              STEP 8: starting 2 VACUUM processes
+2026-10-07 21:57:27.862 8419 INFO   indexes.c:218             STEP 6: starting 2 CREATE INDEX processes
+2026-10-07 21:57:27.862 8419 INFO   indexes.c:219             STEP 7: constraints are built by the CREATE INDEX processes
+2026-10-07 21:57:27.864 8390 INFO   blobs.c:74                Skipping large objects: none found.
+2026-10-07 21:57:27.865 8390 INFO   sequences.c:194           STEP 9: reset sequences values
+2026-10-07 21:57:27.867 8433 INFO   sequences.c:290           Set sequences values on the target database
+2026-10-07 21:57:28.168 8390 INFO   cli_clone_follow.c:1046   STEP 10: restore the post-data section to the target database
+2026-10-07 21:57:28.201 8390 INFO   pgcmd.c:1030               /usr/bin/pg_restore --dbname 'postgres://doadmin@127.0.0.1:55433/skip?sslmode=disable&keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 2 --no-owner --use-list /var/tmp/upwell-spike/runs/s09-poll/clone/schema/post-filtered.list /var/tmp/upwell-spike/runs/s09-poll/clone/schema/schema.dump
+2026-10-07 21:57:28.267 8390 INFO   cli_clone_follow.c:1061   Updating the pgcopydb.sentinel to enable applying changes
+2026-10-07 21:57:28.269 8390 INFO   cli_clone_follow.c:1077   All step are now done, 642ms elapsed
+2026-10-07 21:57:28.269 8390 INFO   summary.c:3631            Printing summary for 3 tables and 4 indexes
+
+  OID | Schema |   Name | Parts | copy duration | transmitted bytes | indexes | create index 
+------+--------+--------+-------+---------------+-------------------+---------+-------------
+17161 | public |  items |     1 |           9ms |             31 kB |       1 |          5ms
+17152 | public | orders |     1 |           7ms |             74 kB |       2 |          8ms
+17175 | public |    big |     1 |           8ms |               0 B |       1 |          3ms
+
+
+                                               Step   Connection    Duration    Transfer   Concurrency
+ --------------------------------------------------   ----------  ----------  ----------  ------------
+   Catalog Queries (table ordering, filtering, etc)       source        57ms                         1
+                                        Dump Schema       source        94ms                         1
+                                     Prepare Schema       target       121ms                         1
+      COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       322ms                         6
+                                  COPY (cumulative)         both        24ms      105 kB             2
+                          CREATE INDEX (cumulative)       target        13ms                         2
+                           CONSTRAINTS (cumulative)       target         3ms                         2
+                                VACUUM (cumulative)       target        34ms                         2
+                                    Reset Sequences         both         9ms                         1
+                         Large Objects (cumulative)         both         0ms                         4
+                                    Finalize Schema         both        97ms                         2
+ --------------------------------------------------   ----------  ----------  ----------  ------------
+                          Total Wall Clock Duration         both       642ms                        12
+
+2026-10-07 21:57:28.573 8395 INFO   ld_apply.c:1384           The pgcopydb sentinel has enabled applying changes
+2026-10-07 21:57:28.589 8395 INFO   ld_apply.c:2489           Setting up previous LSN from replication origin "upwell_s09_poll" progress at 2/342044F0
+2026-10-07 21:57:28.591 8395 INFO   ld_store.c:110            Opening output CDC file "/var/tmp/upwell-spike/runs/s09-poll/clone/cdc/00000001-00000002-342044F0-output.db"
+2026-10-07 21:57:28.591 8395 INFO   ld_store.c:165            Creating replay CDC file "/var/tmp/upwell-spike/runs/s09-poll/clone/cdc/00000001-00000002-342044F0-replay.db"
+2026-10-07 21:57:28.597 8395 INFO   ld_apply.c:1260           Catchup-up with changes from LSN 2/342044F0
+2026-10-07 21:57:28.605 8395 INFO   ld_apply.c:203            Applying CDC changes from replayDB "/var/tmp/upwell-spike/runs/s09-poll/clone/cdc/00000001-00000002-342044F0-replay.db" after LSN 2/342044F0
+2026-10-07 21:57:37.593 8394 INFO   pgsql.c:4864              Reported write_lsn 2/34FB90B0, flush_lsn 2/342044F0, replay_lsn 2/342044F0
+2026-10-07 21:57:37.593 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000034"
+2026-10-07 21:57:47.593 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3602A080, flush_lsn 2/342044F0, replay_lsn 2/342044F0
+2026-10-07 21:57:47.594 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000036"
+2026-10-07 21:57:57.593 8394 INFO   pgsql.c:4864              Reported write_lsn 2/37036308, flush_lsn 2/342044F0, replay_lsn 2/342044F0
+2026-10-07 21:57:57.594 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000037"
+2026-10-07 21:58:07.593 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3806C7B0, flush_lsn 2/342044F0, replay_lsn 2/342044F0
+2026-10-07 21:58:07.594 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000038"
+2026-10-07 21:58:17.593 8394 INFO   pgsql.c:4864              Reported write_lsn 2/38731B90, flush_lsn 2/38108990, replay_lsn 2/38108990
+2026-10-07 21:58:27.594 8394 INFO   pgsql.c:4864              Reported write_lsn 2/39748E30, flush_lsn 2/38108990, replay_lsn 2/38108990
+2026-10-07 21:58:27.595 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000039"
+2026-10-07 21:58:37.594 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3A6F07E0, flush_lsn 2/38108990, replay_lsn 2/38108990
+2026-10-07 21:58:37.595 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000003A"
+2026-10-07 21:58:47.595 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3B6D2550, flush_lsn 2/38108990, replay_lsn 2/38108990
+2026-10-07 21:58:47.595 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000003B"
+2026-10-07 21:58:57.598 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3C107FA0, flush_lsn 2/3C090590, replay_lsn 2/3C090590
+2026-10-07 21:58:59.532 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000003C"
+2026-10-07 21:59:07.597 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3CD608F0, flush_lsn 2/3C107FA0, replay_lsn 2/3C107FA0
+2026-10-07 21:59:17.597 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3DC8BFD0, flush_lsn 2/3C107FA0, replay_lsn 2/3C107FA0
+2026-10-07 21:59:17.598 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000003D"
+2026-10-07 21:59:27.598 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3EC26C78, flush_lsn 2/3C107FA0, replay_lsn 2/3C107FA0
+2026-10-07 21:59:27.599 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000003E"
+2026-10-07 21:59:37.598 8394 INFO   pgsql.c:4864              Reported write_lsn 2/3FBEE968, flush_lsn 2/3C107FA0, replay_lsn 2/3C107FA0
+2026-10-07 21:59:37.599 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000003F"
+2026-10-07 21:59:47.598 8394 INFO   pgsql.c:4864              Reported write_lsn 2/404BFB68, flush_lsn 2/4000CE80, replay_lsn 2/4000CE80
+2026-10-07 21:59:47.599 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000040"
+2026-10-07 21:59:57.599 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4156AD98, flush_lsn 2/4000CE80, replay_lsn 2/4000CE80
+2026-10-07 21:59:57.601 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000041"
+2026-10-07 22:00:07.599 8394 INFO   pgsql.c:4864              Reported write_lsn 2/42601668, flush_lsn 2/4000CE80, replay_lsn 2/4000CE80
+2026-10-07 22:00:07.599 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000042"
+2026-10-07 22:00:17.599 8394 INFO   pgsql.c:4864              Reported write_lsn 2/43642298, flush_lsn 2/4000CE80, replay_lsn 2/4000CE80
+2026-10-07 22:00:17.600 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000043"
+2026-10-07 22:00:27.609 8394 INFO   pgsql.c:4864              Reported write_lsn 2/43F891D0, flush_lsn 2/43F89198, replay_lsn 2/43F89198
+2026-10-07 22:00:37.603 8394 INFO   pgsql.c:4864              Reported write_lsn 2/44B2F6F8, flush_lsn 2/43F891D0, replay_lsn 2/43F891D0
+2026-10-07 22:00:37.605 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000044"
+2026-10-07 22:00:47.603 8394 INFO   pgsql.c:4864              Reported write_lsn 2/45B315D8, flush_lsn 2/43F891D0, replay_lsn 2/43F891D0
+2026-10-07 22:00:47.604 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000045"
+2026-10-07 22:00:57.603 8394 INFO   pgsql.c:4864              Reported write_lsn 2/46AEF830, flush_lsn 2/43F891D0, replay_lsn 2/43F891D0
+2026-10-07 22:00:57.604 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000046"
+2026-10-07 22:01:07.604 8394 INFO   pgsql.c:4864              Reported write_lsn 2/47A68C60, flush_lsn 2/43F891D0, replay_lsn 2/43F891D0
+2026-10-07 22:01:07.605 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000047"
+2026-10-07 22:01:17.604 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4812C6B8, flush_lsn 2/47F05AC0, replay_lsn 2/47F05AC0
+2026-10-07 22:01:17.605 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000048"
+2026-10-07 22:01:27.605 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4907E3B0, flush_lsn 2/47F05AC0, replay_lsn 2/47F05AC0
+2026-10-07 22:01:27.606 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000049"
+2026-10-07 22:01:37.605 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4A0208C8, flush_lsn 2/47F05AC0, replay_lsn 2/47F05AC0
+2026-10-07 22:01:37.606 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000004A"
+2026-10-07 22:01:47.606 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4B06D0B8, flush_lsn 2/47F05AC0, replay_lsn 2/47F05AC0
+2026-10-07 22:01:47.607 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000004B"
+2026-10-07 22:01:57.607 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4BEF9C78, flush_lsn 2/47F05AC0, replay_lsn 2/47F05AC0
+2026-10-07 22:02:07.607 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4C83B178, flush_lsn 2/4BEF9C78, replay_lsn 2/4BEF9C78
+2026-10-07 22:02:07.607 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000004C"
+2026-10-07 22:02:17.607 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4D8AA770, flush_lsn 2/4BEF9C78, replay_lsn 2/4BEF9C78
+2026-10-07 22:02:17.609 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000004D"
+2026-10-07 22:02:27.607 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4E8B2548, flush_lsn 2/4BEF9C78, replay_lsn 2/4BEF9C78
+2026-10-07 22:02:27.608 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000004E"
+2026-10-07 22:02:37.608 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4F83C7F0, flush_lsn 2/4BEF9C78, replay_lsn 2/4BEF9C78
+2026-10-07 22:02:37.609 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "00000001000000020000004F"
+2026-10-07 22:02:47.608 8394 INFO   pgsql.c:4864              Reported write_lsn 2/4FE93518, flush_lsn 2/4FDFE348, replay_lsn 2/4FDFE348
+2026-10-07 22:02:57.609 8394 INFO   pgsql.c:4864              Reported write_lsn 2/50E297A8, flush_lsn 2/4FDFE348, replay_lsn 2/4FDFE348
+2026-10-07 22:02:57.610 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000050"
+2026-10-07 22:03:07.609 8394 INFO   pgsql.c:4864              Reported write_lsn 2/51D1F970, flush_lsn 2/4FDFE348, replay_lsn 2/4FDFE348
+2026-10-07 22:03:07.610 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000051"
+2026-10-07 22:03:17.610 8394 INFO   pgsql.c:4864              Reported write_lsn 2/52CEC3B8, flush_lsn 2/4FDFE348, replay_lsn 2/4FDFE348
+2026-10-07 22:03:17.610 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000052"
+2026-10-07 22:03:27.610 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53C4B750, flush_lsn 2/4FDFE348, replay_lsn 2/4FDFE348
+2026-10-07 22:03:27.611 8394 INFO   ld_stream.c:1211          Now streaming changes for WAL segment "000000010000000200000053"
+2026-10-07 22:03:37.616 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD0E0, flush_lsn 2/53D0DDE0, replay_lsn 2/53D0DDE0
+2026-10-07 22:03:47.629 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD0E0, flush_lsn 2/53D0DDE0, replay_lsn 2/53D0DDE0
+2026-10-07 22:03:57.640 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD118, flush_lsn 2/53DFD0E0, replay_lsn 2/53DFD0E0
+2026-10-07 22:04:07.655 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD118, flush_lsn 2/53DFD0E0, replay_lsn 2/53DFD0E0
+2026-10-07 22:04:17.667 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD118, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:04:27.676 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD118, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:04:32.286 15421 INFO   main.c:150                Running pgcopydb version 0.18 from "/usr/local/bin/pgcopydb"
+2026-10-07 22:04:32.298 15421 INFO   cli_sentinel.c:600        Fetched endpos 2/53DFD118 from source database
+2026-10-07 22:04:32.302 15421 INFO   cli_sentinel.c:650        pgcopydb sentinel endpos has been set to 2/53DFD118
+2/53DFD118
+2026-10-07 22:04:32.309 8395 INFO   sentinel.c:853            pipeline_state_end: apply done at 2/53DFD118
+2026-10-07 22:04:32.334 8395 INFO   follow.c:797              Apply process has terminated
+2026-10-07 22:04:37.684 8394 INFO   pgsql.c:4855              endpos is now set to 2/53DFD118
+2026-10-07 22:04:37.684 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:04:47.698 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:04:57.711 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:05:07.713 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:05:17.725 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:05:27.738 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:05:37.749 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:05:47.758 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:05:57.772 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:07.945 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:17.957 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:27.970 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:37.982 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:47.987 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD1C8, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:55.027 8394 INFO   pgsql.c:4864              Reported write_lsn 2/53DFD278, flush_lsn 2/53DFD118, replay_lsn 2/53DFD118
+2026-10-07 22:06:55.028 8394 INFO   ld_stream.c:1251          streamCloseFile: receive done at 2/53DFD278, signalling transform
+2026-10-07 22:06:55.028 8394 INFO   ld_stream.c:727           Streamed up to write_lsn 2/53DFD278, flush_lsn 2/53DFD118, stopping: endpos is 2/53DFD118
+2026-10-07 22:06:55.028 8394 INFO   sentinel.c:853            pipeline_state_end: receive done at 2/53DFD118
+2026-10-07 22:06:55.028 8394 INFO   follow.c:738              Prefetch process has terminated
+2026-10-07 22:06:55.192 8392 INFO   follow.c:671              Subprocesses for receive and apply have now all exited
+2026-10-07 22:06:55.192 8392 INFO   follow.c:279              Current sentinel replay_lsn is 2/53DFD118, endpos has now been set to 2/53DFD118
+2026-10-07 22:06:55.192 8392 INFO   follow.c:461              Current endpos 2/53DFD118 has been reached at replay_lsn 2/53DFD118
+2026-10-07 22:06:55.192 8392 INFO   follow.c:367              Follow mode is now done, reached endpos 2/53DFD118 with replay_lsn 2/53DFD118
+2026-10-07 22:06:55.386 8374 INFO   copydb_schema.c:376       A previous run has run through completion
+2026-10-07 22:06:55.387 8374 INFO   copydb_schema.c:50        Re-using catalog caches
+2026-10-07 22:06:55.387 8374 INFO   sequences.c:290           Reset sequences values on the target database
+2026-10-07 22:06:55.387 8374 INFO   sequences.c:78            Fetching information for 1 sequences

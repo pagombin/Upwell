@@ -1,0 +1,14 @@
+19:37:48.271 runner=cgroup pgcopydb=pgcopydb version 0.18 server=16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)
+19:37:48.320 RESULT {"meta":{"runner":"cgroup","pgcopydb":"0.18","server":"16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)","stop_timeout_s":30}}
+19:37:48.322 seeding orders with 300000 rows
+19:37:56.271 reached CDC after 1637 ms
+19:38:31.545 RESULT {"scenario":"A_unit_stop_cdc","procs_before":4,"ms_to_empty":30161,"stopped_by":"kill","procs_after":0,"ms_slot_inactive_after_empty":43}
+19:39:17.345 RESULT {"scenario":"B_sigkill_main_cdc","unit_mainpid":14142,"pidfile_mainpid":14142,"procs_before":4,"live_procs_10s_after_kill":3,"receive_alive":1,"apply_alive":1,"slot_active_10s_after_kill":true,"systemd_auto_cleanup_ms":null,"unit_state":"n/a","emulated_stop":{"ms_to_empty":30089,"stopped_by":"kill"},"ms_slot_inactive_after":44}
+19:39:46.624 RESULT {"scenario":"C_resume_after_kill","startpos_kept":"0/4C6F97D0","slot_reused":true,"base_copy_starts_in_log":0,"drain_ms":15275,"exit_state":"inactive","source_orders":"300967/14997438.95","target_orders":"300967/14997438.95","match":true}
+19:39:49.759 reached CDC after 1654 ms
+19:40:17.096 RESULT {"scenario":"D_stale_walsender","walsender_pid":18670,"released_on_its_own_within_20s":false,"terminate_as_same_nonsuper_role":"t","ms_release_after_terminate":41,"wal_sender_timeout":"1min"}
+19:40:55.185 RESULT {"scenario":"E_sigterm_main_only","main_exit_ms":-1,"live_procs_after":4,"slot_active_after":true}
+19:43:00.916 RESULT {"scenario":"F_sigint_all","ms_to_empty":-1,"ms_slot_inactive_after":-1}
+19:45:06.738 RESULT {"scenario":"H_sigterm_plus_walsender_terminate","ms_to_empty":-1,"ms_slot_inactive_after":-1,"clean_exit_logged":0}
+19:46:02.797 RESULT {"scenario":"G_resume_after_D_E_F","drain_ms":16697,"source_orders":"304611/15004726.95","target_orders":"304611/15004726.95","match":true}
+19:46:03.109 done; evidence in /home/user/Upwell/docs/phase0/evidence/s01/results.jsonl

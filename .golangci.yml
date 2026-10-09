@@ -1,0 +1,56 @@
+# golangci-lint v2. errcheck skips best-effort calls whose failure has no
+# useful handling (closing, removing temp files, writing to a client that may
+# have gone away); see docs/DECISIONS.md D18.
+version: "2"
+linters:
+  default: standard
+  settings:
+    staticcheck:
+      # Quick-fix style suggestions (QF*) are not defects.
+      checks: ["all", "-QF*", "-ST1000", "-ST1003", "-ST1020", "-ST1021", "-ST1022"]
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Tx).Rollback
+        - (*database/sql.Stmt).Close
+        - (net.Listener).Close
+        - (net.Conn).Close
+        - (*net/http.Server).Shutdown
+        - (*github.com/jackc/pgx/v5.Conn).Close
+        - (github.com/jackc/pgx/v5.Rows).Close
+        - (*github.com/pagombin/upwell/internal/store.Store).Close
+        - os.Remove
+        - os.RemoveAll
+        - os.MkdirAll
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+        - io.WriteString
+        - (net/http.ResponseWriter).Write
+        - (*encoding/json.Encoder).Encode
+        - (*text/tabwriter.Writer).Flush
+        - (*github.com/pagombin/upwell/internal/audit.Log).Append
+        - (*github.com/pagombin/upwell/internal/logx.Logger).Close
+        # These log their own failures at error level.
+        - (*github.com/pagombin/upwell/internal/orch.Orchestrator).setDB
+        - (*github.com/pagombin/upwell/internal/orch.Orchestrator).updateFlags
+        - (*github.com/pagombin/upwell/internal/orch.Orchestrator).refreshState
+        # Best-effort reads of optional facts (versions, settings, counts) and
+        # best-effort bookkeeping writes; decisions never depend on them silently.
+        - (github.com/jackc/pgx/v5.Row).Scan
+        - (*database/sql.Row).Scan
+        - (*database/sql.Rows).Scan
+        - (*database/sql.DB).ExecContext
+        - (*database/sql.DB).Exec
+        - (*github.com/jackc/pgx/v5.Conn).Exec
+        - encoding/json.Unmarshal
+        - path/filepath.Walk
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck]
+      - path: spikes/
+        linters: [errcheck, staticcheck, unused]

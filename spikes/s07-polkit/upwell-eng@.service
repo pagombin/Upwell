@@ -1,0 +1,30 @@
+# Candidate engine template unit (Phase 0 spike S07). One instance per database run:
+#   upwell-eng@<migration>-<db>.service
+# The app writes /var/lib/upwell/runs/%i/engine.env (mode 0600, owned by upwell) with
+#   UPWELL_ENGINE_ARGS=clone --follow --dir ... --slot-name ... (no secrets, no spaces in values)
+#   PGPASSFILE=/var/lib/upwell/runs/%i/pgpass
+# User, binary and kill behavior are fixed here, so the service user can choose only the
+# engine's arguments, never the command or the user it runs as.
+[Unit]
+Description=Upwell engine run %i
+After=network-online.target
+
+[Service]
+Type=simple
+User=upwell
+Group=upwell
+EnvironmentFile=/var/lib/upwell/runs/%i/engine.env
+# Unquoted $VAR is split on whitespace by systemd, so pgcopydb itself is the main process.
+ExecStart=/usr/local/bin/pgcopydb $UPWELL_ENGINE_ARGS
+StandardOutput=append:/var/lib/upwell/runs/%i/engine.log
+StandardError=append:/var/lib/upwell/runs/%i/engine.log
+KillMode=control-group
+# pgcopydb treats SIGTERM as a graceful stop that may not finish (spike S01, scenario A);
+# SIGINT is its fast stop. SIGKILL to the whole cgroup after the timeout either way.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=no
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/upwell/runs/%i
+PrivateTmp=true
