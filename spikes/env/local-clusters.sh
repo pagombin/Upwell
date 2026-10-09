@@ -9,10 +9,13 @@
 set -euo pipefail
 
 PGVER="${PGVER:-16}"
-BIN="/usr/lib/postgresql/${PGVER}/bin"
+BIN="${PGBIN:-/usr/lib/postgresql/${PGVER}/bin}"
 ROOT="${UPWELL_SPIKE_ROOT:-/var/tmp/upwell-spike}"
-SRC_PORT=55432
-DST_PORT=55433
+SRC_PORT="${SRC_PORT:-55432}"
+DST_PORT="${DST_PORT:-55433}"
+# TARGET_ONLY=1 creates only the target, for example a newer major version:
+#   TARGET_ONLY=1 PGBIN=/usr/local/pg18/bin UPWELL_SPIKE_ROOT=/var/tmp/upwell-pg18 DST_PORT=55434 bash local-clusters.sh up
+TARGET_ONLY="${TARGET_ONLY:-0}"
 PASS="${UPWELL_SPIKE_PASSWORD:-spike-password-not-secret}"
 
 as_pg() { runuser -u postgres -- "$@"; }
@@ -56,7 +59,9 @@ psql_super() { # port sql...
 
 seed() {
   # doadmin mirrors the Standard admin: REPLICATION, CREATEDB, CREATEROLE, not superuser.
-  for port in $SRC_PORT $DST_PORT; do
+  ports="$SRC_PORT $DST_PORT"
+  [[ $TARGET_ONLY == 1 ]] && ports=$DST_PORT
+  for port in $ports; do
     psql_super "$port" -d postgres <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='doadmin') THEN
@@ -96,10 +101,10 @@ SQL
 
 case "${1:-up}" in
   up)
-    init_cluster source $SRC_PORT; init_cluster target $DST_PORT
-    start_cluster source; start_cluster target
+    if [[ $TARGET_ONLY != 1 ]]; then init_cluster source "$SRC_PORT"; start_cluster source; fi
+    init_cluster target "$DST_PORT"; start_cluster target
     seed
-    echo "source: postgres://doadmin@127.0.0.1:$SRC_PORT/defaultdb"
+    [[ $TARGET_ONLY == 1 ]] || echo "source: postgres://doadmin@127.0.0.1:$SRC_PORT/defaultdb"
     echo "target: postgres://doadmin@127.0.0.1:$DST_PORT/defaultdb"
     ;;
   down)
