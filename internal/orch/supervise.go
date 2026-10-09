@@ -58,7 +58,7 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 	ms, err := o.ListMigrations(ctx)
 	if err == nil {
 		for _, m := range ms {
-			if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp {
+			if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp || m.Flags.CleanupRunning {
 				continue
 			}
 			o.superviseMigration(ctx, m)
@@ -74,7 +74,13 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 }
 
 func (o *Orchestrator) superviseMigration(ctx context.Context, m Migration) {
-	unlock := o.lock(m.ID)
+	// A long operation (pause, abort, restart, cleanup) may hold the lock for
+	// minutes; skip this migration rather than block the loop, whose
+	// heartbeat feeds the systemd watchdog.
+	unlock, ok := o.tryLock(m.ID)
+	if !ok {
+		return
+	}
 	defer unlock()
 	m, err := o.GetMigration(ctx, m.ID)
 	if err != nil {
@@ -207,7 +213,10 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	// The unit is no longer running.
 	var reason, cls string
 	switch {
-	case classes.endposReached || (d.State == DDraining && classes.errors == 0):
+	case classes.endposReached || (d.State == DDraining && d.EndPos != "" && classes.errors == 0 && st.ExitCode != nil && *st.ExitCode == 0):
+		// Drained only on the engine's own word or a clean exit while
+		// draining: a unit that was not running when the end position was set,
+		// or one killed during the drain, is not drained.
 		cls = engine.FailEndposReached
 		reason = "reached its end position"
 	case classes.slotLost:
@@ -255,7 +264,7 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 	switch cls {
 	case engine.FailEndposReached:
 		if d.State == DDraining {
-			o.setDB(ctx, d.ID, map[string]any{"state": DDrained})
+			o.setDB(ctx, d.ID, map[string]any{"state": DDrained, "drained": 1})
 			o.Event(ctx, m.ID, d.SourceName, "db_state", "info", d.SourceName+" reached its end position", nil)
 			return
 		}
@@ -270,11 +279,14 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 		// F12: pgcopydb's own SQLite catalog lock is an engine-internal
 		// transient fault, so it gets one automatic restart from zero (the
 		// copy had not finished, so nothing on the target is kept).
-		engineFlake := strings.HasPrefix(reason, engineLockReason) && d.RetryCount == 0
-		if engineFlake {
-			o.setDB(ctx, d.ID, map[string]any{"retry_count": d.RetryCount + 1})
-		}
-		if (v.Bool("auto_restart_base_copy") || engineFlake) && underLimit {
+		engineFlake := strings.HasPrefix(reason, engineLockReason) && d.AutoRestarts == 0
+		// A deterministic failure (a full disk, a table that cannot be
+		// copied) would otherwise loop: drop the target, copy, fail, forever.
+		const maxAutoRestarts = 3
+		if (v.Bool("auto_restart_base_copy") || engineFlake) && underLimit && d.AutoRestarts >= maxAutoRestarts {
+			reason += fmt.Sprintf("; already restarted from zero automatically %d times, so Upwell stopped", d.AutoRestarts)
+		} else if (v.Bool("auto_restart_base_copy") || engineFlake) && underLimit {
+			o.setDB(ctx, d.ID, map[string]any{"auto_restarts": d.AutoRestarts + 1})
 			o.Event(ctx, m.ID, d.SourceName, "auto_restart", "warning", d.SourceName+": base copy failed ("+reason+"); restarting from zero automatically (under the size limit)", nil)
 			spec, err := o.dbSpec(ctx, m, d)
 			if err == nil {
@@ -467,6 +479,17 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			if st.Active {
 				// Engines outlive the app: re-attach the log tailer at its stored offset.
 				o.tails.attach(m.ID, d.SourceName, o.runLog(d), o.attemptNumber(ctx, d.ID))
+				if d.State == DPreparing {
+					// The app stopped between starting the unit and recording it.
+					o.setDB(ctx, d.ID, map[string]any{"state": DBaseCopy})
+				}
+				continue
+			}
+			if d.State == DPreparing && !o.Rebooted {
+				// The app stopped while preparing the launch, before the engine
+				// started: nothing was copied yet, so launch it again.
+				o.endAttempt(ctx, d, nil, "console restarted while preparing")
+				o.setDB(ctx, d.ID, map[string]any{"state": DPending, "last_error": "The console restarted while preparing this database; it is launched again."})
 				continue
 			}
 			if !o.Rebooted {

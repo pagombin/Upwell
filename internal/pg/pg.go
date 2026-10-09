@@ -161,7 +161,13 @@ func sessionPinned(ctx context.Context, c *pgx.Conn, at Conn) (bool, []int, erro
 	if err := probe(); err != nil {
 		return false, pids, err
 	}
-	if other, err := connect(ctx, at, 0); err == nil {
+	other, err := connect(ctx, at, 0)
+	if err != nil {
+		// Without the second connection a quiet pooler in transaction mode
+		// looks pinned, so this is not a confirmation.
+		return false, pids, fmt.Errorf("a second connection for the check failed: %w", Explain(err))
+	}
+	{
 		if tx, err := other.Begin(ctx); err == nil {
 			var pid int
 			if tx.QueryRow(ctx, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid) == nil && pid == pids[0] {

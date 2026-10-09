@@ -498,7 +498,10 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	// base copy: pgcopydb holds its snapshot in a transaction that stays idle
 	// for the whole copy, and a large table's COPY is one statement.
 	ms := map[string]int64{}
-	if tc, err := pg.Connect(ctx, e.Source, 0); err == nil {
+	var readErr error
+	if tc, err := pg.Connect(ctx, e.Source, 0); err != nil {
+		readErr = err
+	} else {
 		if rows, err := tc.Query(ctx, `SELECT name, setting::bigint FROM pg_settings WHERE name IN ('statement_timeout','idle_in_transaction_session_timeout','idle_session_timeout')`); err == nil {
 			for rows.Next() {
 				var n string
@@ -508,6 +511,25 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 				}
 			}
 			rows.Close()
+		} else {
+			readErr = err
+		}
+		// ALTER DATABASE ... SET and ALTER ROLE ... IN DATABASE ... SET apply
+		// only inside the migrated databases, not the maintenance database.
+		names := make([]string, 0, len(e.Databases))
+		for _, d := range e.Databases {
+			names = append(names, d.Source)
+		}
+		if cfgs, err := pg.QueryStrings(ctx, tc, `SELECT unnest(s.setconfig) FROM pg_db_role_setting s JOIN pg_database d ON d.oid=s.setdatabase
+			WHERE d.datname = ANY($1) AND s.setrole IN (0, (SELECT oid FROM pg_roles WHERE rolname=current_user))`, names); err == nil {
+			for _, kv := range cfgs {
+				k, v, _ := strings.Cut(kv, "=")
+				if k == "idle_session_timeout" {
+					if n := settingMillis(v); n > 0 && (ms[k] == 0 || n < ms[k]) {
+						ms[k] = n
+					}
+				}
+			}
 		}
 		tc.Close(ctx)
 	}
@@ -544,6 +566,8 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	ev = map[string]any{"timeouts_ms": ms, "_estimated_copy_seconds": copySecs, "_required_seconds": need, "cleared_by_engine": []string{"statement_timeout", "idle_in_transaction_session_timeout"}}
 	idleSess := float64(ms["idle_session_timeout"]) / 1000
 	switch {
+	case readErr != nil:
+		r.emit("session_timeouts", "", "", check.Warning, false, "Could not read the session timeouts that apply to engine sessions: "+readErr.Error(), "Run preflight again.", ev, t)
 	case idleSess > 0 && idleSess < need:
 		r.emit("session_timeouts", "", "", check.Blocker, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, shorter than %s (three times the estimated base copy, at least 6 hours). pgcopydb does not override it, so an engine connection waiting for others could be closed.%s", e.Source.User, humanDuration(idleSess), humanDuration(need), note),
 			"Clear it for the admin role (ALTER ROLE "+pg.QuoteIdent(e.Source.User)+" RESET idle_session_timeout) or accept the risk.", ev, t)
@@ -616,7 +640,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 
 	t = time.Now()
 	noRead, _ := pg.QueryStrings(ctx, sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p','S') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+		WHERE c.relkind IN ('r','p','S') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT has_table_privilege(c.oid,'SELECT') ORDER BY 1 LIMIT 50`)
 	if len(noRead) > 0 {
 		r.emit("read_privs", "", d.Source, check.Blocker, true, fmt.Sprintf("%s cannot read %d table(s) or sequence(s), for example %s.", e.Source.User, len(noRead), noRead[0]), "Grant SELECT on them to the admin user, or migrate as their owner.", map[string]any{"unreadable": noRead}, t)
@@ -640,7 +664,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 
 	t = time.Now()
 	noIdent, _ := pg.QueryStrings(ctx, sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')
 		ORDER BY 1 LIMIT 100`)
 	if len(noIdent) > 0 {
@@ -656,7 +680,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 
 	simple := []struct{ id, q, msg, fix string }{
 		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards.", "Avoid changing large objects during the migration, or re-copy them after cutover."},
-		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema')`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated."},
+		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated."},
 		{"materialized_views", `SELECT count(*) FROM pg_matviews`, "%d materialized view(s) are created but must be refreshed on the target after cutover.", "Refresh them after cutover (it is in the post-cutover checklist)."},
 		{"foreign_servers", `SELECT count(*) FROM pg_foreign_server`, "%d foreign server(s) need their user mappings and credentials re-created on the target.", "Re-create user mappings on the target after cutover."},
 		{"event_triggers", `SELECT count(*) FROM pg_event_trigger`, "%d event trigger(s) are not copied by the engine.", "Re-create them on the target after cutover."},
@@ -729,7 +753,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 	t = time.Now()
 	objQ := `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p','S','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' ORDER BY 1`
+		WHERE c.relkind IN ('r','p','S','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ORDER BY 1`
 	srcObjs, _ := pg.QueryStrings(ctx, sc, objQ)
 	var dstObjs []string
 	if tc != nil {
@@ -1095,4 +1119,28 @@ func orUnknown(s string) string {
 		return "an unknown address"
 	}
 	return s
+}
+
+// settingMillis parses a time setting as stored by ALTER ... SET ("5min",
+// "1h", "30000"); a bare number is milliseconds.
+func settingMillis(v string) int64 {
+	v = strings.Trim(strings.TrimSpace(v), "'")
+	units := []struct {
+		suf string
+		ms  float64
+	}{{"ms", 1}, {"min", 60000}, {"s", 1000}, {"h", 3600000}, {"d", 86400000}}
+	for _, u := range units {
+		if strings.HasSuffix(v, u.suf) {
+			f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(v, u.suf)), 64)
+			if err != nil {
+				return 0
+			}
+			return int64(f * u.ms)
+		}
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0
+	}
+	return int64(f)
 }

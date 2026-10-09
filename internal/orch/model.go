@@ -177,6 +177,8 @@ type Database struct {
 	RetryWindow  *int64  `json:"-"`
 	NextRetryAt  *int64  `json:"next_retry_at,omitempty"`
 	BaseCopyDone bool    `json:"base_copy_done"`
+	Drained      bool    `json:"drained"`
+	AutoRestarts int     `json:"auto_restarts"`
 	CreatedAt    int64   `json:"created_at"`
 	UpdatedAt    int64   `json:"updated_at"`
 	Progress     float64 `json:"progress,omitempty"`
@@ -297,7 +299,7 @@ func (o *Orchestrator) updateFlags(ctx context.Context, id string, fn func(*Flag
 const dbCols = `id, migration_id, source_name, target_name, include, COALESCE(skip_reason,''), state, slot_name, origin_name, COALESCE(plugin,''), instance,
 	COALESCE(size_bytes,0), COALESCE(rows_estimate,0), COALESCE(table_count,0), COALESCE(last_error,''), COALESCE(error_class,''), in_sync_since, backlog_bytes,
 	COALESCE(replay_lsn,''), COALESCE(write_lsn,''), COALESCE(hb_before_lsn,''), COALESCE(hb_token,''), COALESCE(endpos,''), COALESCE(origin_lsn,''), COALESCE(verdict,''),
-	retry_count, retry_window_start, next_retry_at, base_copy_done, created_at, updated_at`
+	retry_count, retry_window_start, next_retry_at, base_copy_done, created_at, updated_at, drained, auto_restarts`
 
 func scanDB(row interface{ Scan(...any) error }) (Database, error) {
 	var d Database
@@ -305,7 +307,7 @@ func scanDB(row interface{ Scan(...any) error }) (Database, error) {
 	err := row.Scan(&d.ID, &d.MigrationID, &d.SourceName, &d.TargetName, &d.Include, &d.SkipReason, &d.State, &d.SlotName, &d.OriginName, &d.Plugin, &d.Instance,
 		&d.SizeBytes, &d.RowsEstimate, &d.TableCount, &d.LastError, &d.ErrorClass, &inSync, &backlog,
 		&d.ReplayLSN, &d.WriteLSN, &d.HBBeforeLSN, &d.HBToken, &d.EndPos, &d.OriginLSN, &d.Verdict,
-		&d.RetryCount, &rw, &next, &d.BaseCopyDone, &d.CreatedAt, &d.UpdatedAt)
+		&d.RetryCount, &rw, &next, &d.BaseCopyDone, &d.CreatedAt, &d.UpdatedAt, &d.Drained, &d.AutoRestarts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, store.ErrNotFound
 	}
