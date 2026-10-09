@@ -3,10 +3,62 @@ package audit
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/pagombin/upwell/internal/store"
 )
+
+// Two store handles on one file stand in for the CLI and the service: their
+// appends must never collide on seq or break the chain.
+func TestConcurrentAppendAcrossHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.db")
+	st1, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st1.Close()
+	st2, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	logs := []*Log{{Store: st1}, {Store: st2}}
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := logs[i%2].Append(context.Background(), System, "test.append", "", nil, map[string]any{"i": i}); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	r, err := logs[0].Verify(context.Background())
+	if err != nil || !r.OK || r.Entries != 40 {
+		t.Fatalf("verify: %+v %v", r, err)
+	}
+}
+
+// A cancelled request context does not lose the entry.
+func TestAppendIgnoresCancel(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := (&Log{Store: st}).Append(ctx, System, "test.cancelled", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestChain(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "s.db"))

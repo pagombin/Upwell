@@ -7,8 +7,11 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"sync"
+	"time"
 
 	"github.com/pagombin/upwell/internal/store"
 )
@@ -32,7 +35,11 @@ type Entry struct {
 // Log appends entries.
 type Log struct {
 	Store *store.Store
-	mu    sync.Mutex
+	// OnError, when set, hears about an entry that could not be written after
+	// retries. Most callers ignore Append's error, so the failure is never
+	// silent: without OnError it goes to the standard logger (stderr).
+	OnError func(action string, err error)
+	mu      sync.Mutex
 }
 
 // Actor identifies who acted.
@@ -63,24 +70,55 @@ func toRaw(v any) json.RawMessage {
 	return b
 }
 
+const appendAttempts = 3
+
 // Append writes one entry. before and after are any JSON-able values (or nil).
+//
+// The next sequence number is read and the entry inserted inside one
+// immediate transaction, so a writer in another process (the CLI while the
+// service runs) cannot take the same seq. A failed attempt is retried a few
+// times. The entry is written even if ctx is cancelled (a client that
+// disconnects must not erase the record of what it did).
 func (l *Log) Append(ctx context.Context, a Actor, action, target string, before, after any) (Entry, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	ctx = context.WithoutCancel(ctx)
 	e := Entry{ID: store.NewID(), TS: store.Now(), UserID: a.UserID, Username: a.Username, IP: a.IP, Action: action, Target: target, Before: toRaw(before), After: toRaw(after)}
-	var prevSeq sql.NullInt64
-	var prevHash sql.NullString
-	if err := l.Store.DB.QueryRowContext(ctx, `SELECT seq, hash FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&prevSeq, &prevHash); err != nil && err != sql.ErrNoRows {
-		return e, err
+	var err error
+	for i := 0; i < appendAttempts; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * 100 * time.Millisecond)
+		}
+		if e, err = l.appendOnce(ctx, e); err == nil {
+			return e, nil
+		}
 	}
-	e.Seq = prevSeq.Int64 + 1
-	e.PrevHash = prevHash.String
-	if e.PrevHash == "" {
-		e.PrevHash = "genesis"
+	err = fmt.Errorf("audit entry %s not written: %w", action, err)
+	if l.OnError != nil {
+		l.OnError(action, err)
+	} else {
+		log.Print(err)
 	}
-	e.Hash = digest(e)
-	_, err := l.Store.DB.ExecContext(ctx, `INSERT INTO audit_log(seq,id,ts,user_id,username,ip,action,target,before,after,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		e.Seq, e.ID, e.TS, store.NullString(e.UserID), store.NullString(e.Username), store.NullString(e.IP), e.Action, e.Target, nullRaw(e.Before), nullRaw(e.After), e.PrevHash, e.Hash)
+	return e, err
+}
+
+func (l *Log) appendOnce(ctx context.Context, e Entry) (Entry, error) {
+	err := l.Store.Immediate(ctx, func(c *sql.Conn) error {
+		var prevSeq sql.NullInt64
+		var prevHash sql.NullString
+		if err := c.QueryRowContext(ctx, `SELECT seq, hash FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&prevSeq, &prevHash); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		e.Seq = prevSeq.Int64 + 1
+		e.PrevHash = prevHash.String
+		if e.PrevHash == "" {
+			e.PrevHash = "genesis"
+		}
+		e.Hash = digest(e)
+		_, err := c.ExecContext(ctx, `INSERT INTO audit_log(seq,id,ts,user_id,username,ip,action,target,before,after,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			e.Seq, e.ID, e.TS, store.NullString(e.UserID), store.NullString(e.Username), store.NullString(e.IP), e.Action, e.Target, nullRaw(e.Before), nullRaw(e.After), e.PrevHash, e.Hash)
+		return err
+	})
 	return e, err
 }
 
