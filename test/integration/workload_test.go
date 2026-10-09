@@ -142,7 +142,9 @@ func TestPreflightIdentityFullTypes(t *testing.T) {
 	e := newEnv(t, "", orch.TestHooks{})
 	db := uniq("it_idfull")
 	seedDB(t, db, 100)
-	exec1(t, srcConn, db, `CREATE TABLE docs(body json, at point); ALTER TABLE docs REPLICA IDENTITY FULL;`)
+	exec1(t, srcConn, db, `CREATE TABLE docs(body json, at point); ALTER TABLE docs REPLICA IDENTITY FULL;
+		CREATE TABLE tenant_rows(id int PRIMARY KEY, tenant text); ALTER TABLE tenant_rows ENABLE ROW LEVEL SECURITY; ALTER TABLE tenant_rows FORCE ROW LEVEL SECURITY;
+		CREATE POLICY only_a ON tenant_rows USING (tenant = 'a');`)
 	id := e.defineMigration("Identity full types", []string{db}, nil)
 	pv := e.preflight(id)
 	found := false
@@ -154,6 +156,16 @@ func TestPreflightIdentityFullTypes(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no hard blocker for json and point columns under REPLICA IDENTITY FULL")
+	}
+	rlsFound := false
+	for _, r := range pv.Results {
+		if r.CheckID == "row_security" {
+			t.Logf("preflight %s: %s hard=%v %s", r.CheckID, r.Level, r.Hard, r.Message)
+			rlsFound = r.Level == "blocker" && r.Hard && strings.Contains(r.Message, "tenant_rows")
+		}
+	}
+	if !rlsFound {
+		t.Fatal("no hard blocker for row-level security that hides rows from the admin user")
 	}
 	if c := e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil); c < 400 {
 		t.Fatalf("start accepted (%d)", c)

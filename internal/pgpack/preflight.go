@@ -89,6 +89,7 @@ var Catalog = []check.Definition{
 	cd("read_privs", check.ScopeDatabase, "Read access to every table", "hard"),
 	cd("publication_privs", check.ScopeDatabase, "Decoding plugin", "hard"),
 	cd("replica_identity", check.ScopeDatabase, "Updates and deletes can replay", "hard"),
+	cd("row_security", check.ScopeDatabase, "Every row is readable (row-level security)", "hard"),
 	cd("identity_full_types", check.ScopeDatabase, "Full replica identity on comparable columns", "hard"),
 	cd("identity_full_duplicates", check.ScopeDatabase, "Full replica identity without a unique key", "warning"),
 	cd("large_objects", check.ScopeDatabase, "Large objects", "warning"),
@@ -678,6 +679,21 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent}, t)
 	} else {
 		ok(r, "replica_identity", "", d.Source, "Every table can replay updates and deletes.", map[string]any{"tables": []string{}}, t)
+	}
+
+	// Row-level security that applies to the admin user: the engine's COPY
+	// would return only the rows its policies allow, silently.
+	t = time.Now()
+	rls, _ := pg.QueryStrings(ctx, sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE c.relkind IN ('r','p') AND c.relrowsecurity AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		AND NOT (SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname=current_user)
+		AND (c.relforcerowsecurity OR NOT pg_has_role(c.relowner, 'USAGE'))
+		ORDER BY 1 LIMIT 100`)
+	if len(rls) > 0 {
+		r.emit("row_security", "", d.Source, check.Blocker, true, fmt.Sprintf("%d table(s) have row-level security that applies to %s (for example %s): the copy would contain only the rows its policies allow, and verification cannot read them all.", len(rls), e.Source.User, rls[0]),
+			"Disable or relax the policies for the migration (ALTER TABLE ... NO FORCE ROW LEVEL SECURITY when the admin user owns the table), or migrate with a user that bypasses row-level security.", map[string]any{"tables": rls}, t)
+	} else {
+		ok(r, "row_security", "", d.Source, "No row-level security hides rows from the migration.", map[string]any{}, t)
 	}
 
 	// REPLICA IDENTITY FULL: the engine finds the old row by comparing every
