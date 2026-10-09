@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pagombin/upwell/internal/audit"
@@ -47,7 +48,15 @@ type Server struct {
 	mux    *http.ServeMux
 	routes []route
 	static fs.FS
+	// loginLimit bounds sign-in and setup attempts per client IP.
+	loginLimit *auth.RateLimiter
 }
+
+// Sign-in attempts allowed per client IP: a burst of 10, refilled over a minute.
+const (
+	loginBurst  = 10
+	loginPeriod = time.Minute
+)
 
 // TLSInfo describes the serving certificate.
 type TLSInfo struct {
@@ -91,6 +100,9 @@ func badRequest(msg string) error { return apiErr(400, "bad_request", msg, "") }
 func New(s *Server) *Server {
 	s.mux = http.NewServeMux()
 	s.static = webui.FS()
+	if s.loginLimit == nil {
+		s.loginLimit = auth.NewRateLimiter(loginBurst, loginPeriod)
+	}
 	s.register()
 	return s
 }
@@ -168,7 +180,58 @@ func (c *capture) Flush() {
 	}
 }
 
-var idemLocks sync.Map // idempotency key -> *sync.Mutex
+// idemLocks serializes requests that share an idempotency key. Entries are
+// reference-counted and removed when the last holder releases them, so the
+// map never grows and a waiter always shares the holder's mutex.
+var idemLocks = struct {
+	sync.Mutex
+	m map[string]*idemLock
+}{m: map[string]*idemLock{}}
+
+type idemLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func lockIdem(key string) func() {
+	idemLocks.Lock()
+	l := idemLocks.m[key]
+	if l == nil {
+		l = &idemLock{}
+		idemLocks.m[key] = l
+	}
+	l.refs++
+	idemLocks.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		idemLocks.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(idemLocks.m, key)
+		}
+		idemLocks.Unlock()
+	}
+}
+
+// idemScope makes an idempotency key private to the user who sent it, so
+// one user can neither replay nor block another user's request.
+func idemScope(userID, key string) string { return userID + ":" + key }
+
+// idemRetention is how long a stored idempotent response is replayed.
+const idemRetention = 24 * time.Hour
+
+var lastIdemPrune atomic.Int64
+
+// pruneIdem deletes expired idempotency rows, at most once a minute.
+func (s *Server) pruneIdem(ctx context.Context) {
+	now := time.Now()
+	last := lastIdemPrune.Load()
+	if now.UnixMilli()-last < time.Minute.Milliseconds() || !lastIdemPrune.CompareAndSwap(last, now.UnixMilli()) {
+		return
+	}
+	s.Store.DB.ExecContext(ctx, `DELETE FROM idempotency WHERE created_at < ?`, now.Add(-idemRetention).UnixMilli())
+}
 
 func (s *Server) wrap(rt route) http.HandlerFunc {
 	mutating := rt.Method != http.MethodGet && rt.Method != http.MethodHead
@@ -202,7 +265,7 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			r = r.WithContext(context.WithValue(r.Context(), sessKey, sess))
 		}
 		key := r.Header.Get("Idempotency-Key")
-		var bodyHash string
+		var bodyHash, scoped string
 		if mutating && !rt.noIdem {
 			if key == "" {
 				writeErr(w, apiErr(400, "idempotency_key_required", "Every change needs an Idempotency-Key header so repeated submissions act once.", ""))
@@ -212,9 +275,12 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 				writeErr(w, badRequest("Idempotency-Key is too long."))
 				return
 			}
-			lk, _ := idemLocks.LoadOrStore(key, &sync.Mutex{})
-			mu := lk.(*sync.Mutex)
-			mu.Lock()
+			scoped = idemScope(session(r).User.ID, key)
+			// Hold the key's lock for the whole request so a concurrent
+			// duplicate waits, then replays the stored answer, or runs the
+			// request itself when the first attempt stored none (a 5xx).
+			unlock := lockIdem(scoped)
+			defer unlock()
 			// Hash the request body so a reused key with another request is refused.
 			reqBody, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 			r.Body = io.NopCloser(bytes.NewReader(reqBody))
@@ -222,31 +288,33 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			bodyHash = hex.EncodeToString(sum[:])
 			var status int
 			var body, prevHash string
-			err := s.Store.DB.QueryRowContext(r.Context(), `SELECT status, response, body_hash FROM idempotency WHERE key=?`, key).Scan(&status, &body, &prevHash)
+			err := s.Store.DB.QueryRowContext(r.Context(), `SELECT status, response, body_hash FROM idempotency WHERE key=? AND created_at >= ?`,
+				scoped, time.Now().Add(-idemRetention).UnixMilli()).Scan(&status, &body, &prevHash)
 			if err == nil && prevHash != "" && prevHash != bodyHash {
-				mu.Unlock()
 				writeErr(w, apiErr(422, "idempotency_key_reused", "This Idempotency-Key was already used for a different request.", "Send a new key for a new request."))
 				return
 			}
 			if err == nil {
-				mu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Idempotent-Replay", "true")
 				w.WriteHeader(status)
 				io.WriteString(w, body)
 				return
 			}
-			// Hold the key's lock for the whole request so a concurrent duplicate waits and replays.
-			defer func() { mu.Unlock(); idemLocks.Delete(key) }()
 		}
 		cw := &capture{ResponseWriter: w, stream: strings.Contains(rt.Path, "/stream/")}
 		err := rt.h(cw, r)
 		if err != nil {
 			writeErr(cw, err)
 		}
+		// 5xx answers are not stored: a retry (or a waiting duplicate) runs
+		// the request again rather than replaying a failure.
 		if mutating && !rt.noIdem && cw.status < 500 && cw.status != 0 {
-			s.Store.DB.ExecContext(context.Background(), `INSERT OR IGNORE INTO idempotency(key,user_id,method,path,status,response,created_at,body_hash) VALUES (?,?,?,?,?,?,?,?)`,
-				key, session(r).User.ID, r.Method, r.URL.Path, cw.status, cw.buf.String(), store.Now(), bodyHash)
+			s.pruneIdem(context.Background())
+			// The key's lock is held and no live row exists, so replacing
+			// only ever overwrites an expired row.
+			s.Store.DB.ExecContext(context.Background(), `INSERT OR REPLACE INTO idempotency(key,user_id,method,path,status,response,created_at,body_hash) VALUES (?,?,?,?,?,?,?,?)`,
+				scoped, session(r).User.ID, r.Method, r.URL.Path, cw.status, cw.buf.String(), store.Now(), bodyHash)
 		}
 		if !strings.Contains(rt.Path, "/stream/") {
 			lvl := "debug"

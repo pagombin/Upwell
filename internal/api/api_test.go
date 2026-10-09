@@ -68,9 +68,9 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 
 func newClient(t *testing.T, srv *httptest.Server) *client {
 	jar, _ := cookiejar.New(nil)
-	c := srv.Client()
+	c := *srv.Client() // a copy: srv.Client() is shared, and each client needs its own cookie jar
 	c.Jar = jar
-	return &client{t: t, srv: srv, c: c}
+	return &client{t: t, srv: srv, c: &c}
 }
 
 func (c *client) req(method, path, key string, body any) (int, map[string]any, string) {
@@ -201,6 +201,94 @@ func TestIdempotentReplay(t *testing.T) {
 	// A different body under a used key is refused rather than silently replayed.
 	if code, m, _ := c.req("POST", "/api/v1/migrations", "same-key", map[string]any{"name": "Other"}); code != 422 || m["code"] != "idempotency_key_reused" {
 		t.Fatalf("reused key with another body: %d %v", code, m)
+	}
+}
+
+// Idempotency keys are private to each user: the same key from another user
+// runs that user's own request instead of replaying someone else's answer.
+func TestIdempotencyKeysArePerUser(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	a.login("admin", pw)
+	a.req("POST", "/api/v1/users", k(), map[string]any{"username": "op", "password": pw, "role": "operator"})
+	o := newClient(t, srv)
+	o.login("op", pw)
+	codeA, _, rawA := a.req("POST", "/api/v1/migrations", "shared-key", map[string]any{"name": "From admin"})
+	codeO, _, rawO := o.req("POST", "/api/v1/migrations", "shared-key", map[string]any{"name": "From operator"})
+	if codeA != 201 || codeO != 201 || rawA == rawO {
+		t.Fatalf("same key, two users: %d %s / %d %s", codeA, rawA, codeO, rawO)
+	}
+	_, _, raw := a.req("GET", "/api/v1/migrations", "", nil)
+	if !strings.Contains(raw, "From admin") || !strings.Contains(raw, "From operator") {
+		t.Fatalf("migrations: %s", raw)
+	}
+	idemLocks.Lock()
+	left := len(idemLocks.m)
+	idemLocks.Unlock()
+	if left != 0 {
+		t.Fatalf("%d idempotency lock entries left behind", left)
+	}
+}
+
+func TestUserPatchSemantics(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	a.login("admin", pw)
+	_, u, _ := a.req("POST", "/api/v1/users", k(), map[string]any{"username": "eve", "password": pw, "role": "viewer"})
+	id := u["id"].(string)
+	path := "/api/v1/users/" + id
+	if code, m, _ := a.req("PATCH", path, k(), map[string]any{"disabled": true}); code != 200 || m["disabled"] != true || m["role"] != "viewer" {
+		t.Fatalf("disable: %d %v", code, m)
+	}
+	// A PATCH without "disabled" leaves the user disabled.
+	if code, m, _ := a.req("PATCH", path, k(), map[string]any{"role": "operator"}); code != 200 || m["disabled"] != true || m["role"] != "operator" {
+		t.Fatalf("role only: %d %v", code, m)
+	}
+	// A bad password is refused before the role is applied.
+	if code, _, _ := a.req("PATCH", path, k(), map[string]any{"role": "admin", "password": "short"}); code != 400 {
+		t.Fatalf("short password: %d", code)
+	}
+	if _, m, _ := a.req("PATCH", path, k(), map[string]any{}); m["role"] != "operator" {
+		t.Fatalf("role changed by a refused PATCH: %v", m)
+	}
+	// Removing your own Admin role is refused; resetting your own password keeps you signed in.
+	_, me, _ := a.req("GET", "/api/v1/auth/me", "", nil)
+	selfPath := "/api/v1/users/" + me["user"].(map[string]any)["id"].(string)
+	if code, _, _ := a.req("PATCH", selfPath, k(), map[string]any{"role": "viewer"}); code != 400 {
+		t.Fatalf("self demotion: %d", code)
+	}
+	if code, _, raw := a.req("PATCH", selfPath, k(), map[string]any{"password": "a-new-long-password"}); code != 200 {
+		t.Fatalf("self password reset: %d %s", code, raw)
+	}
+	if code, _, _ := a.req("GET", "/api/v1/users", "", nil); code != 200 {
+		t.Fatalf("signed out by own reset: %d", code)
+	}
+	_, _, raw := a.req("GET", "/api/v1/audit?action=user.update", "", nil)
+	if n := strings.Count(raw, `"action":"user.update"`); n != 4 {
+		t.Fatalf("user.update audit entries: %d (%s)", n, raw)
+	}
+}
+
+func TestLoginFailedAuditAndRateLimit(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	x := newClient(t, srv)
+	x.req("POST", "/api/v1/auth/login", "-", map[string]any{"username": "my-secret-password", "password": "x"})
+	x.req("POST", "/api/v1/auth/login", "-", map[string]any{"username": "admin", "password": "wrong"})
+	a.login("admin", pw)
+	_, _, raw := a.req("GET", "/api/v1/audit?action=auth.login_failed", "", nil)
+	if strings.Contains(raw, "my-secret-password") || !strings.Contains(raw, `"target":"unknown:`) || !strings.Contains(raw, `"target":"admin"`) {
+		t.Fatalf("login_failed entries: %s", raw)
+	}
+	// 4 attempts so far from this address (setup, 2 failures, 1 sign-in); the 11th is refused.
+	for i := 0; i < 6; i++ {
+		x.req("POST", "/api/v1/auth/login", "-", map[string]any{"username": "admin", "password": "wrong"})
+	}
+	if code, m, _ := x.req("POST", "/api/v1/auth/login", "-", map[string]any{"username": "admin", "password": pw}); code != 429 {
+		t.Fatalf("11th attempt: %d %v", code, m)
 	}
 }
 
