@@ -124,3 +124,6 @@ At most four Argon2id checks run at once (each takes 64 MiB) and each client add
 
 ## D41. Row-level security that applies to the admin user is a hard blocker
 pgcopydb copies with the admin user's own rights, so a table whose row-level security policies apply to that user (FORCE ROW LEVEL SECURITY, or a table it does not own, without BYPASSRLS) would be copied with only the rows the policies allow, silently. Verification already fails closed on it (row_security off makes the query error), but preflight now says so before anything is copied.
+
+## D42. The engine version is read as packages report it
+The PGDG package reports `pgcopydb version 0.18-1.pgdg24.04+1`. Preflight split that on dots, read the minor version "18-1" as 0, and hard-blocked the droplet's correct pgcopydb 0.18 as "older than 0.18". The version is now read as its leading major.minor; an unreadable version is a blocker that says so. The build container uses a source build ("0.18"), which is why the tests never saw this.
