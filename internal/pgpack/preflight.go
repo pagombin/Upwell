@@ -262,14 +262,11 @@ func (r *Runner) hostChecks(ctx context.Context) {
 	}
 	t = time.Now()
 	if e.EngineErr == nil {
-		parts := strings.SplitN(e.EngineVersion, ".", 3)
-		maj, _ := strconv.Atoi(parts[0])
-		min := 0
-		if len(parts) > 1 {
-			min, _ = strconv.Atoi(parts[1])
-		}
-		ev := map[string]any{"version": e.EngineVersion}
-		if maj == 0 && min < 18 {
+		maj, min, parsed := EngineMajorMinor(e.EngineVersion)
+		ev := map[string]any{"version": e.EngineVersion, "major": maj, "minor": min}
+		if !parsed {
+			r.emit("engine_version", "", "", check.Blocker, true, "Upwell could not read the pgcopydb version from \""+e.EngineVersion+"\".", "Run install.sh again; it installs pgcopydb 0.18.", ev, t)
+		} else if maj == 0 && min < 18 {
 			r.emit("engine_version", "", "", check.Blocker, true, "pgcopydb "+e.EngineVersion+" has a known change-apply bug (exit 12) and cannot run online migrations.", "Install pgcopydb 0.18 or later with install.sh.", ev, t)
 		} else {
 			ok(r, "engine_version", "", "", "pgcopydb "+e.EngineVersion+" supports online migrations up to PostgreSQL 18.", ev, t)
@@ -1189,4 +1186,20 @@ func settingMillis(v string) int64 {
 		return 0
 	}
 	return int64(f)
+}
+
+var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
+
+// EngineMajorMinor reads the leading major.minor of a pgcopydb version as
+// packages report it: "0.18", "0.18.1", or the PGDG package's
+// "0.18-1.pgdg24.04+1" (the Debian revision after the dash is not part of
+// the release).
+func EngineMajorMinor(v string) (major, minor int, ok bool) {
+	m := engineVersionRe.FindStringSubmatch(strings.TrimSpace(v))
+	if m == nil {
+		return 0, 0, false
+	}
+	major, _ = strconv.Atoi(m[1])
+	minor, _ = strconv.Atoi(m[2])
+	return major, minor, true
 }
