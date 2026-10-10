@@ -32,3 +32,15 @@ func TestSettingMillis(t *testing.T) {
 		}
 	}
 }
+
+func TestToolMajorRegexp(t *testing.T) {
+	for in, want := range map[string]string{
+		"pg_dump (PostgreSQL) 18.0 (Ubuntu 18.0-1.pgdg24.04+1)\n": "18",
+		"pg_restore (PostgreSQL) 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)": "16",
+		"pg_dump (PostgreSQL) 18.6": "18",
+	} {
+		if m := majorRe.FindStringSubmatch(in); m == nil || m[1] != want {
+			t.Errorf("%q: %v, want %s", in, m, want)
+		}
+	}
+}
