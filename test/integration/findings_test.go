@@ -5,6 +5,7 @@ package integration
 import (
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/pagombin/upwell/internal/orch"
@@ -67,4 +68,37 @@ func TestPreflightCountsAndQuoting(t *testing.T) {
 	if !strings.Contains(got["read_privs"], `public."Hidden_`) {
 		t.Errorf("read_privs does not quote mixed-case names: %q", got["read_privs"])
 	}
+}
+
+// TestPlanErrorStopsEndPositions (audit finding 8): the end-position step
+// ignored Plan's error and went on with a zero plan (no work directory).
+// It must stop before any end position is set, with the error.
+func TestPlanErrorStopsEndPositions(t *testing.T) {
+	var broken atomic.Bool
+	hook := func(string) []string {
+		if broken.Load() {
+			return []string{"--port", "1"} // Plan refuses the coordinator flags (PC12)
+		}
+		return nil
+	}
+	e := newEnv(t, "", orch.TestHooks{ExtraEngineArgs: hook})
+	db := uniq("it_plan")
+	id := streamingMigration(t, e, "Plan error", db)
+	setSetting(t, e, "cutover_drain_timeout_seconds", 120)
+	broken.Store(true)
+	op := e.cutoverOp(id, map[string]any{"confirm_writers_stopped": true})
+	broken.Store(false)
+	t.Logf("operation %s: %s", op.State, op.Error)
+	for _, s := range op.Steps {
+		t.Logf("step %-10s %-8s %s", s.Key, s.State, s.Detail)
+	}
+	if op.State != "failed" || !strings.Contains(op.Error, "coordinator") {
+		t.Fatalf("the cutover did not stop on the plan error: %s %q", op.State, op.Error)
+	}
+	for _, d := range e.migration(id).Databases {
+		if d.EndPos != "" {
+			t.Fatalf("an end position was set (%s) although the plan failed", d.EndPos)
+		}
+	}
+	e.abortAndClean(id, "Plan error")
 }

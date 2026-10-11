@@ -227,6 +227,7 @@ func OriginProgress(ctx context.Context, c pg.Conn, origin string) (string, erro
 	}
 	return *lsn, nil
 }
+
 // TargetDB says how a target database was created.
 type TargetDB struct {
 	Created  bool

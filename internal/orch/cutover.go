@@ -496,6 +496,24 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			return
 		}
 	}
+	// Every database's engine command must be known before the point of no
+	// return: a plan error stops the cutover with streaming intact (D55).
+	plans := map[string]engine.RunPlan{}
+	specs := map[string]engine.DatabaseSpec{}
+	for _, d := range dbs {
+		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+		spec, err := o.dbSpec(bg, m, cur)
+		if err == nil {
+			var plan engine.RunPlan
+			if plan, err = o.eng.Plan(spec, true); err == nil {
+				plans[d.ID], specs[d.ID] = plan, spec
+			}
+		}
+		if err != nil {
+			fail("endpos", fmt.Errorf("%s: the engine command could not be prepared, so no end position was set and streaming continues: %w", d.SourceName, err))
+			return
+		}
+	}
 	// Check-and-set against an abort racing this step: only the cutover
 	// that is still current, and not cancelled, may move past the point of
 	// no return.
@@ -514,14 +532,8 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	op.StepStart("endpos", "")
 	for _, d := range dbs {
 		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
-		spec, err := o.dbSpec(bg, m, cur)
-		if err != nil {
-			op.StepEnd("endpos", "failed", err.Error())
-			o.finishCutover(bg, m, op, a, err)
-			return
-		}
+		spec, plan := specs[d.ID], plans[d.ID]
 		if cur.EndPos == "" {
-			plan, _ := o.eng.Plan(spec, true)
 			lsn, err := o.eng.SetEndPosition(bg, plan, spec)
 			if err != nil {
 				op.StepEnd("endpos", "failed", fmt.Sprintf("%s: %v", d.SourceName, err))

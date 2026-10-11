@@ -39,7 +39,9 @@ type Log struct {
 	// retries. Most callers ignore Append's error, so the failure is never
 	// silent: without OnError it goes to the standard logger (stderr).
 	OnError func(action string, err error)
-	mu      sync.Mutex
+	// FailWith, set only by tests, makes appending action fail with its error.
+	FailWith func(action string) error
+	mu       sync.Mutex
 }
 
 // Actor identifies who acted.
@@ -103,6 +105,11 @@ func (l *Log) Append(ctx context.Context, a Actor, action, target string, before
 }
 
 func (l *Log) appendOnce(ctx context.Context, e Entry) (Entry, error) {
+	if l.FailWith != nil {
+		if err := l.FailWith(e.Action); err != nil {
+			return e, err
+		}
+	}
 	err := l.Store.Immediate(ctx, func(c *sql.Conn) error {
 		var prevSeq sql.NullInt64
 		var prevHash sql.NullString

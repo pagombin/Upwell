@@ -151,7 +151,11 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	if err != nil {
 		return
 	}
-	plan, _ := o.eng.Plan(spec, d.BaseCopyDone)
+	plan, perr := o.eng.Plan(spec, d.BaseCopyDone)
+	if perr != nil {
+		o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "engine command could not be prepared, skipping this check: %v", perr)
+		return
+	}
 	// New log lines: classify since the attempt started.
 	o.tails.attach(m.ID, d.SourceName, plan.LogFile, o.attemptNumber(ctx, d.ID))
 	classes := o.tails.poll(m.ID, d.SourceName)

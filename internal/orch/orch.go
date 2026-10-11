@@ -60,6 +60,8 @@ type TestHooks struct {
 	// AfterVerify runs after each database's data comparison, before the
 	// verdict is stored.
 	AfterVerify func(ctx context.Context, db Database)
+	// FailVerificationStore makes storing verification results fail.
+	FailVerificationStore bool
 }
 
 // Deps bundles constructor arguments.

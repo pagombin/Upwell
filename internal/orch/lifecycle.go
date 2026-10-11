@@ -780,7 +780,13 @@ func (o *Orchestrator) stopUnit(ctx context.Context, m Migration, d Database) (e
 	if err != nil {
 		return engine.StopResult{}, err
 	}
-	plan, _ := o.eng.Plan(spec, d.BaseCopyDone)
+	plan, perr := o.eng.Plan(spec, d.BaseCopyDone)
+	if perr != nil {
+		// Stopping needs only the unit: never stop "no unit" because the full
+		// engine command could not be prepared (D55).
+		o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "engine command could not be prepared (%v); stopping the unit by name", perr)
+		plan = engine.RunPlan{Instance: spec.Instance, Unit: o.run.UnitName(spec.Instance)}
+	}
 	res, err := o.eng.Stop(ctx, plan, spec)
 	if err == nil {
 		o.logf("info", "orchestrator", m.ID, d.SourceName, "", "unit stopped in %s; slot released after %s (walsender terminated: %v)", res.Duration.Round(time.Millisecond), res.SlotReleaseWaited.Round(time.Millisecond), res.WalsenderKilled)
