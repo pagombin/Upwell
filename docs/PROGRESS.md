@@ -1,6 +1,24 @@
 # Upwell overnight build: progress
 
-Branch `overnight-build`. Status legend: **done**; **partial** (what is missing is stated); **needs droplet** (implemented to spec and tested as far as a container allows, but it needs systemd as PID 1, a real DigitalOcean cluster or a DO account to prove); **stub** (labelled "Coming soon" in the UI, never a dead button).
+## Final regression (bug bash 12), 2026-10-11
+
+Run from a fresh clone of `origin/overnight-build-2` at `ed3470b` (the only later commit changes one README line), by `regress.sh`: every step must pass, and the clusters are checked for leftovers afterwards. **Overall: pass (exit 0).**
+
+| Step | Result | Time |
+| --- | --- | --- |
+| `go build ./...` | pass | 4 s |
+| `go vet` (plus the integration tag) | pass | 1 s |
+| `staticcheck` (plus the integration tag) | pass, 0 findings | 4 s |
+| `golangci-lint` (plus the integration tag) | pass, 0 findings | 21 s |
+| `go test -race -count=1 ./...` | pass | 15 s |
+| `shellcheck -S warning` on deploy, dev and spikes scripts | pass | 1 s |
+| `npm ci`, `npm audit`, `tsc --noEmit`, `eslint src e2e` | pass, 0 vulnerabilities | 11 s |
+| Integration suite (`-tags integration`, local clusters PG14, 15, 16 and 18) | pass: 58 tests, 0 failures, 1 skipped (`TestApplyThroughput`, a 15-minute measurement run only with `UPWELL_MEASURE=1`); includes `TestVersionMatrix` (PG14, 15, 16, 18), `TestOfflineWithFreeze`, `TestReadinessFailsClosed`, `TestRedactionCanaries` | 75 min |
+| `dev/e2e.sh` (Playwright 1.56.1, Chromium) | pass: UI 229/229, walkthrough 4/4, features 12/12; visual baseline unchanged from `ed3470b` | 12 min |
+| Leftovers | 0 replication slots on either source, 0 replication origins on any target, 0 `it_` or `upwell_rate_` databases; the four `e2e_*` databases are the browser-test fixtures, dropped and re-created at the start of every `dev/e2e.sh` run | |
+
+
+Branch `overnight-build` (the first build; the second is above, on `overnight-build-2`). Status legend: **done**; **partial** (what is missing is stated); **needs droplet** (implemented to spec and tested as far as a container allows, but it needs systemd as PID 1, a real DigitalOcean cluster or a DO account to prove); **stub** (labelled "Coming soon" in the UI, never a dead button).
 
 ## Overnight build 2 (2026-10-11): the audit of 643e4c1
 
