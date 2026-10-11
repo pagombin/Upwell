@@ -24,6 +24,18 @@ type Condition struct {
 	OK       bool   `json:"ok"`
 	Detail   string `json:"detail"`
 	Database string `json:"database,omitempty"`
+	// SampleAgeMS is how old the measurement behind the condition is (nil
+	// when it is not a measurement).
+	SampleAgeMS *int64 `json:"sample_age_ms,omitempty"`
+}
+
+func ageMS(at time.Time) *int64 {
+	ms := time.Since(at).Milliseconds()
+	return &ms
+}
+
+func ago(at time.Time) string {
+	return humanDuration(time.Since(at).Seconds()) + " ago"
 }
 
 // Readiness evaluates the cutover readiness gate.
@@ -61,25 +73,56 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 		// Lag in time, from the heartbeat: bytes of backlog can hide a long
 		// apply (pgcopydb applies a few transactions a second, F11), and the
 		// write pause lasts at least as long as the target is behind.
+		// Measurements older than three collection intervals no longer count:
+		// a collector that cannot reach a cluster must not leave the last good
+		// value green (D50).
+		iv := max(o.globalSettings(ctx).Int("sample_interval_seconds"), 5)
+		lagMaxAge := time.Duration(3*max(10, iv)) * time.Second
+		driftMaxAge := time.Duration(3*max(60, iv)) * time.Second
 		if v.Bool("heartbeat") {
 			maxLag := float64(o.globalSettings(ctx).Int("cutover_max_lag_seconds"))
 			lc := Condition{Key: "lag", Label: d.SourceName + " target lag", Database: d.SourceName}
-			if lag, ok := o.LastValue(m.ID, d.SourceName, "heartbeat_latency_s"); !ok {
+			lag, at, ok := o.metrics.LastAt(m.ID, d.SourceName, "heartbeat_latency_s")
+			switch {
+			case !ok:
 				lc.Detail = "Not measured yet: waiting for the heartbeat to reach the target"
-			} else if lag > maxLag {
-				lc.Detail = fmt.Sprintf("The target is %s behind (limit %s); the write pause would last at least that long", humanDuration(lag), humanDuration(maxLag))
-			} else {
+			case time.Since(at) > lagMaxAge:
+				lc.SampleAgeMS = ageMS(at)
+				lc.Detail = fmt.Sprintf("Not measured for %s (last measured %s, when the target was %s behind): Upwell may not be able to reach the source or the target", humanDuration(time.Since(at).Seconds()), ago(at), humanDuration(lag))
+			case lag > maxLag:
+				lc.SampleAgeMS = ageMS(at)
+				lc.Detail = fmt.Sprintf("The target is %s behind (limit %s); the write pause would last at least that long (measured %s)", humanDuration(lag), humanDuration(maxLag), ago(at))
+			default:
+				lc.SampleAgeMS = ageMS(at)
 				lc.OK = true
-				lc.Detail = fmt.Sprintf("The target is %s behind", humanDuration(lag))
+				lc.Detail = fmt.Sprintf("The target is %s behind (measured %s)", humanDuration(lag), ago(at))
 			}
 			out = append(out, lc)
 		}
 		// DDL is not streamed: a schema changed on the source ends NO-GO at
-		// verification, so refuse the cutover now and say why.
-		sc := Condition{Key: "schema", Label: d.SourceName + " schema unchanged", Database: d.SourceName, OK: true, Detail: "Same tables, columns and enum values on both sides"}
-		if drift := o.metrics.Drift(d.ID); len(drift) > 0 {
-			sc.OK = false
-			sc.Detail = "Changed on the source: " + strings.Join(limitStrings(drift, 3), "; ")
+		// verification, so refuse the cutover now and say why. A comparison
+		// that has not run, failed, or is too old is not a pass.
+		sc := Condition{Key: "schema", Label: d.SourceName + " schema unchanged", Database: d.SourceName}
+		drift, at, derr := o.metrics.DriftSample(d.ID)
+		if !at.IsZero() {
+			sc.SampleAgeMS = ageMS(at)
+		}
+		switch {
+		case derr != nil:
+			last := "never compared"
+			if !at.IsZero() {
+				last = "last compared " + ago(at)
+			}
+			sc.Detail = fmt.Sprintf("Could not compare the schemas: %v (%s)", derr, last)
+		case at.IsZero():
+			sc.Detail = "Not compared yet: the first comparison runs within a minute of the base copy finishing"
+		case time.Since(at) > driftMaxAge:
+			sc.Detail = fmt.Sprintf("Not compared for %s (last compared %s)", humanDuration(time.Since(at).Seconds()), ago(at))
+		case len(drift) > 0:
+			sc.Detail = "Changed on the source: " + strings.Join(limitStrings(drift, 3), "; ") + " (compared " + ago(at) + ")"
+		default:
+			sc.OK = true
+			sc.Detail = "Same tables, columns and enum values on both sides (compared " + ago(at) + ")"
 		}
 		out = append(out, sc)
 	}

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/pagombin/upwell/internal/pg"
 	"github.com/pagombin/upwell/internal/pgpack"
 	"github.com/pagombin/upwell/internal/store"
@@ -29,7 +31,16 @@ type collector struct {
 	stale     map[string]int
 	last      map[string]float64
 	lastWrite time.Time
-	drift     map[string][]string // database ID -> schema differences seen while streaming
+	drift     map[string]driftSample // database ID -> last schema comparison while streaming
+	lastAt    map[string]time.Time   // when each series was last sampled
+}
+
+// driftSample is one schema comparison: its differences, or the error that
+// stopped it, and when.
+type driftSample struct {
+	diff []string
+	err  error
+	at   time.Time
 }
 
 type prevSample struct {
@@ -38,7 +49,7 @@ type prevSample struct {
 }
 
 func newCollector(o *Orchestrator) *collector {
-	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string][]string{}}
+	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, lastAt: map[string]time.Time{}}
 }
 
 func (c *collector) seriesID(ctx context.Context, mig, db, name string) int64 {
@@ -63,8 +74,18 @@ func (c *collector) put(ctx context.Context, mig, db, name string, v float64, ts
 	c.o.st.DB.ExecContext(ctx, `INSERT OR REPLACE INTO metric_samples(series_id, ts, value) VALUES (?,?,?)`, id, ts, v)
 	c.mu.Lock()
 	c.last[mig+"|"+db+"|"+name] = v
+	c.lastAt[mig+"|"+db+"|"+name] = time.Now()
 	c.lastWrite = time.Now()
 	c.mu.Unlock()
+}
+
+// LastAt returns the most recent value of a series and when it was sampled.
+func (c *collector) LastAt(mig, db, name string) (float64, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := mig + "|" + db + "|" + name
+	v, ok := c.last[k]
+	return v, c.lastAt[k], ok
 }
 
 // Last returns the most recent value of a series in memory.
@@ -224,17 +245,30 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 		// Schema drift: DDL on the source is not streamed. Catch it within a
 		// minute instead of at the cutover's verification.
 		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|drift", 60*time.Second) {
-			if s, err := pg.Connect(ctx, src.WithDB(d.SourceName), 20*time.Second); err == nil {
-				if t, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 20*time.Second); err == nil {
-					if diff, err := pgpack.SchemaDrift(ctx, s, t); err == nil {
-						c.mu.Lock()
-						c.drift[d.ID] = diff
-						c.mu.Unlock()
-					}
+			// A failed comparison is recorded as such: readiness must not keep
+			// showing the last good result (D50).
+			var diff []string
+			s, err := pg.Connect(ctx, src.WithDB(d.SourceName), 20*time.Second)
+			if err == nil {
+				var t *pgx.Conn
+				if t, err = pg.Connect(ctx, dst.WithDB(d.TargetName), 20*time.Second); err == nil {
+					diff, err = pgpack.SchemaDrift(ctx, s, t)
 					t.Close(ctx)
+				} else {
+					err = fmt.Errorf("target: %w", err)
 				}
 				s.Close(ctx)
+			} else {
+				err = fmt.Errorf("source: %w", err)
 			}
+			c.mu.Lock()
+			if err != nil {
+				prev := c.drift[d.ID]
+				c.drift[d.ID] = driftSample{diff: prev.diff, err: err, at: prev.at}
+			} else {
+				c.drift[d.ID] = driftSample{diff: diff, at: time.Now()}
+			}
+			c.mu.Unlock()
 		}
 		var errs float64
 		c.o.st.DB.QueryRowContext(ctx, `SELECT count(*) FROM logs WHERE migration_id=? AND database=? AND component='engine' AND level IN ('error','fatal')`, m.ID, d.SourceName).Scan(&errs)
@@ -660,7 +694,16 @@ func humanDuration(s float64) string {
 func (c *collector) Drift(dbID string) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]string(nil), c.drift[dbID]...)
+	return append([]string(nil), c.drift[dbID].diff...)
+}
+
+// DriftSample returns the last schema comparison (its time is zero until one
+// succeeded) and the error of the latest attempt, if it failed.
+func (c *collector) DriftSample(dbID string) (diff []string, at time.Time, lastErr error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	x := c.drift[dbID]
+	return append([]string(nil), x.diff...), x.at, x.err
 }
 
 func limitStrings(s []string, n int) []string {
