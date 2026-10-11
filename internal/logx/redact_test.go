@@ -28,3 +28,9 @@ func TestRedact(t *testing.T) {
 		t.Errorf("ordinary text changed: %q", got)
 	}
 }
+
+func TestRedactUpwellToken(t *testing.T) {
+	if got := Redact("pasted upw_0123456789abcdef0123 here"); got != "pasted upw_**** here" {
+		t.Fatal(got)
+	}
+}

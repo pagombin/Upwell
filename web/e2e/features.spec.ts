@@ -120,39 +120,42 @@ test("offline migration from the wizard to GO", async ({ page }) => {
   await cleanUp(page, name);
 });
 
-test("second factor: set up, sign in with a code and a recovery code", async ({ browser }) => {
-  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
-  const page = await ctx.newPage();
-  const pw = process.env.E2E_PASSWORD || "correct-horse-battery-staple";
-  const signIn = async (otp?: string) => {
-    await page.goto("/login");
-    await page.getByLabel("Username").fill("mfa-user");
-    await page.getByLabel("Password").fill(pw);
-    await page.getByRole("button", { name: "Sign in" }).click();
-    if (otp) {
-      await page.getByLabel("Authentication code").fill(otp);
+test.describe("signed out", () => {
+  test.use({ storageState: { cookies: [], origins: [] } });
+  test("second factor: set up, sign in with a code and a recovery code", async ({ page }) => {
+    const pw = process.env.E2E_PASSWORD || "correct-horse-battery-staple";
+    const signIn = async (otp?: string) => {
+      await page.goto("/login");
+      await page.getByLabel("Username").fill("mfa-user");
+      await page.getByLabel("Password").fill(pw);
       await page.getByRole("button", { name: "Sign in" }).click();
-    }
-    await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
-  };
-  await signIn();
-  await page.goto("/account");
-  await page.getByRole("button", { name: "Set up" }).click();
-  const secret = (await page.getByTestId("totp-secret").textContent()) || "";
-  await page.getByLabel("Code from the app").fill(await totp(secret));
-  await page.getByRole("button", { name: "Turn on" }).click();
-  const codes = ((await page.getByTestId("recovery-codes").locator("pre").textContent()) || "").split("\n");
-  expect(codes).toHaveLength(10);
-  await page.getByRole("button", { name: "I saved them" }).click();
-  await expect(page.locator(".pill", { hasText: /^On$/ })).toBeVisible();
-  // Sign out; sign in again with the next step's code, then with a recovery code.
-  await page.getByRole("button", { name: /mfa-user/ }).click();
-  await page.getByRole("menuitem", { name: "Sign out" }).click();
-  await signIn(await totp(secret, 1));
-  await page.getByRole("button", { name: /mfa-user/ }).click();
-  await page.getByRole("menuitem", { name: "Sign out" }).click();
-  await signIn(codes[0]);
-  await ctx.close();
+      if (otp) {
+        await page.getByLabel("Authentication code").fill(otp);
+        await page.getByRole("button", { name: "Sign in" }).click();
+      }
+      await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
+    };
+    const signOut = async () => {
+      await page.getByRole("button", { name: /mfa-user/ }).click();
+      await page.getByRole("menuitem", { name: "Sign out" }).click();
+      await expect(page.getByLabel("Username")).toBeVisible();
+    };
+    await signIn();
+    await page.goto("/account");
+    await page.getByRole("button", { name: "Set up" }).click();
+    const secret = (await page.getByTestId("totp-secret").textContent()) || "";
+    await page.getByLabel("Code from the app").fill(await totp(secret));
+    await page.getByRole("button", { name: "Turn on" }).click();
+    const codes = ((await page.getByTestId("recovery-codes").locator("pre").textContent()) || "").split("\n");
+    expect(codes).toHaveLength(10);
+    await page.getByRole("button", { name: "I saved them" }).click();
+    await expect(page.locator(".pill", { hasText: /^On$/ })).toBeVisible();
+    // Sign in again with the next step's code, then with a recovery code.
+    await signOut();
+    await signIn(await totp(secret, 1));
+    await signOut();
+    await signIn(codes[0]);
+  });
 });
 
 test("support bundle: preview, then download", async ({ page }) => {
@@ -175,4 +178,55 @@ test("PDF report: download from the report tab", async ({ page }) => {
   const path = await dl.path();
   const fs = await import("node:fs");
   expect(fs.readFileSync(path).subarray(0, 5).toString()).toBe("%PDF-");
+});
+
+test("queue: a ready migration is queued, reordered and unqueued", async ({ page }) => {
+  test.skip(!process.env.E2E_DRAFT, "dev/e2e.sh prepares the draft migration");
+  await page.goto(`/migrations/${process.env.E2E_DRAFT}/setup?step=6`);
+  await expect(page.getByText("Engine command per database")).toBeVisible();
+  const review = page.getByLabel(/I reviewed the \d+ preflight warnings/);
+  if (await review.count()) await review.check();
+  await page.getByRole("button", { name: "Queue instead" }).click();
+  await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
+  const q = page.locator("table[aria-label='Queue']");
+  await expect(q).toContainText("Draft: wizard walkthrough");
+  await q.getByRole("checkbox").check();
+  await expect(q.getByRole("checkbox")).toBeChecked();
+  await q.getByRole("button", { name: "Unqueue" }).click();
+  await expect(page.getByText("No migrations are queued")).toBeVisible();
+});
+
+test("saved log views: save, pick, delete", async ({ page }) => {
+  await page.goto("/logs");
+  await page.getByRole("button", { name: "Save these filters" }).click();
+  await page.getByLabel("View name").fill("e2e view");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByLabel("Saved view")).toContainText("e2e view");
+  await page.getByLabel("Saved view").selectOption({ label: "e2e view" });
+  await page.getByRole("button", { name: "Delete view" }).click();
+  await expect(page.getByLabel("Saved view")).not.toContainText("e2e view");
+});
+
+test("host: network throughput charts", async ({ page }) => {
+  await page.goto("/host");
+  await expect(page.getByText("Network received")).toBeVisible();
+  await expect(page.getByText("Network sent")).toBeVisible();
+});
+
+test("TLS: check, install and roll back an uploaded certificate", async ({ page }) => {
+  const cert = process.env.E2E_UPLOAD_CERT, key = process.env.E2E_UPLOAD_KEY;
+  test.skip(!cert || !key, "dev/e2e.sh generates the certificate");
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "TLS", exact: true }).click();
+  await page.getByLabel("Certificate file").setInputFiles(cert!);
+  await page.getByLabel("Private key file").setInputFiles(key!);
+  await page.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(page.getByTestId("cert-check")).toContainText("upwell-e2e.local");
+  await page.getByRole("button", { name: "Install this certificate" }).click();
+  await page.getByRole("dialog", { name: "Install this certificate" }).getByRole("button", { name: "Install" }).click();
+  await expect(page.locator("dl.kv")).toContainText("upwell-e2e.local");
+  await expect(page.locator("dl.kv")).toContainText("Uploaded here");
+  await page.getByRole("button", { name: "Roll back to the previous certificate" }).click();
+  await page.getByRole("dialog", { name: "Roll back the certificate" }).getByRole("button", { name: "Roll back" }).click();
+  await expect(page.locator("dl.kv")).not.toContainText("upwell-e2e.local");
 });

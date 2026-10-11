@@ -16,6 +16,8 @@ var redactions = []struct {
 	{regexp.MustCompile(`https://hooks\.slack\.com/[^\s"']+`), `https://hooks.slack.com/****`},
 	// DigitalOcean API tokens
 	{regexp.MustCompile(`\bdop_v1_[a-f0-9]{16,}\b`), `dop_v1_****`},
+	// Upwell API tokens, wherever they appear (D67)
+	{regexp.MustCompile(`\bupw_[0-9a-fA-F]{6,}`), `upw_****`},
 }
 
 // Redact masks secrets in s. It runs before any log write.

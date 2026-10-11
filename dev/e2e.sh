@@ -238,6 +238,11 @@ api POST /api/v1/dev/fixtures >/dev/null
 SHORT=$(api GET /api/v1/migrations/$MIG | json 'd["migration"]["short_id"]')
 FSHORT=$(api GET /api/v1/migrations/$FREEZE | json 'd["migration"]["short_id"]')
 export E2E_FREEZE=$FSHORT
+# A certificate for the TLS upload test (rolled back by the test).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=upwell-e2e.local" \
+  -addext "subjectAltName=DNS:upwell-e2e.local" -addext "extendedKeyUsage=serverAuth" \
+  -keyout $DATA/upload-key.pem -out $DATA/upload-cert.pem >/dev/null 2>&1
+export E2E_UPLOAD_CERT=$DATA/upload-cert.pem E2E_UPLOAD_KEY=$DATA/upload-key.pem
 DSHORT=$(api GET /api/v1/migrations/$DRAFT | json 'd["migration"]["short_id"]')
 export E2E_BASE=$BASE E2E_PASSWORD=$PW E2E_MIG=$SHORT E2E_DRAFT=$DSHORT E2E_DB=$DB
 printf 'export E2E_BASE=%s E2E_PASSWORD=%s E2E_MIG=%s E2E_DRAFT=%s E2E_DB=%s\n' "$BASE" "$PW" "$SHORT" "$DSHORT" "$DB" > $DATA/e2e.env
