@@ -57,6 +57,9 @@ type TestHooks struct {
 	SkipPreflightGate bool
 	// BeforeVerify runs after the drain and before verification of each database.
 	BeforeVerify func(ctx context.Context, db Database)
+	// AfterVerify runs after each database's data comparison, before the
+	// verdict is stored.
+	AfterVerify func(ctx context.Context, db Database)
 }
 
 // Deps bundles constructor arguments.

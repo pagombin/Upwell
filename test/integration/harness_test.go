@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -316,6 +317,7 @@ func dropDB(t *testing.T, name string) {
 type writer struct {
 	stop chan struct{}
 	done chan struct{}
+	once sync.Once
 	n    int
 }
 
@@ -344,7 +346,11 @@ func startWriter(t *testing.T, db string) *writer {
 	return w
 }
 
-func (w *writer) Stop() { close(w.stop); <-w.done }
+// Stop ends the writer; calling it again is harmless.
+func (w *writer) Stop() {
+	w.once.Do(func() { close(w.stop) })
+	<-w.done
+}
 
 // ---------- migration helpers
 

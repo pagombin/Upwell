@@ -227,7 +227,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		})
 		if f.Cutover == nil {
 			for _, d := range dbs {
-				o.setDB(bg, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil})
+				o.setDB(bg, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil, "writes_baseline": nil})
 			}
 		}
 		o.refreshState(bg, m.ID)
@@ -275,16 +275,16 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		if secs <= 0 {
 			secs = 10
 		}
-		first := map[string]int64{}
+		first := map[string]pgpack.Activity{}
 		for _, d := range dbs {
-			n, sessions, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
+			act, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
 			if err != nil {
-				fail("writers", fmt.Errorf("%s: %w", d.SourceName, err))
+				fail("writers", fmt.Errorf("%s: could not sample writes: %w", d.SourceName, err))
 				return
 			}
-			first[d.SourceName] = n
-			if len(sessions) > 0 {
-				op.LogDB("warn", d.SourceName, "%d client session(s) still connected: %s", len(sessions), strings.Join(sessions, "; "))
+			first[d.SourceName] = act
+			if len(act.Sessions) > 0 {
+				op.LogDB("warn", d.SourceName, "%d client session(s) still connected: %s", len(act.Sessions), strings.Join(act.Sessions, "; "))
 			} else {
 				op.LogDB("info", d.SourceName, "no client sessions besides the engine and Upwell")
 			}
@@ -296,26 +296,37 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			return
 		case <-time.After(time.Duration(secs) * time.Second):
 		}
+		// Writes show in the counters when their transaction ends; a writer
+		// inside an open transaction shows as a session holding a
+		// transaction ID. Either one means writes have not stopped.
 		var changing []string
+		baseline := map[string]int64{}
 		for _, d := range dbs {
-			n, _, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
+			act, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
 			if err != nil {
-				fail("writers", fmt.Errorf("%s: %w", d.SourceName, err))
+				fail("writers", fmt.Errorf("%s: could not sample writes: %w", d.SourceName, err))
 				return
 			}
-			if n != first[d.SourceName] {
-				changing = append(changing, fmt.Sprintf("%s (%d row changes in %d s)", d.SourceName, n-first[d.SourceName], secs))
+			baseline[d.SourceName] = act.Changes
+			if n := act.Changes - first[d.SourceName].Changes; n != 0 {
+				changing = append(changing, fmt.Sprintf("%s (%d row changes in %d s)", d.SourceName, n, secs))
+			}
+			if len(act.OpenWriters) > 0 {
+				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
 			}
 		}
 		override := false
 		if len(changing) > 0 {
 			if role != "admin" || p.OverrideConfirm != m.Name {
-				fail("writers", fmt.Errorf("rows are still changing in %s. Stop every writer, or an Admin can override by typing the migration name", strings.Join(changing, ", ")))
+				fail("writers", fmt.Errorf("writes have not stopped: %s. Stop every writer (and end open transactions), or an Admin can override by typing the migration name; verification then ends NO-GO if the source changed at all", strings.Join(changing, ", ")))
 				return
 			}
 			override = true
 			o.audit.Append(bg, a, "cutover.override_writes", m.ID, nil, map[string]any{"changing": changing})
 			op.Log("warn", "Admin %s overrode detected writes: %s", a.Username, strings.Join(changing, ", "))
+		}
+		for _, d := range dbs {
+			o.setDB(bg, d.ID, map[string]any{"writes_baseline": baseline[d.SourceName]})
 		}
 		now := store.Now()
 		o.updateFlags(bg, m.ID, func(f *Flags) {
@@ -639,6 +650,17 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			res.GO = false
 			res.Results = append(res.Results, check.Result{CheckID: "verify_error", Level: check.Blocker, Hard: true, Title: "Verification completed", Message: err.Error(), Database: d.SourceName})
 		}
+		if o.testHooks.AfterVerify != nil {
+			o.testHooks.AfterVerify(ctx, d)
+		}
+		// The source must not have changed since the writers step: a write
+		// after it (a writer that resumed, an open transaction that committed,
+		// writes an Admin overrode) is missing on the target (D44, D45).
+		wr := o.writesSinceWritersStep(ctx, m, src.WithDB(d.SourceName), cur)
+		res.Results = append(res.Results, wr)
+		if wr.Level == check.Blocker {
+			res.GO = false
+		}
 		if _, bad := originFail[d.SourceName]; bad {
 			res.GO = false
 		}
@@ -767,7 +789,7 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	for _, d := range dbs {
-		o.setDB(ctx, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil})
+		o.setDB(ctx, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil, "writes_baseline": nil})
 	}
 	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Cutover = nil })
 	o.audit.Append(ctx, a, "cutover.abort", m.ID, nil, nil)
@@ -858,4 +880,44 @@ func noEndPositions(o *Orchestrator, ctx context.Context, id string) bool {
 		}
 	}
 	return true
+}
+
+// writesSinceWritersStep resamples the source's writes after verification and
+// compares them with the baseline taken when the writers step confirmed
+// writes stopped. It fails closed: no baseline, or a failed sample, is a
+// blocker.
+func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, src pg.Conn, d Database) check.Result {
+	res := check.Result{CheckID: "writes_stopped", Title: "No writes on the source since writers stopped", Database: d.SourceName, Hard: true}
+	override := false
+	if cur, err := o.GetMigration(ctx, m.ID); err == nil && cur.Flags.Cutover != nil {
+		override = cur.Flags.Cutover.Override
+	}
+	overrideNote := ""
+	if override {
+		overrideNote = " An Admin overrode detected writes at the writers step, so this resample decides the verdict."
+	}
+	if d.WritesBaseline == nil {
+		res.Level = check.Blocker
+		res.Message = "There is no write sample from the writers step for this database, so Upwell cannot show that the source stopped changing."
+		return res
+	}
+	// Statistics reach pg_stat_user_tables about a second after a transaction ends.
+	time.Sleep(1500 * time.Millisecond)
+	act, err := pgpack.WriteActivity(ctx, src)
+	res.Evidence = map[string]any{"baseline": *d.WritesBaseline, "now": act.Changes, "open_writers": act.OpenWriters, "override": override}
+	switch {
+	case err != nil:
+		res.Level = check.Blocker
+		res.Message = "Could not resample the source's writes after verification: " + err.Error() + "."
+	case act.Changes != *d.WritesBaseline:
+		res.Level = check.Blocker
+		res.Message = fmt.Sprintf("Rows changed on the source after the writers step confirmed writes stopped (%d row changes since then); those changes are not on the target.%s", act.Changes-*d.WritesBaseline, overrideNote)
+	case len(act.OpenWriters) > 0:
+		res.Level = check.Blocker
+		res.Message = fmt.Sprintf("%d session(s) hold an open write transaction on the source (%s): when they commit, their changes will be missing on the target.%s", len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; "), overrideNote)
+	default:
+		res.Level = check.OK
+		res.Message = "No row changes on the source since writers were confirmed stopped, and no open write transaction."
+	}
+	return res
 }

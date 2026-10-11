@@ -880,7 +880,7 @@ func (o *Orchestrator) RestartDatabase(ctx context.Context, a audit.Actor, id, d
 		return d, err
 	}
 	o.setDB(ctx, d.ID, map[string]any{"state": DPending, "base_copy_done": 0, "last_error": nil, "error_class": nil, "next_retry_at": nil, "retry_count": 0,
-		"hb_before_lsn": nil, "hb_token": nil, "endpos": nil, "origin_lsn": nil, "verdict": nil, "in_sync_since": nil, "replay_lsn": nil, "write_lsn": nil, "drained": 0, "auto_restarts": 0})
+		"hb_before_lsn": nil, "hb_token": nil, "endpos": nil, "origin_lsn": nil, "verdict": nil, "in_sync_since": nil, "replay_lsn": nil, "write_lsn": nil, "drained": 0, "auto_restarts": 0, "writes_baseline": nil})
 	done("reset")
 	o.audit.Append(ctx, a, "database.restart", m.ID, map[string]any{"database": d.SourceName, "state": d.State}, map[string]any{"state": DPending})
 	o.Event(ctx, m.ID, d.SourceName, "restart", "warning", d.SourceName+" restarted from zero by "+a.Username, nil)

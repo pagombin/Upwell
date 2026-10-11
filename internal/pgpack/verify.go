@@ -539,19 +539,41 @@ func SyncSequences(ctx context.Context, srcC, dstC pg.Conn) (int, error) {
 	return n, nil
 }
 
-// WriteActivity samples total row changes in a database (for the manual
-// stop-writes check).
-func WriteActivity(ctx context.Context, c pg.Conn) (int64, []string, error) {
+// Activity is one sample of a source database's writes.
+type Activity struct {
+	// Changes is the row-change counter (inserts, updates and deletes in
+	// user tables). PostgreSQL adds a transaction's changes when it ends.
+	Changes int64
+	// OpenWriters are client sessions inside a transaction that has written
+	// (it holds a transaction ID): invisible to Changes until they commit.
+	OpenWriters []string
+	// Sessions are the other client sessions connected to the database.
+	Sessions []string
+}
+
+// WriteActivity samples a source database's writes. It fails closed: any
+// failed query is an error, never "no writes" (D44). Upwell's own and the
+// engine's sessions are excluded, and so is Upwell's heartbeat schema.
+func WriteActivity(ctx context.Context, c pg.Conn) (Activity, error) {
+	var a Activity
 	conn, err := pg.Connect(ctx, c, 15*time.Second)
 	if err != nil {
-		return 0, nil, err
+		return a, err
 	}
 	defer conn.Close(ctx)
-	var n int64
-	pg.QueryRow(ctx, conn, `SELECT COALESCE(sum(n_tup_ins+n_tup_upd+n_tup_del),0)::bigint FROM pg_stat_user_tables WHERE schemaname <> 'upwell'`).Scan(&n)
-	sessions, _ := pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' ('||COALESCE(application_name,'')||', '||state||')' FROM pg_stat_activity
-		WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND COALESCE(application_name,'') NOT LIKE 'upwell%' AND COALESCE(application_name,'') NOT LIKE 'pgcopydb%' ORDER BY 1 LIMIT 50`)
-	return n, sessions, nil
+	if err := pg.QueryRow(ctx, conn, `SELECT COALESCE(sum(n_tup_ins+n_tup_upd+n_tup_del),0)::bigint FROM pg_stat_user_tables WHERE schemaname <> 'upwell'`).Scan(&a.Changes); err != nil {
+		return a, fmt.Errorf("reading row-change statistics: %w", err)
+	}
+	const others = `datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND COALESCE(application_name,'') NOT LIKE 'upwell%' AND COALESCE(application_name,'') NOT LIKE 'pgcopydb%'`
+	if a.OpenWriters, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' pid '||pid||' ('||COALESCE(application_name,'')||', '||state||', open '||
+		COALESCE(extract(epoch FROM now()-xact_start)::int,0)||' s)' FROM pg_stat_activity WHERE `+others+` AND backend_xid IS NOT NULL ORDER BY 1 LIMIT 50`); err != nil {
+		return a, fmt.Errorf("listing open write transactions: %w", err)
+	}
+	if a.Sessions, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' ('||COALESCE(application_name,'')||', '||state||')' FROM pg_stat_activity
+		WHERE `+others+` ORDER BY 1 LIMIT 50`); err != nil {
+		return a, fmt.Errorf("listing client sessions: %w", err)
+	}
+	return a, nil
 }
 
 // SchemaDrift lists the differences that logical decoding cannot carry and
