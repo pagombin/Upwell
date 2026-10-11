@@ -122,7 +122,10 @@ test("offline migration from the wizard to GO", async ({ page }) => {
 
 test.describe("signed out", () => {
   test.use({ storageState: { cookies: [], origins: [] } });
-  test("second factor: set up, sign in with a code and a recovery code", async ({ page }) => {
+  test("second factor: set up, sign in with a code and a recovery code", async ({ page, guard }) => {
+    // Signing in with the password alone answers 401 mfa_required: expected.
+    guard.allow(/\/api\/v1\/auth\/login/);
+    guard.allow(/status of 401/);
     const pw = process.env.E2E_PASSWORD || "correct-horse-battery-staple";
     const signIn = async (otp?: string) => {
       await page.goto("/login");
@@ -190,7 +193,8 @@ test("queue: a ready migration is queued, reordered and unqueued", async ({ page
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
   const q = page.locator("table[aria-label='Queue']");
   await expect(q).toContainText("Draft: wizard walkthrough");
-  await q.getByRole("checkbox").check();
+  // The checkbox shows the stored value, so it turns on once the server has it.
+  await q.getByRole("checkbox").click();
   await expect(q.getByRole("checkbox")).toBeChecked();
   await q.getByRole("button", { name: "Unqueue" }).click();
   await expect(page.getByText("No migrations are queued")).toBeVisible();
@@ -209,8 +213,8 @@ test("saved log views: save, pick, delete", async ({ page }) => {
 
 test("host: network throughput charts", async ({ page }) => {
   await page.goto("/host");
-  await expect(page.getByText("Network received")).toBeVisible();
-  await expect(page.getByText("Network sent")).toBeVisible();
+  await expect(page.getByRole("img", { name: "Network received" })).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByRole("img", { name: "Network sent" })).toBeVisible();
 });
 
 test("TLS: check, install and roll back an uploaded certificate", async ({ page }) => {

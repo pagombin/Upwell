@@ -161,10 +161,6 @@ func (s *Server) comingSoon(what string) handlerFunc {
 	}
 }
 
-func (s *Server) emptyList(w http.ResponseWriter, r *http.Request) error {
-	return writeJSON(w, 200, []any{})
-}
-
 // ---------- health
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) error {

@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -32,7 +33,7 @@ func TestVersionMatrix(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			src := pg.Conn{Host: "127.0.0.1", Port: c.srcPort, User: "doadmin", Password: password, DBName: "defaultdb", SSLMode: "disable"}
 			dst := pg.Conn{Host: "127.0.0.1", Port: c.dstPort, User: "doadmin", Password: password, DBName: "defaultdb", SSLMode: "disable"}
-			if _, err := pg.Connect(t.Context(), dst, 5*time.Second); err != nil {
+			if _, err := pg.Connect(context.Background(), dst, 5*time.Second); err != nil {
 				t.Skipf("no %s target on port %d (spikes/env/local-clusters.sh): %v", c.name, c.dstPort, err)
 			}
 			t.Logf("source %s, target %s", q(t, src, "defaultdb", "SELECT current_setting('server_version')"), q(t, dst, "defaultdb", "SELECT current_setting('server_version')"))

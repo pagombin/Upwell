@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -67,7 +68,7 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 	set := &settings.Service{Store: st}
 	// TOTP for Admins is tested on its own (TestTOTP*); the other tests sign
 	// in with a password.
-	set.Set(t.Context(), "mfa_required_for_admins", false, "test")
+	set.Set(context.Background(), "mfa_required_for_admins", false, "test")
 	r, _ := runner.New("local", filepath.Join(cfg.DataDir, "units"))
 	au := &audit.Log{Store: st}
 	vault := &secrets.Vault{Box: box, Store: st}
@@ -436,7 +437,7 @@ func TestTOTP(t *testing.T) {
 		t.Fatalf("admin disable under enforcement: %d", code)
 	}
 	// The audit log records each step.
-	code, m, raw = a.req("GET", "/api/v1/audit?limit=200", "", nil)
+	_, _, raw = a.req("GET", "/api/v1/audit?limit=200", "", nil)
 	for _, want := range []string{"auth.totp_enabled", "auth.recovery_code_used", "auth.totp_reset"} {
 		if !strings.Contains(raw, want) {
 			t.Errorf("audit log lacks %s", want)

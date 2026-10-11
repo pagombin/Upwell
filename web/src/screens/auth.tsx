@@ -93,7 +93,8 @@ export function LoginScreen() {
       await api.post("/api/v1/auth/login", { username, password, otp: needOtp ? otp : undefined });
       await reload();
       const next = new URLSearchParams(window.location.search).get("next");
-      nav(next && next.startsWith("/") && !next.startsWith("//") ? next : "/");
+      // Only same-site paths: "//host" and "/\\host" would leave the site.
+      nav(next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\") ? next : "/");
     } catch (e2) {
       const ae = e2 as ApiError;
       if (ae.code === "mfa_required") { setNeedOtp(true); } else { setErr(ae); }

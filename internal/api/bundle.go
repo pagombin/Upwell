@@ -211,8 +211,9 @@ func hostFacts(dataDir string) map[string]any {
 	}
 	if b, err := os.ReadFile("/proc/uptime"); err == nil {
 		var up float64
-		fmt.Sscanf(string(b), "%f", &up)
-		h["uptime_seconds"] = int64(up)
+		if _, err := fmt.Sscanf(string(b), "%f", &up); err == nil {
+			h["uptime_seconds"] = int64(up)
+		}
 	}
 	var st syscall.Statfs_t
 	if syscall.Statfs(dataDir, &st) == nil {
