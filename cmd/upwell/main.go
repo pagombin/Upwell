@@ -189,17 +189,18 @@ func serve(args []string) error {
 		}
 		a.log.Logf("warn", "api", "", "no users yet: open the console and complete first-run setup with the token in %s", cfg.SetupToken)
 	}
-	tlsCfg, err := tlsutil.Config(cfg.TLSCert, cfg.TLSKey)
+	// The serving certificate: an uploaded pair in the data directory when
+	// there is a valid one, else the configured pair; swapped in memory on
+	// upload and rollback (D74).
+	holder, err := tlsutil.NewHolder(cfg.TLSCert, cfg.TLSKey, cfg.DataDir)
 	if err != nil {
 		return err
 	}
+	tlsCfg := holder.Config()
 	health := api.NewHealth()
-	srv := api.New(&api.Server{Cfg: cfg, Store: a.st, Auth: a.auth, Audit: a.audit, Orch: a.orch, Settings: a.set, Bus: a.bus, Log: a.log, Version: Version, Health: health,
+	srv := api.New(&api.Server{Cfg: cfg, Store: a.st, Auth: a.auth, Audit: a.audit, Orch: a.orch, Settings: a.set, Bus: a.bus, Log: a.log, Version: Version, Health: health, TLS: holder,
 		TLSInfo: func() api.TLSInfo {
-			i, err := tlsutil.Inspect(cfg.TLSCert)
-			if err != nil {
-				return api.TLSInfo{}
-			}
+			i := holder.Info()
 			return api.TLSInfo{Fingerprint: i.Fingerprint, NotAfter: i.NotAfter.UnixMilli(), Subject: i.Subject, SelfSigned: i.SelfSigned}
 		}})
 	a.orch.Heartbeat = health.Beat

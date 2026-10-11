@@ -107,6 +107,8 @@ func (s *Server) prometheus(w http.ResponseWriter, r *http.Request) error {
 		{"mem_pct", gauge("upwell_host_memory_percent", "Droplet memory use.")},
 		{"load1", gauge("upwell_host_load1", "One-minute load average.")},
 		{"staging_bytes", gauge("upwell_host_staging_bytes", "Change staging on disk.")},
+		{"net_rx_bps", gauge("upwell_host_network_receive_bytes_per_second", "Bytes received per second on the droplet's interfaces (loopback excluded).")},
+		{"net_tx_bps", gauge("upwell_host_network_transmit_bytes_per_second", "Bytes sent per second on the droplet's interfaces (loopback excluded).")},
 	}
 	ms, err := s.Orch.ListMigrations(ctx)
 	if err != nil {

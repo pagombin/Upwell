@@ -28,6 +28,7 @@ import (
 	"github.com/pagombin/upwell/internal/orch"
 	"github.com/pagombin/upwell/internal/settings"
 	"github.com/pagombin/upwell/internal/store"
+	"github.com/pagombin/upwell/internal/tlsutil"
 	"github.com/pagombin/upwell/internal/webui"
 )
 
@@ -43,6 +44,7 @@ type Server struct {
 	Log      *logx.Logger
 	Version  string
 	TLSInfo  func() TLSInfo
+	TLS      *tlsutil.Holder // nil where the certificate cannot be managed (tests)
 	Health   *Health
 
 	mux    *http.ServeMux

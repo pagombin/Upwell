@@ -252,7 +252,7 @@ function StepOptions({ v, onDone }: { v: MigrationView; onDone: () => void }) {
           </div>
         )}
         {vals.heartbeat === false && <div className="callout warn"><div className="body"><strong>Heartbeat off</strong><span>The final heartbeat proves the last writes reached the target. Without it, GO relies on data comparison alone and the report records the accepted risk.</span></div></div>}
-        <div className="row small muted"><span>Watched tables</span><ComingSoon what="Watched tables" /><span>Notifications</span><ComingSoon what="Notifications" /></div>
+        <div className="row small muted"><span>Watched tables: choose them on each database's page once the migration runs.</span><span>Notifications</span><ComingSoon what="Notifications" /></div>
         {err && <ErrorState error={err} />}
         <Nav next={save} busy={busy} />
       </div>

@@ -7,7 +7,7 @@ import { useSession } from "../lib/session";
 import type { Database, EventRow, Migration, Series } from "../lib/types";
 import { CrosshairProvider, seriesFor, TimeChart } from "../components/charts";
 import { LogViewer } from "../components/logview";
-import { Card, ConfirmDialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, Tile, Trunc, useAction } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, Tile, Trunc, useAction } from "../components/ui";
 import { EventList, useMig } from "./migration";
 
 const RANGES = [{ m: 30, l: "30 minutes" }, { m: 180, l: "3 hours" }, { m: 720, l: "12 hours" }, { m: 2880, l: "2 days" }, { m: 10080, l: "7 days" }];
@@ -121,7 +121,7 @@ export function DatabaseScreen() {
         )}
         {d.data.attempts[0] && <details style={{ marginTop: 12 }}><summary>Engine command of attempt {d.data.attempts[0].number}</summary><pre className="cmd" style={{ marginTop: 8 }}>{d.data.attempts[0].command}</pre></details>}
       </Card>
-      <Card title="Watched tables"><p className="muted small">Per-table watch lists are coming soon; verification compares every table after the cutover.</p></Card>
+      <WatchedTables mig={id} db={x.source_name} canEdit={can("operator") && !view.data?.migration.fixture} />
       <Card title="Logs for this database"><LogViewer filter={{ migration: id, database: x.source_name, level: "info" }} height={320} label={`Logs for ${x.source_name}`} /></Card>
       {restart && (
         <ConfirmDialog title={`Restart ${x.source_name} from zero`} danger typeToConfirm={x.source_name} confirmLabel="Restart from zero" onClose={() => setRestart(false)}
@@ -260,5 +260,64 @@ export function MigrationEventsTab() {
     <Card title="Timeline">
       {ev.error ? <ErrorState error={ev.error} retry={ev.refresh} /> : !ev.data ? <Skeleton lines={8} /> : ev.data.length === 0 ? <Empty title="No events yet">Phase changes, operations, alerts and operator actions appear here.</Empty> : <EventList rows={ev.data} now={now} />}
     </Card>
+  );
+}
+
+interface Watched { id: string; database: string; schema: string; table: string; added_by: string; added_at: number; source_rows?: number; target_rows?: number; counted_at?: number; count_error?: string }
+
+// Watched tables (overnight item 9): exact counts on both sides while streaming.
+function WatchedTables({ mig, db, canEdit }: { mig: string; db: string; canEdit: boolean }) {
+  const ws = useApi<Watched[]>(`/api/v1/migrations/${mig}/watched?database=${encodeURIComponent(db)}`, 15000);
+  const [adding, setAdding] = useState(false);
+  const { run, busy } = useAction();
+  const now = useNow(5000);
+  return (
+    <Card title="Watched tables" actions={canEdit && <button onClick={() => setAdding(true)}>Watch a table</button>}>
+      <p className="muted small">Exact row counts on both sides, once a minute while the database streams, for the tables you choose. Each count reads the whole table, so watch only the tables you care about. The target is normally a little behind; verification compares every table after the cutover.</p>
+      {ws.error ? <ErrorState error={ws.error} retry={ws.refresh} /> : !ws.data ? <Skeleton lines={2} /> : ws.data.length === 0 ? <Empty title="No watched tables">Watch a table to see its exact counts here.</Empty> : (
+        <div className="tablewrap">
+          <table className="data" aria-label="Watched tables">
+            <thead><tr><th>Table</th><th className="num">Source rows</th><th className="num">Target rows</th><th className="num">Difference</th><th>Counted</th><th><span className="sr-only">Actions</span></th></tr></thead>
+            <tbody>{ws.data.map((w) => {
+              const diff = w.source_rows !== undefined && w.source_rows !== null && w.target_rows !== undefined && w.target_rows !== null ? w.source_rows - w.target_rows : undefined;
+              return (
+                <tr key={w.id}>
+                  <td style={{ maxWidth: 260 }}><Trunc className="mono">{`${w.schema}.${w.table}`}</Trunc></td>
+                  <td className="num">{w.source_rows ?? "—"}</td>
+                  <td className="num">{w.target_rows ?? "—"}</td>
+                  <td className="num">{diff === undefined ? "—" : diff === 0 ? <Pill kind="ok" text="Equal" /> : diff > 0 ? `${count(diff)} behind` : `${count(-diff)} more on the target`}</td>
+                  <td>{w.count_error ? <span className="small" style={{ color: "var(--crit)" }}>Could not count: {w.count_error}</span> : w.counted_at ? ago(w.counted_at, now) : "Not counted yet"}</td>
+                  <td>{canEdit && <button className="ghost" disabled={!!busy} onClick={() => run("unwatch", () => api.del(`/api/v1/migrations/${mig}/watched/${w.id}`)).then(ws.refresh)}>Stop watching</button>}</td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+        </div>
+      )}
+      {adding && <WatchPicker mig={mig} db={db} onClose={() => setAdding(false)} onDone={ws.refresh} />}
+    </Card>
+  );
+}
+
+function WatchPicker({ mig, db, onClose, onDone }: { mig: string; db: string; onClose: () => void; onDone: () => void }) {
+  const tables = useApi<{ schema: string; table: string; estimated_rows: number; size_bytes: number }[]>(`/api/v1/migrations/${mig}/databases/${encodeURIComponent(db)}/tables`);
+  const [sel, setSel] = useState("");
+  const [err, setErr] = useState<Error>();
+  const save = async () => {
+    const [schema, ...rest] = sel.split(".");
+    try { await api.post(`/api/v1/migrations/${mig}/watched`, { database: db, schema, table: rest.join(".") }); onDone(); onClose(); } catch (e) { setErr(e as Error); }
+  };
+  return (
+    <Dialog title={`Watch a table in ${db}`} onClose={onClose} footer={<><button onClick={onClose}>Cancel</button><button className="primary" disabled={!sel} onClick={save}>Watch</button></>}>
+      {tables.error ? <ErrorState error={tables.error} retry={tables.refresh} /> : !tables.data ? <Skeleton lines={3} /> : (
+        <label className="field"><span className="lbl">Table</span>
+          <select value={sel} onChange={(e) => setSel(e.target.value)}>
+            <option value="">Choose a table</option>
+            {tables.data.map((t) => <option key={t.schema + "." + t.table} value={t.schema + "." + t.table}>{t.schema}.{t.table} (about {count(t.estimated_rows)} rows, {bytes(t.size_bytes)})</option>)}
+          </select>
+        </label>
+      )}
+      {err && <ErrorState error={err} />}
+    </Dialog>
   );
 }

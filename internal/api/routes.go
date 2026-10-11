@@ -28,6 +28,7 @@ import (
 	"github.com/pagombin/upwell/internal/report"
 	"github.com/pagombin/upwell/internal/settings"
 	"github.com/pagombin/upwell/internal/store"
+	"github.com/pagombin/upwell/internal/tlsutil"
 )
 
 const (
@@ -96,6 +97,17 @@ func (s *Server) register() {
 	s.add("DELETE", "/api/v1/migrations/{id}/queue", operator, "Take a migration out of the queue", s.queueRemove)
 	s.add("PATCH", "/api/v1/migrations/{id}/queue", operator, "Turn auto-start on or off for a queued migration", s.queueAutoStart)
 	s.add("GET", "/api/v1/queue", viewer, "The run lock and the queue", s.queueList)
+	s.add("GET", "/api/v1/tls", admin, "The serving certificate and the one a rollback restores", s.tlsInfo)
+	s.add("POST", "/api/v1/tls/validate", admin, "Check a certificate and key without installing them", s.tlsValidate)
+	s.add("POST", "/api/v1/tls/certificate", admin, "Install a certificate and key (validated first; the current pair is kept)", s.tlsInstall)
+	s.add("POST", "/api/v1/tls/rollback", admin, "Serve the previous certificate again", s.tlsRollback)
+	s.add("GET", "/api/v1/log-views", viewer, "Your saved log views", s.logViews)
+	s.add("POST", "/api/v1/log-views", viewer, "Save a log view", s.saveLogView)
+	s.add("DELETE", "/api/v1/log-views/{id}", viewer, "Delete one of your saved log views", s.deleteLogView)
+	s.add("GET", "/api/v1/migrations/{id}/watched", viewer, "Watched tables and their latest exact counts", s.watchedList)
+	s.add("POST", "/api/v1/migrations/{id}/watched", operator, "Watch a table", s.watchedAdd)
+	s.add("DELETE", "/api/v1/migrations/{id}/watched/{wid}", operator, "Stop watching a table", s.watchedRemove)
+	s.add("GET", "/api/v1/migrations/{id}/databases/{db}/tables", viewer, "Source tables of a database", s.sourceTables)
 	s.add("PUT", "/api/v1/queue/order", operator, "Reorder the queue", s.queueOrder)
 	s.add("POST", "/api/v1/migrations/{id}/pause", operator, "Pause (stop every database, keep slots)", s.pause)
 	s.add("POST", "/api/v1/migrations/{id}/resume", operator, "Resume", s.resume)
@@ -495,6 +507,198 @@ func (s *Server) queueOrder(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	return writeJSON(w, 200, q)
+}
+
+func (s *Server) watchedList(w http.ResponseWriter, r *http.Request) error {
+	m, err := s.Orch.GetMigration(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	ws, err := s.Orch.ListWatched(r.Context(), m.ID, r.URL.Query().Get("database"))
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, ws)
+}
+
+func (s *Server) watchedAdd(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		Database string `json:"database"`
+		Schema   string `json:"schema"`
+		Table    string `json:"table"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	m, err := s.Orch.GetMigration(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	wt, err := s.Orch.AddWatched(r.Context(), actor(r), m.ID, in.Database, in.Schema, in.Table)
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 201, wt)
+}
+
+func (s *Server) watchedRemove(w http.ResponseWriter, r *http.Request) error {
+	m, err := s.Orch.GetMigration(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	if err := s.Orch.RemoveWatched(r.Context(), actor(r), m.ID, r.PathValue("wid")); err != nil {
+		return err
+	}
+	return writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) sourceTables(w http.ResponseWriter, r *http.Request) error {
+	m, err := s.Orch.GetMigration(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	ts, err := s.Orch.SourceTables(r.Context(), m.ID, r.PathValue("db"))
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, ts)
+}
+
+// Saved log views (overnight item 10): named filter sets, per user, kept in
+// Upwell's store on the droplet.
+
+var logViewKeys = map[string]bool{"level": true, "component": true, "migration": true, "database": true, "q": true}
+
+func (s *Server) logViews(w http.ResponseWriter, r *http.Request) error {
+	rows, err := s.Store.DB.QueryContext(r.Context(), `SELECT id, name, filters, created_at FROM log_views WHERE user_id=? ORDER BY name`, session(r).User.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, name, raw string
+		var at int64
+		if err := rows.Scan(&id, &name, &raw, &at); err != nil {
+			return err
+		}
+		var f map[string]string
+		json.Unmarshal([]byte(raw), &f)
+		out = append(out, map[string]any{"id": id, "name": name, "filters": f, "created_at": at})
+	}
+	return writeJSON(w, 200, out)
+}
+
+func (s *Server) saveLogView(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		Name    string            `json:"name"`
+		Filters map[string]string `json:"filters"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" || len(in.Name) > 60 {
+		return apiErr(422, "invalid", "Give the view a name of at most 60 characters.", "")
+	}
+	f := map[string]string{}
+	for k, v := range in.Filters {
+		if logViewKeys[k] && v != "" && len(v) <= 200 {
+			f[k] = v
+		}
+	}
+	b, _ := json.Marshal(f)
+	id := store.NewID()
+	// Saving under an existing name replaces that view.
+	_, err := s.Store.DB.ExecContext(r.Context(), `INSERT INTO log_views(id, user_id, name, filters, created_at) VALUES (?,?,?,?,?)
+		ON CONFLICT(user_id, name) DO UPDATE SET filters=excluded.filters, created_at=excluded.created_at`, id, session(r).User.ID, in.Name, string(b), store.Now())
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 201, map[string]any{"name": in.Name, "filters": f})
+}
+
+func (s *Server) deleteLogView(w http.ResponseWriter, r *http.Request) error {
+	res, err := s.Store.DB.ExecContext(r.Context(), `DELETE FROM log_views WHERE id=? AND user_id=?`, r.PathValue("id"), session(r).User.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return store.ErrNotFound
+	}
+	return writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// TLS certificate upload (overnight item 12).
+
+type certBody struct {
+	Cert  string `json:"cert"`
+	Key   string `json:"key"`
+	Chain string `json:"chain"`
+}
+
+func (s *Server) tlsHolder() (*tlsutil.Holder, error) {
+	if s.TLS == nil {
+		return nil, apiErr(501, "not_available", "This server's certificate cannot be managed here.", "")
+	}
+	return s.TLS, nil
+}
+
+func (s *Server) tlsInfo(w http.ResponseWriter, r *http.Request) error {
+	h, err := s.tlsHolder()
+	if err != nil {
+		return err
+	}
+	prev, perr := h.Previous()
+	out := map[string]any{"current": h.Info(), "source": h.Source(), "previous": prev}
+	if perr != nil {
+		out["previous_error"] = perr.Error()
+	}
+	return writeJSON(w, 200, out)
+}
+
+func (s *Server) tlsValidate(w http.ResponseWriter, r *http.Request) error {
+	var in certBody
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	v, _, err := tlsutil.Validate([]byte(in.Cert), []byte(in.Key), []byte(in.Chain), time.Now())
+	if err != nil {
+		return apiErr(422, "invalid_certificate", err.Error(), "")
+	}
+	return writeJSON(w, 200, v)
+}
+
+func (s *Server) tlsInstall(w http.ResponseWriter, r *http.Request) error {
+	h, err := s.tlsHolder()
+	if err != nil {
+		return err
+	}
+	var in certBody
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	before := h.Info()
+	v, err := h.Install([]byte(in.Cert), []byte(in.Key), []byte(in.Chain), time.Now())
+	if err != nil {
+		return apiErr(422, "invalid_certificate", err.Error(), "Nothing was changed: the current certificate is still served.")
+	}
+	s.Audit.Append(r.Context(), actor(r), "tls.install", "", map[string]any{"fingerprint": before.Fingerprint}, map[string]any{"fingerprint": v.Fingerprint, "subject": v.Subject, "not_after": v.NotAfter})
+	return writeJSON(w, 200, v)
+}
+
+func (s *Server) tlsRollback(w http.ResponseWriter, r *http.Request) error {
+	h, err := s.tlsHolder()
+	if err != nil {
+		return err
+	}
+	before := h.Info()
+	i, err := h.Rollback()
+	if err != nil {
+		return apiErr(409, "no_previous", err.Error(), "")
+	}
+	s.Audit.Append(r.Context(), actor(r), "tls.rollback", "", map[string]any{"fingerprint": before.Fingerprint}, map[string]any{"fingerprint": i.Fingerprint})
+	return writeJSON(w, 200, i)
 }
 
 // failedLoginTarget names an unknown username in the audit log without

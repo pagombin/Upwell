@@ -33,7 +33,10 @@ type collector struct {
 	lastWrite time.Time
 	drift     map[string]driftSample // database ID -> last schema comparison while streaming
 	apply     map[string]applyWatch  // database ID -> apply-progress watchdog (E2)
-	lastAt    map[string]time.Time   // when each series was last sampled
+	netRx     uint64                 // /proc/net/dev counters at netAt (item 11)
+	netTx     uint64
+	netAt     time.Time
+	lastAt    map[string]time.Time // when each series was last sampled
 }
 
 // driftSample is one schema comparison: its differences, or the error that
@@ -243,6 +246,10 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 				s.Close(ctx)
 			}
 		}
+		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|watch", time.Minute) {
+			// Exact counts take a scan: off the sampling path.
+			go c.o.countWatched(context.WithoutCancel(ctx), m, d, src, dst)
+		}
 		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|apply", 10*time.Second) {
 			c.applySample(ctx, m, d, scn, dcn, dstErr, src)
 		}
@@ -388,6 +395,18 @@ func (c *collector) hostSample(ctx context.Context) {
 		f.Close()
 		if total > 0 {
 			c.put(ctx, "_host", "", "mem_pct", 100*(1-avail/total), ts)
+		}
+	}
+	if b, err := os.ReadFile("/proc/net/dev"); err == nil {
+		if rx, tx, ok := parseNetDev(b); ok {
+			now := time.Now()
+			if !c.netAt.IsZero() && rx >= c.netRx && tx >= c.netTx {
+				if dt := now.Sub(c.netAt).Seconds(); dt > 0 {
+					c.put(ctx, "_host", "", "net_rx_bps", float64(rx-c.netRx)/dt, ts)
+					c.put(ctx, "_host", "", "net_tx_bps", float64(tx-c.netTx)/dt, ts)
+				}
+			}
+			c.netRx, c.netTx, c.netAt = rx, tx, now
 		}
 	}
 	if b, err := os.ReadFile("/proc/loadavg"); err == nil {

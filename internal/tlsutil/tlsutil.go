@@ -69,10 +69,10 @@ func EnsureSelfSigned(certPath, keyPath string) (bool, error) {
 
 // Info describes a certificate.
 type Info struct {
-	Fingerprint string
-	NotAfter    time.Time
-	Subject     string
-	SelfSigned  bool
+	Fingerprint string    `json:"fingerprint"`
+	NotAfter    time.Time `json:"not_after"`
+	Subject     string    `json:"subject"`
+	SelfSigned  bool      `json:"self_signed"`
 }
 
 // Inspect reads the leaf certificate.

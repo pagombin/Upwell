@@ -18,6 +18,14 @@ test("write freeze: preview, apply at cutover, GO, undo", async ({ page }) => {
   if (await review.count()) await review.check();
   await page.getByRole("button", { name: "Start migration" }).click();
   await expect(page.locator("table[aria-label='Databases'] .pill", { hasText: "In sync" })).toBeVisible({ timeout: 300_000 });
+  // Watched tables (overnight item 9) while it streams.
+  await page.goto(`/migrations/${FREEZE}/databases/e2e_freeze`);
+  await page.getByRole("button", { name: "Watch a table" }).click();
+  const pick = page.getByRole("dialog", { name: "Watch a table in e2e_freeze" });
+  await pick.getByLabel("Table").selectOption("public.orders");
+  await pick.getByRole("button", { name: "Watch" }).click();
+  await expect(page.locator("table[aria-label='Watched tables']")).toContainText("public.orders");
+  await expect(page.locator("table[aria-label='Watched tables']")).toContainText("Equal", { timeout: 150_000 });
   await page.goto(`/migrations/${FREEZE}/cutover`);
   await expect(page.locator(".pill", { hasText: /^Ready$/ })).toBeVisible({ timeout: 300_000 });
   await page.getByLabel(/Write freeze: Upwell makes the source databases read-only/).check();

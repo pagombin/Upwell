@@ -41,8 +41,8 @@ export function LogsScreen() {
               </select>
             </label>
           </div>
+          <SavedViews value={f} onChange={setF} />
           <LogViewer filter={{ migration: f.migration, level: f.level, component: f.component, q }} height={600} label="All logs" />
-          <p className="small faint">Saved views <ComingSoon what="Saved log views" /></p>
         </div>
       </Card>
     </Page>
@@ -160,7 +160,7 @@ export function HostScreen() {
   const [mins, setMins] = useState(60);
   const now = useNow(30000);
   const from = Math.floor(now / 30000) * 30000 - mins * 60000, to = Math.floor(now / 30000) * 30000;
-  const mx = useApi<Series[]>(`/api/v1/host/metrics?names=work_volume_pct,work_volume_free_bytes,staging_bytes,cpu_pct,mem_pct,load1&from=${from}&to=${to}`, 30000);
+  const mx = useApi<Series[]>(`/api/v1/host/metrics?names=work_volume_pct,work_volume_free_bytes,staging_bytes,cpu_pct,mem_pct,load1,net_rx_bps,net_tx_bps&from=${from}&to=${to}`, 30000);
   const sys = useApi<SystemInfo & { units: { migration: string; migration_name: string; database: string; state: string; unit: string; status: { active: boolean; main_pid: number; main_live: boolean } | null }[] }>("/api/v1/system", 15000);
   const lastV = (n: string) => mx.data?.find((s) => s.name === n)?.points.slice(-1)[0]?.v;
   const staging = mx.data?.find((s) => s.name === "staging_bytes")?.points || [];
@@ -184,9 +184,11 @@ export function HostScreen() {
             <TimeChart title="Staging size" series={seriesFor(mx.data, "staging_bytes", "")} fmt={(n) => bytes(n, 0)} from={from} to={to} />
             <TimeChart title="CPU" series={seriesFor(mx.data, "cpu_pct", "")} fmt={(n) => pct(n)} from={from} to={to} />
             <TimeChart title="Memory" series={seriesFor(mx.data, "mem_pct", "")} fmt={(n) => pct(n)} from={from} to={to} />
+            <TimeChart title="Network received" series={seriesFor(mx.data, "net_rx_bps", "")} fmt={(n) => `${bytes(n, 0)}/s`} from={from} to={to} />
+            <TimeChart title="Network sent" series={seriesFor(mx.data, "net_tx_bps", "")} fmt={(n) => `${bytes(n, 0)}/s`} from={from} to={to} />
           </div>
         </CrosshairProvider>
-        <p className="small faint" style={{ marginTop: 12 }}>Network throughput <ComingSoon what="Network metrics" /></p>
+        <p className="small faint" style={{ marginTop: 12 }}>Network throughput is the sum over the droplet's interfaces, loopback excluded (from /proc/net/dev): the source's WAL coming in and the copy going out.</p>
       </Card>
       <Card title="Engine units">
         {!sys.data ? <Skeleton lines={4} /> : sys.data.units.length === 0 ? <p className="muted">No engine units: no migration is running.</p> : (
@@ -368,16 +370,56 @@ function ResetPassword({ u, onClose }: { u: User; onClose: () => void }) {
   );
 }
 
+interface CertInfo { fingerprint: string; not_after: string; subject: string; self_signed: boolean }
+interface CertCheck { subject: string; names: string[]; issuer: string; not_before: string; not_after: string; fingerprint: string; chain_length: number; self_signed: boolean; trusted_by_system: boolean; warnings: string[] }
+
+// TLS (overnight item 12): upload a certificate, checked before it is
+// served; the previous pair is kept for rollback.
 function TLSSection() {
-  const sys = useApi<SystemInfo>("/api/v1/system");
+  const info = useApi<{ current: CertInfo; source: string; previous: CertInfo | null; previous_error?: string }>("/api/v1/tls");
+  const [f, setF] = useState({ cert: "", key: "", chain: "" });
+  const [check, setCheck] = useState<CertCheck | null>(null);
+  const [err, setErr] = useState<Error>();
+  const [confirm, setConfirm] = useState<"install" | "rollback" | null>(null);
+  const { run, busy } = useAction();
+  const load = (k: "cert" | "key" | "chain") => async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) { setF((x) => ({ ...x, [k]: "" })); const t = await file.text(); setF((x) => ({ ...x, [k]: t })); setCheck(null); }
+  };
+  const validate = async () => {
+    setErr(undefined); setCheck(null);
+    try { setCheck(await api.post<CertCheck>("/api/v1/tls/validate", f)); } catch (e) { setErr(e as Error); }
+  };
+  const c = info.data?.current;
   return (
     <Card title="TLS">
-      {!sys.data ? <Skeleton /> : (
+      {info.error ? <ErrorState error={info.error} retry={info.refresh} /> : !info.data || !c ? <Skeleton /> : (
         <div className="stack">
-          <dl className="kv"><dt>Subject</dt><dd>{sys.data.tls.subject}</dd><dt>Fingerprint (SHA-256)</dt><dd className="mono wrapany">{sys.data.tls.fingerprint}</dd><dt>Valid until</dt><dd>{time(sys.data.tls.not_after)}</dd><dt>Type</dt><dd>{sys.data.tls.self_signed ? "Self-signed, created by install.sh" : "Provided certificate"}</dd></dl>
-          <p className="small muted">To use your own certificate, set tls_cert and tls_key in /etc/upwell/config.yaml and restart Upwell. Uploading a certificate here is coming soon.</p>
+          <dl className="kv"><dt>Subject</dt><dd>{c.subject}</dd><dt>Fingerprint (SHA-256)</dt><dd className="mono wrapany">{c.fingerprint}</dd><dt>Valid until</dt><dd>{time(Date.parse(c.not_after))}</dd><dt>Type</dt><dd>{info.data.source === "uploaded" ? "Uploaded here" : c.self_signed ? "Self-signed, created by install.sh" : "From the configuration file"}</dd></dl>
+          {info.data.previous && (
+            <div className="row"><span className="small muted">Previous: {info.data.previous.subject}, valid until {time(Date.parse(info.data.previous.not_after))}</span><button disabled={!!busy} onClick={() => setConfirm("rollback")}>Roll back to the previous certificate</button></div>
+          )}
+          <h3>Upload a certificate</h3>
+          <p className="small muted">PEM files: the certificate (with or without its chain), its private key, and the intermediate chain if separate. Upwell checks that the key matches, the certificate is valid now and is for servers, and the chain is unbroken before serving it; the current pair is kept for rollback. The browser may ask you to accept the new certificate.</p>
+          <div className="fieldgrid">
+            <label className="field"><span className="lbl">Certificate</span><input type="file" accept=".pem,.crt,.cer" aria-label="Certificate file" onChange={load("cert")} /><textarea aria-label="Certificate PEM" rows={4} className="mono small" value={f.cert} onChange={(e) => { setF({ ...f, cert: e.target.value }); setCheck(null); }} placeholder="-----BEGIN CERTIFICATE-----" /></label>
+            <label className="field"><span className="lbl">Private key</span><input type="file" accept=".pem,.key" aria-label="Private key file" onChange={load("key")} /><textarea aria-label="Private key PEM" rows={4} className="mono small" value={f.key} onChange={(e) => { setF({ ...f, key: e.target.value }); setCheck(null); }} placeholder="-----BEGIN PRIVATE KEY-----" /></label>
+            <label className="field"><span className="lbl">Chain (optional)</span><input type="file" accept=".pem,.crt" aria-label="Chain file" onChange={load("chain")} /><textarea aria-label="Chain PEM" rows={4} className="mono small" value={f.chain} onChange={(e) => { setF({ ...f, chain: e.target.value }); setCheck(null); }} /></label>
+          </div>
+          <div className="row"><button disabled={!f.cert || !f.key || !!busy} onClick={validate}>Check</button>{check && <button className="primary" disabled={!!busy} onClick={() => setConfirm("install")}>Install this certificate</button>}</div>
+          {check && (
+            <div className="callout info" data-testid="cert-check"><div className="body">
+              <strong>{check.subject} · valid until {time(Date.parse(check.not_after))}</strong>
+              <span className="small">Names: {check.names.join(", ") || "none"} · issuer {check.issuer} · chain of {check.chain_length} · {check.trusted_by_system ? "trusted by public authorities" : check.self_signed ? "self-signed" : "private authority"}</span>
+              <span className="mono small wrapany">{check.fingerprint}</span>
+              {check.warnings.map((w) => <span key={w} className="small">{w}</span>)}
+            </div></div>
+          )}
+          {err && <ErrorState error={err} />}
         </div>
       )}
+      {confirm === "install" && <ConfirmDialog title="Install this certificate" confirmLabel="Install" onClose={() => setConfirm(null)} onConfirm={async () => { await run("tls", () => api.post("/api/v1/tls/certificate", f), "Certificate installed"); setF({ cert: "", key: "", chain: "" }); setCheck(null); info.refresh(); }}><p>New connections get the new certificate at once; the current one is kept so you can roll back. Recorded in the audit log.</p></ConfirmDialog>}
+      {confirm === "rollback" && <ConfirmDialog title="Roll back the certificate" confirmLabel="Roll back" onClose={() => setConfirm(null)} onConfirm={async () => { await run("tlsrb", () => api.post("/api/v1/tls/rollback"), "Previous certificate restored"); info.refresh(); }}><p>New connections get the previous certificate again; the current one becomes the previous one.</p></ConfirmDialog>}
     </Card>
   );
 }
@@ -468,5 +510,34 @@ function MetricsSection() {
         <pre className="cmd">{example}</pre>
       </div>
     </Card>
+  );
+}
+
+interface LogView { id: string; name: string; filters: Record<string, string>; created_at: number }
+
+// Saved log views (overnight item 10): named filter sets, yours only.
+function SavedViews({ value, onChange }: { value: Record<string, string>; onChange: (f: Record<string, string>) => void }) {
+  const views = useApi<LogView[]>("/api/v1/log-views");
+  const [name, setName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const { run, busy } = useAction();
+  const current = (views.data || []).find((v) => JSON.stringify(v.filters) === JSON.stringify(Object.fromEntries(Object.entries(value).filter(([, x]) => x))));
+  return (
+    <div className="row small" style={{ gap: 8 }}>
+      <label className="row" style={{ gap: 6 }}>Saved view
+        <select aria-label="Saved view" value={current?.id || ""} onChange={(e) => { const v = views.data?.find((x) => x.id === e.target.value); if (v) onChange({ level: "info", ...v.filters }); }} style={{ maxWidth: 240 }}>
+          <option value="">{(views.data || []).length ? "Choose a view" : "No saved views"}</option>
+          {(views.data || []).map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+        </select>
+      </label>
+      {current && <button className="ghost" disabled={!!busy} onClick={() => run("delview", () => api.del(`/api/v1/log-views/${current.id}`), `Deleted ${current.name}`).then(views.refresh)}>Delete view</button>}
+      {saving ? (
+        <span className="row" style={{ gap: 6 }}>
+          <input aria-label="View name" placeholder="Name this view" value={name} onChange={(e) => setName(e.target.value)} style={{ width: 200 }} />
+          <button className="primary" disabled={!name.trim() || !!busy} onClick={() => run("saveview", () => api.post("/api/v1/log-views", { name, filters: value }), `Saved ${name}`).then(() => { setSaving(false); setName(""); views.refresh(); })}>Save</button>
+          <button className="ghost" onClick={() => setSaving(false)}>Cancel</button>
+        </span>
+      ) : <button className="ghost" onClick={() => setSaving(true)}>Save these filters</button>}
+    </div>
   );
 }

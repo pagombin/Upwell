@@ -646,3 +646,36 @@ func TestSupportBundle(t *testing.T) {
 		t.Fatalf("only %d files in the bundle", n)
 	}
 }
+
+// TestSavedLogViews (overnight item 10): views are per user; unknown filter
+// keys are dropped; saving under the same name replaces the view.
+func TestSavedLogViews(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	pw := "correct-horse-battery-staple"
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	a.login("admin", pw)
+	a.req("POST", "/api/v1/users", k(), map[string]any{"username": "vera", "password": pw, "role": "viewer"})
+	v := newClient(t, srv)
+	v.login("vera", pw)
+	if code, _, raw := a.req("POST", "/api/v1/log-views", k(), map[string]any{"name": "engine errors", "filters": map[string]string{"level": "error", "component": "engine", "evil": "x"}}); code != 201 || strings.Contains(raw, "evil") {
+		t.Fatalf("save: %d %s", code, raw)
+	}
+	a.req("POST", "/api/v1/log-views", k(), map[string]any{"name": "engine errors", "filters": map[string]string{"level": "warn"}})
+	_, _, raw := a.req("GET", "/api/v1/log-views", "", nil)
+	if strings.Count(raw, `"name"`) != 1 || !strings.Contains(raw, `"level":"warn"`) {
+		t.Fatalf("admin's views: %s", raw)
+	}
+	_, _, vraw := v.req("GET", "/api/v1/log-views", "", nil)
+	if strings.Contains(vraw, "engine errors") {
+		t.Fatal("another user's view is visible")
+	}
+	var views []map[string]any
+	json.Unmarshal([]byte(raw), &views)
+	if code, _, _ := v.req("DELETE", "/api/v1/log-views/"+fmt.Sprint(views[0]["id"]), k(), nil); code != 404 {
+		t.Fatalf("another user deleted the view: %d", code)
+	}
+	if code, _, _ := a.req("DELETE", "/api/v1/log-views/"+fmt.Sprint(views[0]["id"]), k(), nil); code != 200 {
+		t.Fatalf("delete: %d", code)
+	}
+}
