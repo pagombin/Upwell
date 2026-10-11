@@ -235,6 +235,10 @@ func (e *Engine) Nudge(ctx context.Context, d engine.DatabaseSpec) error {
 	// pgcopydb 0.18 cannot parse a logical decoding message under
 	// test_decoding and its receive process fails on it (F14), so the message
 	// is only a fallback for pgoutput when the heartbeat table is off.
+	// Read-write explicitly, for the write freeze.
+	if _, err := c.Exec(ctx, `SET default_transaction_read_only = off`); err != nil {
+		return err
+	}
 	var hb *string
 	_ = c.QueryRow(ctx, `SELECT to_regclass('upwell.heartbeat')::text`).Scan(&hb)
 	if hb != nil {

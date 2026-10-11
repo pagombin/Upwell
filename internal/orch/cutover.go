@@ -172,6 +172,10 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 type CutoverParams struct {
 	ConfirmWritersStopped bool   `json:"confirm_writers_stopped"`
 	OverrideConfirm       string `json:"override_confirm"`
+	// WriteFreeze applies the write freeze at the writers step; FreezeConfirm
+	// must be the source cluster's name (FreezeConfirmName).
+	WriteFreeze   bool   `json:"write_freeze"`
+	FreezeConfirm string `json:"freeze_confirm"`
 }
 
 var cutoverCancels sync.Map // op id -> context.CancelFunc
@@ -220,8 +224,19 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 		if m.Flags.Verdict != "" {
 			return nil, uerr("verdict", "This migration already has a verdict.", "Restart the failed databases to try again.")
 		}
-		if !p.ConfirmWritersStopped {
-			return nil, uerr("confirm_writers", "Confirm that the customer has stopped every writer.", "Tick the confirmation in the cutover console.")
+		if p.WriteFreeze {
+			if role != "admin" {
+				return nil, uerr("admin_only", "Only an Admin can apply the write freeze.", "Ask an Admin, or stop writers by hand and confirm it.")
+			}
+			src, _, err := o.Conns(ctx, m)
+			if err != nil {
+				return nil, err
+			}
+			if want := FreezeConfirmName(src.Host); p.FreezeConfirm != want {
+				return nil, uerr("freeze_confirm", "Type the source cluster's name ("+want+") to apply the write freeze.", "Review the freeze preview first.")
+			}
+		} else if !p.ConfirmWritersStopped {
+			return nil, uerr("confirm_writers", "Confirm that the customer has stopped every writer.", "Tick the confirmation in the cutover console, or apply the write freeze.")
 		}
 		conds, ready, err := o.Readiness(ctx, m.ID)
 		if err != nil {
@@ -242,7 +257,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	steps := []Step{{Key: "readiness", Title: "Readiness gate"}, {Key: "writers", Title: "Confirm writers stopped"}, {Key: "heartbeat", Title: "Write final heartbeat"},
 		{Key: "await", Title: "Wait for the final heartbeat on the target"}, {Key: "endpos", Title: "Set end positions and nudge"}, {Key: "drain", Title: "Drain to end positions"}, {Key: "origin", Title: "Check target origin reached the final heartbeat"},
 		{Key: "sequences", Title: "Sync sequences"}, {Key: "verify", Title: "Verify data"}, {Key: "verdict", Title: "Verdict"}}
-	op, err := o.newOp(ctx, m.ID, "cutover", key, a.Username, steps, map[string]any{"confirm_writers_stopped": p.ConfirmWritersStopped, "override": p.OverrideConfirm != "", "continuing": continuing})
+	op, err := o.newOp(ctx, m.ID, "cutover", key, a.Username, steps, map[string]any{"confirm_writers_stopped": p.ConfirmWritersStopped, "override": p.OverrideConfirm != "", "write_freeze": p.WriteFreeze, "continuing": continuing})
 	if err != nil {
 		return op, err
 	}
@@ -255,7 +270,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 			f.Cutover.Phase = "readiness"
 		}
 	})
-	o.audit.Append(ctx, a, "cutover.start", m.ID, nil, map[string]any{"operation": op.ID, "confirm_writers_stopped": p.ConfirmWritersStopped, "continuing": continuing})
+	o.audit.Append(ctx, a, "cutover.start", m.ID, nil, map[string]any{"operation": op.ID, "confirm_writers_stopped": p.ConfirmWritersStopped, "write_freeze": p.WriteFreeze, "continuing": continuing})
 	o.refreshState(ctx, m.ID)
 	cctx, cancel := context.WithCancel(context.Background())
 	cutoverCancels.Store(op.ID, cancel)
@@ -295,6 +310,10 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		if f.Cutover == nil {
 			for _, d := range dbs {
 				o.setDB(bg, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil, "writes_baseline": nil})
+			}
+			// Streaming continues and applications keep the source.
+			if uerr := o.undoFreeze(bg, m.ID, "Upwell", "the cutover stopped before end positions: "+err.Error()); uerr != nil {
+				op.Log("error", "%v", uerr)
 			}
 		}
 		o.refreshState(bg, m.ID)
@@ -341,6 +360,13 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		secs := o.globalSettings(bg).Int("cutover_write_sample_seconds")
 		if secs <= 0 {
 			secs = 10
+		}
+		if p.WriteFreeze {
+			op.StepDetail("writers", "applying the write freeze", 0.1)
+			if err := o.applyFreeze(bg, m, a, dbs, src, op); err != nil {
+				fail("writers", err)
+				return
+			}
 		}
 		first := map[string]pgpack.Activity{}
 		for _, d := range dbs {
@@ -846,6 +872,14 @@ func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Opera
 	if f.Cutover != nil {
 		pause = f.Cutover.WritePauseMS
 	}
+	if verdict != "GO" {
+		// Applications stay on the source: give it its writes back.
+		if uerr := o.undoFreeze(ctx, m.ID, "Upwell", "the verdict is NO-GO"); uerr != nil {
+			op.Log("error", "%v", uerr)
+		}
+	} else if f.Freeze.Active() {
+		o.Event(ctx, m.ID, "", "write_freeze", "info", "The write freeze stays applied after GO, so nothing writes to the old source; undo it from the cutover console when the customer wants the source writable", nil)
+	}
 	if verdict == "GO" {
 		op.StepEnd("verdict", "done", fmt.Sprintf("GO: every database verified; write pause %s", (time.Duration(pause)*time.Millisecond).Round(time.Second)))
 		o.Event(ctx, m.ID, "", "verdict", "info", fmt.Sprintf("Cutover verdict GO: every database verified (write pause %s)", (time.Duration(pause)*time.Millisecond).Round(time.Second)), map[string]any{"verdict": verdict})
@@ -898,6 +932,9 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 	}
 	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Cutover = nil })
 	o.audit.Append(ctx, a, "cutover.abort", m.ID, nil, nil)
+	if err := o.undoFreeze(ctx, m.ID, a.Username, "the cutover was aborted"); err != nil {
+		o.Event(ctx, m.ID, "", "write_freeze", "critical", err.Error(), nil)
+	}
 	o.Event(ctx, m.ID, "", "cutover_aborted", "warning", "Cutover aborted by "+a.Username+" before end positions were set; streaming continues", nil)
 	o.refreshState(ctx, m.ID)
 	return nil

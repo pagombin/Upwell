@@ -5,7 +5,18 @@ export interface Flags {
   preflight_running?: boolean; preflight_ok?: boolean; preflight_run_id?: string; verdict?: string; verdict_at?: number;
   verifying?: boolean; cleanup_running?: boolean; verify_run_id?: string;
   cutover?: { op_id: string; phase: string; started_at: number; writes_stopped_at?: number; ended_at?: number; write_pause_ms?: number; override?: boolean; verdict?: string };
+  freeze?: FreezeState;
 }
+export interface FreezeState {
+  state: "applying" | "applied" | "undone"; applied_at: number; by: string; undone_at?: number; undone_by?: string; undo_reason?: string; undo_error?: string;
+  databases: { name: string; prior?: string; applied: boolean; terminated: number; not_terminated?: string[]; undone: boolean }[];
+}
+export interface FreezeTarget {
+  database: string; owner: boolean; pg_signal_backend: boolean; available: boolean; reason?: string; prior?: string;
+  sessions: { pid: number; user: string; application: string; client: string; state: string; open_write_transaction: boolean }[];
+  apply_sql: string[]; undo_sql: string[];
+}
+export interface FreezePreview { confirm: string; note: string; available: boolean; databases: FreezeTarget[]; active?: FreezeState }
 export interface Migration {
   id: string; short_id: string; name: string; state: string; mode: string; engine: string;
   source_conn_id?: string; target_conn_id?: string; settings: Record<string, unknown>; settings_snapshot?: Record<string, unknown>;

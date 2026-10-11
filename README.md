@@ -13,10 +13,10 @@ Upwell is a migration console for moving PostgreSQL databases between DigitalOce
 - A seven-step wizard: customer permission record, source and target with a live connection test, database selection, options, preflight (more than 50 checks; acceptable blockers can be accepted with a reason), and a plan review that shows the exact engine command for each database.
 - Online migrations of one or many databases, with a scheduler for concurrent base copies, live progress, charts and logs, per-database stop, resume and restart from zero, and pause, resume and abort for the whole migration.
 - Automatic recovery: transient failures resume with backoff; the engine being killed, the app restarting and the droplet rebooting are reconciled; a failed base copy or a lost slot goes to Restart required with a diagnosis.
-- A cutover console with manual stop-writes (Upwell samples the source to confirm writes really stopped), a write-pause timer, drain, sequence sync and **verification that compares data**, ending in GO or NO-GO.
+- A cutover console with manual stop-writes or an optional **write freeze** (with a preview of exactly what it runs and ends, an audit entry, automatic undo when the cutover does not end GO, and an always-available undo button), in both cases Upwell sampling the source to confirm writes really stopped, a write-pause timer, drain, sequence sync and **verification that compares data**, ending in GO or NO-GO.
 - An HTML and Markdown report, cleanup of slots, publications, origins, the heartbeat schema, work files and stored credentials, and alerts, events, logs, host metrics and system health screens.
 
-**Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand), notifications (Slack, email, PagerDuty), the Prometheus endpoint, PDF reports, the support bundle, SSO and TOTP, write freeze, a queue of several migrations, offline migrations and bundles, and self-serve mode.
+**Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand), notifications (Slack, email, PagerDuty), the Prometheus endpoint, PDF reports, the support bundle, SSO and TOTP, a queue of several migrations, offline migrations and bundles, and self-serve mode.
 
 ## Install
 
@@ -104,7 +104,7 @@ The verdict is decided per database and the migration is GO only if every databa
 - **Connection poolers.** Use the cluster's direct port when it has one. Behind a pooler, Upwell and pgcopydb work in session mode (tested with PgBouncer); transaction mode is refused by the connection test and preflight because the engine's session settings would be lost.
 - **DDL is not streamed.** Schema changes made on the source during a migration (a new table or partition, a changed column, a new enum value) do not reach the target. Upwell notices within a minute (a critical alert and a readiness condition that blocks the cutover), and verification would end NO-GO anyway (tested). Freeze schema changes until the cutover, or apply the same change on the target.
 - **Large objects are not streamed.** They are copied during the base copy and compared at verification; a change made while streaming ends NO-GO.
-- Write freeze is not available, so stopping writers is manual. Only online mode is available. One migration runs at a time per operator action (no queue).
+- **The write freeze is a strong guard, not a lock.** It makes new sessions read-only by default and ends client sessions; a session can still run `SET default_transaction_read_only = off` and write, which the writers check detects. It needs the admin user to own each source database and be a member of `pg_signal_backend`; otherwise preflight says so and writers are stopped by hand. Only online mode is available. One migration runs at a time per operator action (no queue).
 - systemd as PID 1, the polkit rule, the watchdog and reboot recovery could not be exercised in the build container; they are implemented to spec and marked "needs droplet" in `docs/PROGRESS.md`.
 
 ## Where things are

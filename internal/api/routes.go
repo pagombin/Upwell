@@ -97,8 +97,9 @@ func (s *Server) register() {
 	s.add("POST", "/api/v1/migrations/{id}/cutover", operator, "Start the cutover", s.cutover)
 	s.add("POST", "/api/v1/migrations/{id}/cutover/abort", operator, "Abort the cutover before end positions are set", s.abortCutover)
 	s.add("POST", "/api/v1/migrations/{id}/cutover/confirm-writers-stopped", operator, "Confirm writers stopped (part of starting the cutover)", s.cutover)
-	s.add("POST", "/api/v1/migrations/{id}/cutover/freeze", admin, "Write freeze (coming soon)", s.comingSoon("Write freeze"))
-	s.add("POST", "/api/v1/migrations/{id}/cutover/unfreeze", admin, "Undo write freeze (coming soon)", s.comingSoon("Write freeze"))
+	s.add("GET", "/api/v1/migrations/{id}/cutover/freeze", operator, "Preview the write freeze", s.freezePreview)
+	s.add("POST", "/api/v1/migrations/{id}/cutover/freeze", admin, "Start the cutover with the write freeze", s.cutoverWithFreeze)
+	s.add("POST", "/api/v1/migrations/{id}/cutover/unfreeze", operator, "Undo the write freeze", s.unfreeze)
 	s.add("POST", "/api/v1/migrations/{id}/switched", operator, "Mark applications switched", s.switched)
 	s.add("POST", "/api/v1/migrations/{id}/verify", operator, "Run verification again", s.verify)
 	s.add("GET", "/api/v1/migrations/{id}/verification", viewer, "Latest verification", s.verification)
@@ -833,6 +834,32 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) error {
 	}
 	op, err := s.Orch.StartCutover(r.Context(), actor(r), session(r).User.Role, r.PathValue("id"), r.Header.Get("Idempotency-Key"), in)
 	return opResponse(w, op, err)
+}
+
+func (s *Server) freezePreview(w http.ResponseWriter, r *http.Request) error {
+	pv, err := s.Orch.FreezePreviewFor(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, pv)
+}
+
+func (s *Server) cutoverWithFreeze(w http.ResponseWriter, r *http.Request) error {
+	var in orch.CutoverParams
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	in.WriteFreeze = true
+	op, err := s.Orch.StartCutover(r.Context(), actor(r), session(r).User.Role, r.PathValue("id"), r.Header.Get("Idempotency-Key"), in)
+	return opResponse(w, op, err)
+}
+
+func (s *Server) unfreeze(w http.ResponseWriter, r *http.Request) error {
+	m, err := s.Orch.UndoFreeze(r.Context(), actor(r), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, m)
 }
 
 func (s *Server) abortCutover(w http.ResponseWriter, r *http.Request) error {

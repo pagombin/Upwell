@@ -925,9 +925,9 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	var owner, sigBackend bool
 	p.row(sc, `SELECT pg_has_role((SELECT datdba FROM pg_database WHERE datname=current_database()),'MEMBER'), pg_has_role('pg_signal_backend','MEMBER')`).Scan(&owner, &sigBackend)
 	ev = map[string]any{"owner": owner, "pg_signal_backend": sigBackend}
-	msg := "Write freeze is coming soon; this database would support it."
+	msg := "The write freeze is available for this database at cutover."
 	if !owner || !sigBackend {
-		msg = "Write freeze is coming soon; this database would not support it (the admin does not own it or cannot end other sessions)."
+		msg = "The write freeze is not available for this database: the admin user must own it (ALTER DATABASE) and be a member of pg_signal_backend (to end other sessions). Stop writers by hand at cutover."
 	}
 	p.emit(check.Info, false, msg, "", ev)
 }

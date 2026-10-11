@@ -163,6 +163,9 @@ func EnsureHeartbeat(ctx context.Context, c pg.Conn) error {
 		return err
 	}
 	defer conn.Close(ctx)
+	if _, err := pg.Exec(ctx, conn, `SET default_transaction_read_only = off`); err != nil {
+		return err
+	}
 	_, err = pg.Exec(ctx, conn, HeartbeatDDL)
 	return err
 }
@@ -175,6 +178,11 @@ func WriteHeartbeat(ctx context.Context, c pg.Conn, kind, token string) (before 
 		return "", err
 	}
 	defer conn.Close(ctx)
+	// Read-write explicitly: under the write freeze new sessions default to
+	// read-only, and the heartbeat must still be written.
+	if _, err := pg.Exec(ctx, conn, `SET default_transaction_read_only = off`); err != nil {
+		return "", err
+	}
 	if err := pg.QueryRow(ctx, conn, `SELECT pg_current_wal_lsn()::text`).Scan(&before); err != nil {
 		return "", err
 	}

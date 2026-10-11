@@ -564,7 +564,7 @@ func WriteActivity(ctx context.Context, c pg.Conn) (Activity, error) {
 	if err := pg.QueryRow(ctx, conn, `SELECT COALESCE(sum(n_tup_ins+n_tup_upd+n_tup_del),0)::bigint FROM pg_stat_user_tables WHERE schemaname <> 'upwell'`).Scan(&a.Changes); err != nil {
 		return a, fmt.Errorf("reading row-change statistics: %w", err)
 	}
-	const others = `datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND COALESCE(application_name,'') NOT LIKE 'upwell%' AND COALESCE(application_name,'') NOT LIKE 'pgcopydb%'`
+	const others = ClientSessionsWhere
 	if a.OpenWriters, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' pid '||pid||' ('||COALESCE(application_name,'')||', '||state||', open '||
 		COALESCE(extract(epoch FROM now()-xact_start)::int,0)||' s)' FROM pg_stat_activity WHERE `+others+` AND backend_xid IS NOT NULL ORDER BY 1 LIMIT 50`); err != nil {
 		return a, fmt.Errorf("listing open write transactions: %w", err)

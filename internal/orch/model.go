@@ -82,6 +82,7 @@ type Flags struct {
 	VerifyRunID      string        `json:"verify_run_id,omitempty"`
 	Verifying        bool          `json:"verifying,omitempty"`
 	CleanupRunning   bool          `json:"cleanup_running,omitempty"`
+	Freeze           *FreezeState  `json:"freeze,omitempty"`
 }
 
 // Migration is one migration definition.

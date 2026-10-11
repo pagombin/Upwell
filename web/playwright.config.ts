@@ -19,8 +19,10 @@ export default defineConfig({
   },
   projects: [
     { name: "setup", testMatch: /auth\.setup\.ts/ },
-    { name: "ui", testMatch: /.*\.spec\.ts/, testIgnore: /flow\.spec\.ts/, dependencies: ["setup"] },
+    { name: "ui", testMatch: /.*\.spec\.ts/, testIgnore: /(flow|features)\.spec\.ts/, dependencies: ["setup"] },
     // The full walkthrough changes state, so dev/e2e.sh runs it on its own afterwards.
     { name: "flow", testMatch: /flow\.spec\.ts/, dependencies: ["setup"] },
+    // The overnight features change state too, and run after the walkthrough.
+    { name: "features", testMatch: /features\.spec\.ts/, dependencies: ["setup"] },
   ],
 });

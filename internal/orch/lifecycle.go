@@ -1130,6 +1130,9 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 		}
 	}
 	o.audit.Append(ctx, a, "migration.abort", m.ID, map[string]any{"state": m.State}, nil)
+	if err := o.undoFreeze(ctx, m.ID, a.Username, "the migration was aborted"); err != nil {
+		o.Event(ctx, m.ID, "", "write_freeze", "critical", err.Error(), nil)
+	}
 	o.Event(ctx, m.ID, "", "aborted", "warning", "Migration aborted by "+a.Username+"; clean up removes its slots, publications and origins", nil)
 	o.refreshState(ctx, m.ID)
 	return o.GetMigration(ctx, m.ID)
@@ -1195,6 +1198,13 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 		defer unlock()
 		for _, d := range included(dbs) {
 			o.setDB(bg, d.ID, map[string]any{"next_retry_at": nil})
+		}
+		// The stored credentials are needed to undo a write freeze: undo it
+		// before they are deleted, or stop.
+		if err := o.undoFreeze(bg, m.ID, a.Username, "the migration is being cleaned up"); err != nil {
+			o.updateFlags(bg, m.ID, func(f *Flags) { f.CleanupRunning = false })
+			op.Finish(fmt.Errorf("cleanup stopped: %w; the stored credentials are kept so the freeze can still be undone", err), nil)
+			return
 		}
 		var failed []string
 		for _, d := range included(dbs) {

@@ -65,6 +65,9 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 	ms, err := o.ListMigrations(tctx)
 	if err == nil {
 		for _, m := range ms {
+			if !m.Fixture && !m.Flags.CleanupRunning {
+				o.freezeJanitor(tctx, m)
+			}
 			if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp || m.Flags.CleanupRunning {
 				continue
 			}
@@ -496,6 +499,13 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 	ms, _ := o.ListMigrations(ctx)
 	g := o.globalSettings(ctx)
 	for _, m := range ms {
+		if !m.Fixture && m.Flags.Freeze.Active() && m.Flags.Verdict != "GO" {
+			// No cutover survives a restart: give the source its writes back.
+			// Continuing the cutover re-checks that writes stopped (D48).
+			if err := o.undoFreeze(ctx, m.ID, "Upwell", "Upwell restarted during the cutover"); err != nil {
+				o.logf("error", "orchestrator", m.ID, "", "", "%v", err)
+			}
+		}
 		if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp {
 			continue
 		}
