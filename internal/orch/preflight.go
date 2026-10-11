@@ -297,6 +297,11 @@ func (o *Orchestrator) Accept(ctx context.Context, a audit.Actor, mig, resultID,
 		if r.Hard {
 			return r, uerr("hard_blocker", "This blocker cannot be accepted: the migration would fail with it.", r.Remediation)
 		}
+		// The audit entry comes first: an acceptance that is not on the
+		// audit record is refused (D58).
+		if _, err := o.audit.Append(ctx, a, "preflight.accept", m.ID, nil, map[string]any{"check": r.CheckID, "scope": r.Scope, "database": r.Database, "evidence_hash": r.EvidenceHash, "reason": reason}); err != nil {
+			return r, uerr("audit_failed", "The risk was not accepted because the acceptance could not be recorded in the audit log: "+err.Error(), "Check the console's disk and logs, then try again.")
+		}
 		id := store.NewID()
 		now := store.Now()
 		o.st.DB.ExecContext(ctx, `UPDATE acceptances SET lapsed_at=? WHERE migration_id=? AND check_id=? AND scope=? AND database=? AND lapsed_at IS NULL`, now, m.ID, r.CheckID, r.Scope, r.Database)
@@ -306,7 +311,6 @@ func (o *Orchestrator) Accept(ctx context.Context, a audit.Actor, mig, resultID,
 			return r, err
 		}
 		r.Accepted = &check.Acceptance{ID: id, Reason: reason, AcceptedBy: a.Username, AcceptedAt: now}
-		o.audit.Append(ctx, a, "preflight.accept", m.ID, nil, map[string]any{"check": r.CheckID, "scope": r.Scope, "database": r.Database, "evidence_hash": r.EvidenceHash, "reason": reason})
 		o.Event(ctx, m.ID, r.Database, "accepted", "warning", fmt.Sprintf("%s accepted the risk %q: %s", a.Username, r.Title, reason), nil)
 		_, after, _ := o.LatestPreflight(ctx, m.ID)
 		o.updateFlags(ctx, m.ID, func(f *Flags) { f.PreflightOK = check.Summarize(after).CanStart })

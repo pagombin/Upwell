@@ -364,8 +364,12 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 				fail("writers", fmt.Errorf("writes have not stopped: %s. Stop every writer (and end open transactions), or an Admin can override by typing the migration name; verification then ends NO-GO if the source changed at all", strings.Join(changing, ", ")))
 				return
 			}
+			// An override that is not on the audit record does not happen (D58).
+			if _, err := o.audit.Append(bg, a, "cutover.override_writes", m.ID, nil, map[string]any{"changing": changing}); err != nil {
+				fail("writers", fmt.Errorf("the override of detected writes was refused because it could not be recorded in the audit log: %w", err))
+				return
+			}
 			override = true
-			o.audit.Append(bg, a, "cutover.override_writes", m.ID, nil, map[string]any{"changing": changing})
 			op.Log("warn", "Admin %s overrode detected writes: %s", a.Username, strings.Join(changing, ", "))
 		}
 		for _, d := range dbs {
@@ -678,14 +682,21 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	o.setPhase(ctx, m.ID, "sequences")
 	op.StepStart("sequences", "")
 	total := 0
+	var seqErrs []string
 	for _, d := range inc {
 		n, err := pgpack.SyncSequences(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
 		if err != nil {
-			op.LogDB("warn", d.SourceName, "sequence sync: %v", err)
+			op.LogDB("error", d.SourceName, "sequence sync failed: %v", err)
+			seqErrs = append(seqErrs, fmt.Sprintf("%s: %v", d.SourceName, err))
 		}
 		total += n
 	}
-	op.StepEnd("sequences", "done", fmt.Sprintf("%d sequence(s) synced", total))
+	if len(seqErrs) > 0 {
+		// Verification still compares every sequence and decides (D56).
+		op.StepEnd("sequences", "failed", fmt.Sprintf("%d sequence(s) synced; sync failed for %s; verification compares every sequence", total, strings.Join(seqErrs, "; ")))
+	} else {
+		op.StepEnd("sequences", "done", fmt.Sprintf("%d sequence(s) synced", total))
+	}
 
 	// 8. Verification.
 	o.setPhase(ctx, m.ID, "verify")
@@ -724,9 +735,16 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName,
 				Message: "The engine did not reach this database's end position during the cutover, so changes before it may be missing on the target."})
 		}
+		table := "verifications"
+		if o.testHooks.FailVerificationStore {
+			table = "verifications_unavailable"
+		}
+		var storeErr error
 		for _, r := range res.Results {
-			o.st.DB.ExecContext(ctx, `INSERT INTO verifications(id,migration_id,database,run_id,check_id,result,title,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
-				store.NewID(), m.ID, d.SourceName, runID, r.CheckID, r.Level, r.Title, toJSON(map[string]any{"message": r.Message, "evidence": r.Evidence}), store.Now())
+			if _, err := o.st.DB.ExecContext(ctx, `INSERT INTO `+table+`(id,migration_id,database,run_id,check_id,result,title,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
+				store.NewID(), m.ID, d.SourceName, runID, r.CheckID, r.Level, r.Title, toJSON(map[string]any{"message": r.Message, "evidence": r.Evidence}), store.Now()); err != nil && storeErr == nil {
+				storeErr = err
+			}
 			lvl := "info"
 			if r.Level == check.Blocker {
 				lvl = "error"
@@ -735,11 +753,19 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			}
 			op.LogDB(lvl, d.SourceName, "%s: %s", r.Title, r.Message)
 		}
+		if storeErr != nil {
+			// A verdict nobody can review is not a GO (D57).
+			res.GO = false
+			op.LogDB("error", d.SourceName, "verification results could not be recorded: %v", storeErr)
+		}
 		verdicts[d.SourceName] = res.GO
 		state, verdict, lastErr := DVerified, "GO", ""
 		if !res.GO {
 			state, verdict = DFailed, "NO-GO"
 			var why []string
+			if storeErr != nil {
+				why = append(why, "verification results could not be recorded ("+storeErr.Error()+")")
+			}
 			for _, r := range res.Results {
 				if r.Level == check.Blocker {
 					why = append(why, r.Title)
