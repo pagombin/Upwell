@@ -328,3 +328,12 @@ func Jobs(v Values, concurrent int) (table, index int) {
 	}
 	return
 }
+
+// Defaults returns every setting at its default value.
+func Defaults() Values {
+	v := Values{}
+	for _, d := range Catalog {
+		v[d.Key] = d.Default
+	}
+	return v
+}

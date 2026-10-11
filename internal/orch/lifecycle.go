@@ -233,13 +233,17 @@ func TestConnection(ctx context.Context, c pg.Conn, kind string) []ProbeResult {
 		out = append(out, ProbeResult{"replication", repl || super, map[bool]string{true: "The user has the REPLICATION privilege.", false: "The user lacks REPLICATION."}[repl || super]},
 			ProbeResult{"wal_level", wl == "logical", "wal_level is " + wl + "."})
 	} else {
-		ver, _ := pg.ServerVersionNum(ctx, conn)
-		ap := pgpack.TargetApplyPrivileges(ctx, conn, ver)
+		ver, verr := pg.ServerVersionNum(ctx, conn)
+		ap, err := pgpack.TargetApplyPrivileges(ctx, conn, ver)
 		msg := "The user can apply replicated changes."
-		if !ap.OK {
+		okAP := ap.OK && err == nil && verr == nil
+		switch {
+		case verr != nil || err != nil:
+			msg = "Could not check the apply privileges: " + firstErr(verr, err).Error() + "."
+		case !ap.OK:
 			msg = "The user cannot " + strings.Join(ap.Missing, " or ") + "."
 		}
-		out = append(out, ProbeResult{"apply_privileges", ap.OK, msg}, ProbeResult{"createdb", createdb || super, map[bool]string{true: "The user can create databases.", false: "The user cannot create databases."}[createdb || super]})
+		out = append(out, ProbeResult{"apply_privileges", okAP, msg}, ProbeResult{"createdb", createdb || super, map[bool]string{true: "The user can create databases.", false: "The user cannot create databases."}[createdb || super]})
 	}
 	return out
 }
@@ -582,9 +586,13 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		done("failed: " + err.Error())
 		return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not connect to target database "+d.TargetName+" to confirm the apply privileges, so it did not start the engine (finding F2): "+err.Error()+". Nothing was copied; restart it from zero once the target is reachable.")
 	} else {
-		ver, _ := pg.ServerVersionNum(ctx, tc)
-		ap := pgpack.TargetApplyPrivileges(ctx, tc, ver)
+		ver, verr := pg.ServerVersionNum(ctx, tc)
+		ap, err := pgpack.TargetApplyPrivileges(ctx, tc, ver)
 		tc.Close(ctx)
+		if err = firstErr(verr, err); err != nil {
+			done("failed: apply privileges not confirmed")
+			return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not confirm the apply privileges on target database "+d.TargetName+" ("+err.Error()+"), so it did not start the engine (finding F2). Nothing was copied; restart it from zero.")
+		}
 		if !ap.OK {
 			done("failed: apply privileges")
 			return o.dbFailed(ctx, m, d, engine.FailPermanent, "On target database "+d.TargetName+" the user cannot "+strings.Join(ap.Missing, " or ")+
@@ -1188,4 +1196,14 @@ func orDash(s string) string {
 		return "no client address"
 	}
 	return s
+}
+
+// firstErr returns the first non-nil error.
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }

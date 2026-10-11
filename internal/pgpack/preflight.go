@@ -364,11 +364,23 @@ func (r *Runner) clusterChecks(ctx context.Context) {
 			}
 			continue
 		}
-		ver, _ := pg.ServerVersionNum(ctx, conn)
+		cp := r.probe(ctx, "connect", side.name, "")
+		ver, verr := pg.ServerVersionNum(ctx, conn)
+		cp.fail(verr)
 		var vs string
-		conn.QueryRow(ctx, `SHOW server_version`).Scan(&vs)
-		ok(r, "connect", side.name, "", fmt.Sprintf("Connected to PostgreSQL %s as %s.", vs, side.c.User), map[string]any{"server_version": vs}, t)
+		cp.row(conn, `SHOW server_version`).Scan(&vs)
+		cp.ok(fmt.Sprintf("Connected to PostgreSQL %s as %s.", vs, side.c.User), map[string]any{"server_version": vs})
 		ok(r, "trusted_sources", side.name, "", "Confirmed by connecting (the DigitalOcean API check is coming soon).", map[string]any{"method": "connect"}, t)
+		if cp.err != nil {
+			// Without the server version nothing after this can be judged.
+			conn.Close(ctx)
+			if side.name == "source" {
+				r.srcErr = cp.err
+			} else {
+				r.dstErr = cp.err
+			}
+			continue
+		}
 		t = time.Now()
 		r.sessionCheck(ctx, side.name, conn, side.c, t)
 		if side.name == "source" {
@@ -394,94 +406,96 @@ func (r *Runner) clusterChecks(ctx context.Context) {
 	} else {
 		ok(r, "version_order", "", "", fmt.Sprintf("PostgreSQL %d to %d.", r.srcVer/10000, r.dstVer/10000), ev, t)
 	}
-	t = time.Now()
+	p := r.probe(ctx, "primary", "", "")
 	var sRec, dRec bool
-	r.src.QueryRow(ctx, `SELECT pg_is_in_recovery()`).Scan(&sRec)
-	r.dst.QueryRow(ctx, `SELECT pg_is_in_recovery()`).Scan(&dRec)
+	p.row(r.src, `SELECT pg_is_in_recovery()`).Scan(&sRec)
+	p.row(r.dst, `SELECT pg_is_in_recovery()`).Scan(&dRec)
 	if sRec || dRec {
-		r.emit("primary", "", "", check.Blocker, true, "One endpoint is a standby; both must be primaries.", "Use the primary's connection details, not a read-only node's.", map[string]any{"source_standby": sRec, "target_standby": dRec}, t)
+		p.emit(check.Blocker, true, "One endpoint is a standby; both must be primaries.", "Use the primary's connection details, not a read-only node's.", map[string]any{"source_standby": sRec, "target_standby": dRec})
 	} else {
-		ok(r, "primary", "", "", "Both endpoints are primaries.", map[string]any{"source_standby": false, "target_standby": false}, t)
+		p.ok("Both endpoints are primaries.", map[string]any{"source_standby": false, "target_standby": false})
 	}
-	t = time.Now()
+	p = r.probe(ctx, "connections", "", "")
 	n := max(len(e.Databases), 1)
 	conc := min(n, max(e.Settings.Int("max_concurrent_base_copies"), 1))
 	tj, ij := settings.Jobs(e.Settings, conc)
 	need := conc*(tj+ij+4) + 4
-	sFree, dFree := freeConns(ctx, r.src), freeConns(ctx, r.dst)
+	sFree, dFree := freeConns(p, r.src), freeConns(p, r.dst)
 	ev = map[string]any{"needed": need, "source_free": sFree, "target_free": dFree, "table_jobs": tj, "index_jobs": ij, "concurrent": conc}
 	if sFree < need || dFree < need {
-		r.emit("connections", "", "", check.Blocker, false, fmt.Sprintf("The engines will open about %d connections at once; the source has %d free and the target %d.", need, sFree, dFree),
-			"Lower table and index jobs or max concurrent base copies in Options, or accept the risk if the estimate is pessimistic.", ev, t)
+		p.emit(check.Blocker, false, fmt.Sprintf("The engines will open about %d connections at once; the source has %d free and the target %d.", need, sFree, dFree),
+			"Lower table and index jobs or max concurrent base copies in Options, or accept the risk if the estimate is pessimistic.", ev)
 	} else {
-		ok(r, "connections", "", "", fmt.Sprintf("About %d connections needed; %d free on the source and %d on the target.", need, sFree, dFree), ev, t)
+		p.ok(fmt.Sprintf("About %d connections needed; %d free on the source and %d on the target.", need, sFree, dFree), ev)
 	}
 }
 
-func freeConns(ctx context.Context, c *pgx.Conn) int {
+func freeConns(p *probe, c *pgx.Conn) int {
 	var max, used, reserved int
-	c.QueryRow(ctx, `SELECT current_setting('max_connections')::int, (SELECT count(*) FROM pg_stat_activity), current_setting('superuser_reserved_connections')::int`).Scan(&max, &used, &reserved)
+	p.row(c, `SELECT current_setting('max_connections')::int, (SELECT count(*) FROM pg_stat_activity), current_setting('superuser_reserved_connections')::int`).Scan(&max, &used, &reserved)
 	return max - used - reserved
 }
 
 func (r *Runner) sourceChecks(ctx context.Context) {
 	e := r.Env
 	c := r.src
-	t := time.Now()
+	p := r.probe(ctx, "wal_level", "", "")
 	var walLevel string
-	c.QueryRow(ctx, `SHOW wal_level`).Scan(&walLevel)
+	p.row(c, `SHOW wal_level`).Scan(&walLevel)
 	if walLevel != "logical" {
-		r.emit("wal_level", "", "", check.Blocker, true, "wal_level is "+walLevel+"; online migration needs logical.", "Set wal_level to logical on the source (on DigitalOcean this is on by default for PostgreSQL clusters).", map[string]any{"wal_level": walLevel}, t)
+		p.emit(check.Blocker, true, "wal_level is "+walLevel+"; online migration needs logical.", "Set wal_level to logical on the source (on DigitalOcean this is on by default for PostgreSQL clusters).", map[string]any{"wal_level": walLevel})
 	} else {
-		ok(r, "wal_level", "", "", "wal_level is logical.", map[string]any{"wal_level": walLevel}, t)
+		p.ok("wal_level is logical.", map[string]any{"wal_level": walLevel})
 	}
 	n := len(e.Databases)
-	t = time.Now()
+	p = r.probe(ctx, "repl_slots", "", "")
 	var maxSlots, usedSlots, maxSenders, usedSenders int
-	c.QueryRow(ctx, `SELECT current_setting('max_replication_slots')::int, (SELECT count(*) FROM pg_replication_slots), current_setting('max_wal_senders')::int, (SELECT count(*) FROM pg_stat_replication)`).Scan(&maxSlots, &usedSlots, &maxSenders, &usedSenders)
+	p.row(c, `SELECT current_setting('max_replication_slots')::int, (SELECT count(*) FROM pg_replication_slots), current_setting('max_wal_senders')::int, (SELECT count(*) FROM pg_stat_replication)`).Scan(&maxSlots, &usedSlots, &maxSenders, &usedSenders)
+	ps := r.probe(ctx, "wal_senders", "", "")
+	ps.fail(p.err)
 	ev := map[string]any{"max": maxSlots, "used": usedSlots, "needed": n}
 	if e.Resuming {
 		usedSlots -= n
 	}
 	if maxSlots-usedSlots < n {
-		r.emit("repl_slots", "", "", check.Blocker, true, fmt.Sprintf("%d replication slots are free and %d databases need one each.", maxSlots-usedSlots, n), "Split the databases into several migrations, or remove unused slots.", ev, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("%d replication slots are free and %d databases need one each.", maxSlots-usedSlots, n), "Split the databases into several migrations, or remove unused slots.", ev)
 	} else {
-		ok(r, "repl_slots", "", "", fmt.Sprintf("%d of %d slots free; %d needed.", maxSlots-usedSlots, maxSlots, n), ev, t)
+		p.ok(fmt.Sprintf("%d of %d slots free; %d needed.", maxSlots-usedSlots, maxSlots, n), ev)
 	}
 	ev = map[string]any{"max": maxSenders, "used": usedSenders, "needed": n}
 	if maxSenders-usedSenders < n {
-		r.emit("wal_senders", "", "", check.Blocker, true, fmt.Sprintf("%d WAL senders are free and %d databases need one each.", maxSenders-usedSenders, n), "Split the databases into several migrations.", ev, t)
+		ps.emit(check.Blocker, true, fmt.Sprintf("%d WAL senders are free and %d databases need one each.", maxSenders-usedSenders, n), "Split the databases into several migrations.", ev)
 	} else {
-		ok(r, "wal_senders", "", "", fmt.Sprintf("%d of %d WAL senders free; %d needed.", maxSenders-usedSenders, maxSenders, n), ev, t)
+		ps.ok(fmt.Sprintf("%d of %d WAL senders free; %d needed.", maxSenders-usedSenders, maxSenders, n), ev)
 	}
-	t = time.Now()
+	p = r.probe(ctx, "repl_privilege", "", "")
 	var repl, super bool
-	c.QueryRow(ctx, `SELECT rolreplication, rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&repl, &super)
+	p.row(c, `SELECT rolreplication, rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&repl, &super)
 	if !repl && !super {
-		r.emit("repl_privilege", "", "", check.Blocker, true, e.Source.User+" has neither REPLICATION nor superuser.", "Use the cluster's admin user (doadmin), which has REPLICATION.", map[string]any{"replication": repl, "superuser": super}, t)
+		p.emit(check.Blocker, true, e.Source.User+" has neither REPLICATION nor superuser.", "Use the cluster's admin user (doadmin), which has REPLICATION.", map[string]any{"replication": repl, "superuser": super})
 	} else {
-		ok(r, "repl_privilege", "", "", e.Source.User+" has the REPLICATION privilege.", map[string]any{"replication": repl, "superuser": super}, t)
+		p.ok(e.Source.User+" has the REPLICATION privilege.", map[string]any{"replication": repl, "superuser": super})
 	}
-	t = time.Now()
+	p = r.probe(ctx, "prepared_xacts", "", "")
 	var prepared int
-	c.QueryRow(ctx, `SELECT count(*) FROM pg_prepared_xacts`).Scan(&prepared)
+	p.row(c, `SELECT count(*) FROM pg_prepared_xacts`).Scan(&prepared)
 	if prepared > 0 {
-		r.emit("prepared_xacts", "", "", check.Blocker, false, fmt.Sprintf("%d prepared transactions are open; creating a replication slot waits behind them.", prepared), "Commit or roll back the prepared transactions, or accept the risk that slot creation may wait.", map[string]any{"count": prepared}, t)
+		p.emit(check.Blocker, false, fmt.Sprintf("%d prepared transactions are open; creating a replication slot waits behind them.", prepared), "Commit or roll back the prepared transactions, or accept the risk that slot creation may wait.", map[string]any{"count": prepared})
 	} else {
-		ok(r, "prepared_xacts", "", "", "No prepared transactions.", map[string]any{"count": 0}, t)
+		p.ok("No prepared transactions.", map[string]any{"count": 0})
 	}
-	t = time.Now()
+	p = r.probe(ctx, "long_transactions", "", "")
 	mins := max(e.Settings.Int("long_transaction_minutes"), 1)
 	var longCount int
 	var oldest *float64
-	c.QueryRow(ctx, `SELECT count(*), max(extract(epoch FROM now()-xact_start)) FROM pg_stat_activity WHERE xact_start < now() - make_interval(mins => $1) AND backend_type='client backend'`, mins).Scan(&longCount, &oldest)
+	p.row(c, `SELECT count(*), max(extract(epoch FROM now()-xact_start))::float8 FROM pg_stat_activity WHERE xact_start < now() - make_interval(mins => $1) AND backend_type='client backend'`, mins).Scan(&longCount, &oldest)
 	if longCount > 0 {
-		r.emit("long_transactions", "", "", check.Warning, false, fmt.Sprintf("%d transactions have been open longer than %d minutes; the base copy snapshot waits for them.", longCount, mins), "Find them in pg_stat_activity and ask the customer whether they can end.", map[string]any{"count": longCount, "_oldest_seconds": oldest}, t)
+		p.emit(check.Warning, false, fmt.Sprintf("%d transactions have been open longer than %d minutes; the base copy snapshot waits for them.", longCount, mins), "Find them in pg_stat_activity and ask the customer whether they can end.", map[string]any{"count": longCount, "_oldest_seconds": oldest})
 	} else {
-		ok(r, "long_transactions", "", "", fmt.Sprintf("No transactions open longer than %d minutes.", mins), map[string]any{"count": 0}, t)
+		p.ok(fmt.Sprintf("No transactions open longer than %d minutes.", mins), map[string]any{"count": 0})
 	}
-	t = time.Now()
-	r.emit("maintenance_window", "", "", check.Info, false, "Not checked: the maintenance window comes from the DigitalOcean API, which is coming soon. Check the cluster's maintenance window in the control panel.", "", map[string]any{"checked": false}, t)
+	t := time.Now()
+	r.emit("maintenance_window", "", "", check.Info, false, "Not checked: the maintenance window comes from the DigitalOcean API, which is not available in this version. Check the cluster's maintenance window in the control panel.", "", map[string]any{"checked": false}, t)
 	t = time.Now()
 	names := make([]string, 0, n)
 	for _, d := range e.Databases {
@@ -492,42 +506,35 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	} else {
 		ok(r, "databases", "", "", fmt.Sprintf("%d database(s) selected: %s.", n, strings.Join(names, ", ")), map[string]any{"databases": names}, t)
 	}
-	t = time.Now()
 	// Read the timeouts an engine session inherits, on a connection that does
 	// not set its own statement timeout, and compare them with the estimated
 	// base copy: pgcopydb holds its snapshot in a transaction that stays idle
 	// for the whole copy, and a large table's COPY is one statement.
+	p = r.probe(ctx, "session_timeouts", "", "")
 	ms := map[string]int64{}
-	var readErr error
 	if tc, err := pg.Connect(ctx, e.Source, 0); err != nil {
-		readErr = err
+		p.fail(err)
 	} else {
-		if rows, err := tc.Query(ctx, `SELECT name, setting::bigint FROM pg_settings WHERE name IN ('statement_timeout','idle_in_transaction_session_timeout','idle_session_timeout')`); err == nil {
+		if rows, err := pg.Query(ctx, tc, `SELECT name, setting::bigint FROM pg_settings WHERE name IN ('statement_timeout','idle_in_transaction_session_timeout','idle_session_timeout')`); err == nil {
 			for rows.Next() {
 				var n string
 				var v int64
-				if rows.Scan(&n, &v) == nil {
-					ms[n] = v
-				}
+				p.fail(rows.Scan(&n, &v))
+				ms[n] = v
 			}
+			p.fail(rows.Err())
 			rows.Close()
 		} else {
-			readErr = err
+			p.fail(err)
 		}
 		// ALTER DATABASE ... SET and ALTER ROLE ... IN DATABASE ... SET apply
 		// only inside the migrated databases, not the maintenance database.
-		names := make([]string, 0, len(e.Databases))
-		for _, d := range e.Databases {
-			names = append(names, d.Source)
-		}
-		if cfgs, err := pg.QueryStrings(ctx, tc, `SELECT unnest(s.setconfig) FROM pg_db_role_setting s JOIN pg_database d ON d.oid=s.setdatabase
-			WHERE d.datname = ANY($1) AND s.setrole IN (0, (SELECT oid FROM pg_roles WHERE rolname=current_user))`, names); err == nil {
-			for _, kv := range cfgs {
-				k, v, _ := strings.Cut(kv, "=")
-				if k == "idle_session_timeout" {
-					if n := settingMillis(v); n > 0 && (ms[k] == 0 || n < ms[k]) {
-						ms[k] = n
-					}
+		for _, kv := range p.strings(tc, `SELECT unnest(s.setconfig) FROM pg_db_role_setting s JOIN pg_database d ON d.oid=s.setdatabase
+			WHERE d.datname = ANY($1) AND s.setrole IN (0, (SELECT oid FROM pg_roles WHERE rolname=current_user))`, names) {
+			k, v, _ := strings.Cut(kv, "=")
+			if k == "idle_session_timeout" {
+				if n := settingMillis(v); n > 0 && (ms[k] == 0 || n < ms[k]) {
+					ms[k] = n
 				}
 			}
 		}
@@ -536,9 +543,8 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	var srcBytes int64
 	for _, d := range e.Databases {
 		var b int64
-		if r.src != nil && r.src.QueryRow(ctx, `SELECT pg_database_size($1)`, d.Source).Scan(&b) == nil {
-			srcBytes += b
-		}
+		p.row(c, `SELECT pg_database_size($1)`, d.Source).Scan(&b)
+		srcBytes += b
 	}
 	mibs := e.Settings.Float("assumed_throughput_mibs")
 	if mibs <= 0 {
@@ -566,31 +572,28 @@ func (r *Runner) sourceChecks(ctx context.Context) {
 	ev = map[string]any{"timeouts_ms": ms, "_estimated_copy_seconds": copySecs, "_required_seconds": need, "cleared_by_engine": []string{"statement_timeout", "idle_in_transaction_session_timeout"}}
 	idleSess := float64(ms["idle_session_timeout"]) / 1000
 	switch {
-	case readErr != nil:
-		r.emit("session_timeouts", "", "", check.Warning, false, "Could not read the session timeouts that apply to engine sessions: "+readErr.Error(), "Run preflight again.", ev, t)
 	case idleSess > 0 && idleSess < need:
-		r.emit("session_timeouts", "", "", check.Blocker, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, shorter than %s (three times the estimated base copy, at least 6 hours). pgcopydb does not override it, so an engine connection waiting for others could be closed.%s", e.Source.User, humanDuration(idleSess), humanDuration(need), note),
-			"Clear it for the admin role (ALTER ROLE "+pg.QuoteIdent(e.Source.User)+" RESET idle_session_timeout) or accept the risk.", ev, t)
+		p.emit(check.Blocker, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, shorter than %s (three times the estimated base copy, at least 6 hours). pgcopydb does not override it, so an engine connection waiting for others could be closed.%s", e.Source.User, humanDuration(idleSess), humanDuration(need), note),
+			"Clear it for the admin role (ALTER ROLE "+pg.QuoteIdent(e.Source.User)+" RESET idle_session_timeout) or accept the risk.", ev)
 	case idleSess > 0:
-		r.emit("session_timeouts", "", "", check.Warning, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, long enough for the estimated base copy of %s.%s", e.Source.User, humanDuration(idleSess), humanDuration(copySecs), note),
-			"Nothing to do unless the copy runs far slower than estimated.", ev, t)
+		p.emit(check.Warning, false, fmt.Sprintf("Sessions for %s inherit idle_session_timeout %s, long enough for the estimated base copy of %s.%s", e.Source.User, humanDuration(idleSess), humanDuration(copySecs), note),
+			"Nothing to do unless the copy runs far slower than estimated.", ev)
 	default:
-		ok(r, "session_timeouts", "", "", "No timeout can cut the engine's sessions."+note, ev, t)
+		p.ok("No timeout can cut the engine's sessions."+note, ev)
 	}
 }
 
 func (r *Runner) targetChecks(ctx context.Context) {
 	e := r.Env
-	t := time.Now()
+	p := r.probe(ctx, "target_disk", "", "")
 	var used int64
-	r.dst.QueryRow(ctx, `SELECT COALESCE(sum(pg_database_size(oid)),0) FROM pg_database WHERE datallowconn`).Scan(&used)
+	p.row(r.dst, `SELECT COALESCE(sum(pg_database_size(oid)),0)::bigint FROM pg_database WHERE datallowconn`).Scan(&used)
 	var srcBytes int64
 	if r.src != nil {
 		for _, d := range e.Databases {
 			var b int64
-			if r.src.QueryRow(ctx, `SELECT pg_database_size($1)`, d.Source).Scan(&b) == nil {
-				srcBytes += b
-			}
+			p.row(r.src, `SELECT pg_database_size($1)`, d.Source).Scan(&b)
+			srcBytes += b
 		}
 	}
 	r.totalSourceBytes = srcBytes
@@ -602,11 +605,11 @@ func (r *Runner) targetChecks(ctx context.Context) {
 	ev := map[string]any{"target_used_bytes": used, "source_bytes": srcBytes, "factor": factor, "storage_gb": e.TargetStorageGB}
 	switch {
 	case e.TargetStorageGB <= 0:
-		r.emit("target_disk", "", "", check.Warning, false, fmt.Sprintf("Target storage size is unknown; the migration needs about %s.", humanBytes(need)), "Enter the target's storage size in the Target step so Upwell can check it.", ev, t)
+		p.emit(check.Warning, false, fmt.Sprintf("Target storage size is unknown; the migration needs about %s.", humanBytes(need)), "Enter the target's storage size in the Target step so Upwell can check it.", ev)
 	case need > e.TargetStorageGB*(1<<30):
-		r.emit("target_disk", "", "", check.Blocker, false, fmt.Sprintf("The target has %.0f GB; existing data plus %.1f × the databases being migrated needs %s.", e.TargetStorageGB, factor, humanBytes(need)), "Resize the target's storage before starting, or accept the risk.", ev, t)
+		p.emit(check.Blocker, false, fmt.Sprintf("The target has %.0f GB; existing data plus %.1f × the databases being migrated needs %s.", e.TargetStorageGB, factor, humanBytes(need)), "Resize the target's storage before starting, or accept the risk.", ev)
 	default:
-		ok(r, "target_disk", "", "", fmt.Sprintf("Needs about %s of the target's %.0f GB.", humanBytes(need), e.TargetStorageGB), ev, t)
+		p.ok(fmt.Sprintf("Needs about %s of the target's %.0f GB.", humanBytes(need), e.TargetStorageGB), ev)
 	}
 }
 
@@ -638,14 +641,14 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		ok(r, "repl_protocol", "", d.Source, "Replication connection works.", map[string]any{}, t)
 	}
 
-	t = time.Now()
-	noRead, _ := pg.QueryStrings(ctx, sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	p := r.probe(ctx, "read_privs", "", d.Source)
+	noRead := p.strings(sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p','S') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT has_table_privilege(c.oid,'SELECT') ORDER BY 1 LIMIT 50`)
 	if len(noRead) > 0 {
-		r.emit("read_privs", "", d.Source, check.Blocker, true, fmt.Sprintf("%s cannot read %d table(s) or sequence(s), for example %s.", e.Source.User, len(noRead), noRead[0]), "Grant SELECT on them to the admin user, or migrate as their owner.", map[string]any{"unreadable": noRead}, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("%s cannot read %d table(s) or sequence(s), for example %s.", e.Source.User, len(noRead), noRead[0]), "Grant SELECT on them to the admin user, or migrate as their owner.", map[string]any{"unreadable": noRead})
 	} else {
-		ok(r, "read_privs", "", d.Source, "Every table and sequence is readable.", map[string]any{"unreadable": []string{}}, t)
+		p.ok("Every table and sequence is readable.", map[string]any{"unreadable": []string{}})
 	}
 
 	t = time.Now()
@@ -653,7 +656,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	ev := map[string]any{"plugin": choice.Plugin, "reasons": choice.Reasons}
 	switch {
 	case err != nil:
-		r.emit("publication_privs", "", d.Source, check.Blocker, true, "Could not check publication feasibility: "+err.Error(), "", ev, t)
+		r.couldNotCheck("publication_privs", "", d.Source, err, ev, t)
 	case !choice.OK:
 		r.emit("publication_privs", "", d.Source, check.Blocker, true, "pgoutput is forced but cannot work here: "+strings.Join(choice.Reasons, "; ")+".", "Set the decoding plugin to auto or test_decoding.", ev, t)
 	case len(choice.Reasons) > 0:
@@ -662,8 +665,8 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		ok(r, "publication_privs", "", d.Source, "pgoutput can create its publication.", ev, t)
 	}
 
-	t = time.Now()
-	noIdent, _ := pg.QueryStrings(ctx, sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	p = r.probe(ctx, "replica_identity", "", d.Source)
+	noIdent := p.strings(sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')
 		ORDER BY 1 LIMIT 100`)
@@ -672,53 +675,53 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		// application's own UPDATE and DELETE on these tables on the source
 		// ("cannot update table ... publishes updates"), so accepting this would
 		// break the customer's writes while the migration runs (tested).
-		r.emit("replica_identity", "", d.Source, check.Blocker, true, fmt.Sprintf("%d table(s) have no primary key or replica identity (for example %s). While the migration runs, the application's UPDATE and DELETE on them would fail with an error on the source, and they could not be replayed.", len(noIdent), noIdent[0]),
-			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent}, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have no primary key or replica identity (for example %s). While the migration runs, the application's UPDATE and DELETE on them would fail with an error on the source, and they could not be replayed.", len(noIdent), noIdent[0]),
+			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent})
 	} else {
-		ok(r, "replica_identity", "", d.Source, "Every table can replay updates and deletes.", map[string]any{"tables": []string{}}, t)
+		p.ok("Every table can replay updates and deletes.", map[string]any{"tables": []string{}})
 	}
 
 	// Row-level security that applies to the admin user: the engine's COPY
 	// would return only the rows its policies allow, silently.
-	t = time.Now()
-	rls, _ := pg.QueryStrings(ctx, sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	p = r.probe(ctx, "row_security", "", d.Source)
+	rls := p.strings(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND c.relrowsecurity AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT (SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname=current_user)
 		AND (c.relforcerowsecurity OR NOT pg_has_role(c.relowner, 'USAGE'))
 		ORDER BY 1 LIMIT 100`)
 	if len(rls) > 0 {
-		r.emit("row_security", "", d.Source, check.Blocker, true, fmt.Sprintf("%d table(s) have row-level security that applies to %s (for example %s): the copy would contain only the rows its policies allow, and verification cannot read them all.", len(rls), e.Source.User, rls[0]),
-			"Disable or relax the policies for the migration (ALTER TABLE ... NO FORCE ROW LEVEL SECURITY when the admin user owns the table), or migrate with a user that bypasses row-level security.", map[string]any{"tables": rls}, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have row-level security that applies to %s (for example %s): the copy would contain only the rows its policies allow, and verification cannot read them all.", len(rls), e.Source.User, rls[0]),
+			"Disable or relax the policies for the migration (ALTER TABLE ... NO FORCE ROW LEVEL SECURITY when the admin user owns the table), or migrate with a user that bypasses row-level security.", map[string]any{"tables": rls})
 	} else {
-		ok(r, "row_security", "", d.Source, "No row-level security hides rows from the migration.", map[string]any{}, t)
+		p.ok("No row-level security hides rows from the migration.", map[string]any{})
 	}
 
 	// REPLICA IDENTITY FULL: the engine finds the old row by comparing every
 	// column. Types without an equality operator (json, xml, the geometric
 	// types) make that comparison fail, so updates and deletes cannot apply.
-	t = time.Now()
-	noEq, _ := pg.QueryStrings(ctx, sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
+	p = r.probe(ctx, "identity_full_types", "", d.Source)
+	noEq := p.strings(sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
 		JOIN pg_type ty ON ty.oid=a.atttypid LEFT JOIN pg_type el ON el.oid=ty.typelem AND ty.typlen=-1 AND ty.typelem<>0
 		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
 		AND (ty.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle') OR el.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle'))
 		ORDER BY 1 LIMIT 100`)
 	if len(noEq) > 0 {
-		r.emit("identity_full_types", "", d.Source, check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", len(noEq), noEq[0]),
-			"Give these tables a primary key (or a unique index used with REPLICA IDENTITY USING INDEX), or change json columns to jsonb, then run preflight again.", map[string]any{"columns": noEq}, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", len(noEq), noEq[0]),
+			"Give these tables a primary key (or a unique index used with REPLICA IDENTITY USING INDEX), or change json columns to jsonb, then run preflight again.", map[string]any{"columns": noEq})
 	} else {
-		ok(r, "identity_full_types", "", d.Source, "Tables with full replica identity have only comparable columns.", map[string]any{}, t)
+		p.ok("Tables with full replica identity have only comparable columns.", map[string]any{})
 	}
-	t = time.Now()
-	fullNoKey, _ := pg.QueryStrings(ctx, sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	p = r.probe(ctx, "identity_full_duplicates", "", d.Source)
+	fullNoKey := p.strings(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisunique AND i.indpred IS NULL)
 		ORDER BY 1 LIMIT 100`)
 	if len(fullNoKey) > 0 {
-		r.emit("identity_full_duplicates", "", d.Source, check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", len(fullNoKey), fullNoKey[0]),
-			"Add a primary key if the table can hold identical rows.", map[string]any{"tables": fullNoKey}, t)
+		p.emit(check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", len(fullNoKey), fullNoKey[0]),
+			"Add a primary key if the table can hold identical rows.", map[string]any{"tables": fullNoKey})
 	} else {
-		ok(r, "identity_full_duplicates", "", d.Source, "Every table with full replica identity has a unique key.", map[string]any{}, t)
+		p.ok("Every table with full replica identity has a unique key.", map[string]any{})
 	}
 
 	simple := []struct{ id, q, msg, fix string }{
@@ -731,76 +734,83 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		{"pg_partman", `SELECT count(*) FROM pg_extension WHERE extname='pg_partman'`, "pg_partman is installed; partition maintenance must run on only one side at a time%.0d.", "Pause partition maintenance on the source after cutover."},
 	}
 	for _, s := range simple {
-		t = time.Now()
+		p = r.probe(ctx, s.id, "", d.Source)
 		var n int64
-		if err := sc.QueryRow(ctx, s.q).Scan(&n); err != nil {
-			r.emit(s.id, "", d.Source, check.Info, false, "Not checked: "+err.Error(), "", map[string]any{"error": err.Error()}, t)
-			continue
-		}
+		p.row(sc, s.q).Scan(&n)
 		if n > 0 {
-			r.emit(s.id, "", d.Source, check.Warning, false, fmt.Sprintf(s.msg, n), s.fix, map[string]any{"count": n}, t)
+			p.emit(check.Warning, false, fmt.Sprintf(s.msg, n), s.fix, map[string]any{"count": n})
 		} else {
-			ok(r, s.id, "", d.Source, "None.", map[string]any{"count": 0}, t)
+			p.ok("None.", map[string]any{"count": 0})
 		}
 	}
 
-	// Target side.
-	t = time.Now()
+	// Target side. The source's encoding and locale, and whether the target
+	// database exists, feed three checks; an error in either query fails all three.
+	src := r.probe(ctx, "dst_database", "", d.Source)
 	var srcEnc, srcCollate, srcCtype string
-	sc.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname=current_database()`).Scan(&srcEnc, &srcCollate, &srcCtype)
-	var exists bool
+	src.row(sc, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname=current_database()`).Scan(&srcEnc, &srcCollate, &srcCtype)
 	var dstEnc, dstCollate, dstCtype, dstCollVer, srcCollVer string
-	r.dst.QueryRow(ctx, `SELECT true, pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname=$1`, d.Target).Scan(&exists, &dstEnc, &dstCollate, &dstCtype)
+	exists := src.rowMaybe(r.dst, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname=$1`, []any{d.Target}, &dstEnc, &dstCollate, &dstCtype)
+	baseErr := src.err
 	var createdb, superT bool
-	r.dst.QueryRow(ctx, `SELECT rolcreatedb, rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&createdb, &superT)
+	src.row(r.dst, `SELECT rolcreatedb, rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&createdb, &superT)
 	ev = map[string]any{"exists": exists, "can_create": createdb || superT, "create_target_databases": e.Settings.Bool("create_target_databases")}
 	switch {
 	case exists:
-		ok(r, "dst_database", "", d.Source, fmt.Sprintf("Target database %s exists.", d.Target), ev, t)
+		src.ok(fmt.Sprintf("Target database %s exists.", d.Target), ev)
 	case (createdb || superT) && e.Settings.Bool("create_target_databases"):
-		ok(r, "dst_database", "", d.Source, fmt.Sprintf("Target database %s will be created with the source's encoding and locale.", d.Target), ev, t)
+		src.ok(fmt.Sprintf("Target database %s will be created with the source's encoding and locale.", d.Target), ev)
 	default:
-		r.emit("dst_database", "", d.Source, check.Blocker, true, fmt.Sprintf("Target database %s does not exist and Upwell will not create it.", d.Target), "Create it on the target, or allow Upwell to create target databases (and give the user CREATEDB).", ev, t)
+		src.emit(check.Blocker, true, fmt.Sprintf("Target database %s does not exist and Upwell will not create it.", d.Target), "Create it on the target, or allow Upwell to create target databases (and give the user CREATEDB).", ev)
 	}
-	t = time.Now()
+	p = r.probe(ctx, "encoding", "", d.Source)
+	p.fail(baseErr)
 	if exists && dstEnc != srcEnc {
-		r.emit("encoding", "", d.Source, check.Blocker, true, fmt.Sprintf("Encodings differ: source %s, target %s.", srcEnc, dstEnc), "Recreate the target database with encoding "+srcEnc+".", map[string]any{"source": srcEnc, "target": dstEnc}, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("Encodings differ: source %s, target %s.", srcEnc, dstEnc), "Recreate the target database with encoding "+srcEnc+".", map[string]any{"source": srcEnc, "target": dstEnc})
 	} else {
-		ok(r, "encoding", "", d.Source, "Encoding "+srcEnc+" on both sides.", map[string]any{"source": srcEnc, "target": firstNonEmpty(dstEnc, srcEnc)}, t)
+		p.ok("Encoding "+srcEnc+" on both sides.", map[string]any{"source": srcEnc, "target": firstNonEmpty(dstEnc, srcEnc)})
 	}
-	t = time.Now()
-	if exists {
-		sc.QueryRow(ctx, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&srcCollVer)
-		if tc, err := pg.Connect(ctx, e.Target.WithDB(d.Target), 30*time.Second); err == nil {
-			tc.QueryRow(ctx, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&dstCollVer)
-			probeS := sortProbe(ctx, sc)
-			probeT := sortProbe(ctx, tc)
+	p = r.probe(ctx, "collation", "", d.Source)
+	p.fail(baseErr)
+	if exists && p.err == nil {
+		p.row(sc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&srcCollVer)
+		if tc, err := pg.Connect(ctx, e.Target.WithDB(d.Target), 30*time.Second); err != nil {
+			p.fail(err)
+			p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
+		} else {
+			p.row(tc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&dstCollVer)
+			probeS := sortProbe(p, sc)
+			probeT := sortProbe(p, tc)
 			tc.Close(ctx)
 			ev := map[string]any{"source": srcCollate, "target": dstCollate, "source_version": srcCollVer, "target_version": dstCollVer, "sort_match": probeS == probeT}
 			if NormalizeLocale(srcCollate) != NormalizeLocale(dstCollate) || probeS != probeT || (srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer) {
-				r.emit("collation", "", d.Source, check.Blocker, false, fmt.Sprintf("Collations differ (source %s, target %s), so text indexes may sort differently.", srcCollate, dstCollate), "Recreate the target database with the source's locale, or accept the risk and reindex text indexes after cutover.", ev, t)
+				p.emit(check.Blocker, false, fmt.Sprintf("Collations differ (source %s, target %s), so text indexes may sort differently.", srcCollate, dstCollate), "Recreate the target database with the source's locale, or accept the risk and reindex text indexes after cutover.", ev)
 			} else {
-				ok(r, "collation", "", d.Source, "Same collation ("+srcCollate+") and sort order.", ev, t)
+				p.ok("Same collation ("+srcCollate+") and sort order.", ev)
 			}
 		}
+	} else if p.err != nil {
+		p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
 	} else {
-		ok(r, "collation", "", d.Source, "The target database will be created with collation "+srcCollate+".", map[string]any{"source": srcCollate}, t)
+		p.ok("The target database will be created with collation "+srcCollate+".", map[string]any{"source": srcCollate})
 	}
 
 	var tc *pgx.Conn
+	var tcErr error
 	if exists {
-		tc, _ = pg.Connect(ctx, e.Target.WithDB(d.Target), 30*time.Second)
+		tc, tcErr = pg.Connect(ctx, e.Target.WithDB(d.Target), 30*time.Second)
 	}
 	if tc != nil {
 		defer tc.Close(ctx)
 	}
-	t = time.Now()
+	p = r.probe(ctx, "dst_conflicts", "", d.Source)
+	p.fail(tcErr)
 	objQ := `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p','S','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ORDER BY 1`
-	srcObjs, _ := pg.QueryStrings(ctx, sc, objQ)
+	srcObjs := p.strings(sc, objQ)
 	var dstObjs []string
 	if tc != nil {
-		dstObjs, _ = pg.QueryStrings(ctx, tc, objQ)
+		dstObjs = p.strings(tc, objQ)
 	}
 	srcSet := map[string]bool{}
 	for _, o := range srcObjs {
@@ -814,22 +824,22 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 			extra = append(extra, o)
 		}
 	}
+	extraP := r.probe(ctx, "dst_extra_objects", "", d.Source)
+	extraP.fail(p.err)
 	if len(conflicts) > 0 && !e.Resuming {
-		r.emit("dst_conflicts", "", d.Source, check.Blocker, true, fmt.Sprintf("%d object(s) already exist on both sides, for example %s; the copy would fail or mix data.", len(conflicts), conflicts[0]), "Drop them from the target database, or choose a different target database name.", map[string]any{"conflicts": limitList(conflicts, 50)}, t)
+		p.emit(check.Blocker, true, fmt.Sprintf("%d object(s) already exist on both sides, for example %s; the copy would fail or mix data.", len(conflicts), conflicts[0]), "Drop them from the target database, or choose a different target database name.", map[string]any{"conflicts": limitList(conflicts, 50)})
 	} else {
-		ok(r, "dst_conflicts", "", d.Source, "No object exists on both sides.", map[string]any{"conflicts": []string{}}, t)
+		p.ok("No object exists on both sides.", map[string]any{"conflicts": []string{}})
 	}
-	t = time.Now()
 	if len(extra) > 0 {
-		r.emit("dst_extra_objects", "", d.Source, check.Warning, false, fmt.Sprintf("%d object(s) exist only on the target (for example %s); Upwell leaves them untouched.", len(extra), extra[0]), "No action needed unless they are left over from an earlier attempt.", map[string]any{"objects": limitList(extra, 50)}, t)
+		extraP.emit(check.Warning, false, fmt.Sprintf("%d object(s) exist only on the target (for example %s); Upwell leaves them untouched.", len(extra), extra[0]), "No action needed unless they are left over from an earlier attempt.", map[string]any{"objects": limitList(extra, 50)})
 	} else {
-		ok(r, "dst_extra_objects", "", d.Source, "No objects exist only on the target.", map[string]any{"objects": []string{}}, t)
+		extraP.ok("No objects exist only on the target.", map[string]any{"objects": []string{}})
 	}
-	t = time.Now()
-	srcExt, _ := pg.QueryStrings(ctx, sc, `SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY 1`)
+	p = r.probe(ctx, "extensions", "", d.Source)
+	srcExt := p.strings(sc, `SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY 1`)
 	avail := map[string]bool{}
-	names, _ := pg.QueryStrings(ctx, r.dst, `SELECT name FROM pg_available_extensions`)
-	for _, n := range names {
+	for _, n := range p.strings(r.dst, `SELECT name FROM pg_available_extensions`) {
 		avail[n] = true
 	}
 	var missingExt []string
@@ -839,61 +849,66 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		}
 	}
 	if len(missingExt) > 0 {
-		r.emit("extensions", "", d.Source, check.Blocker, true, "These source extensions are not available on the target: "+strings.Join(missingExt, ", ")+".", "Ask for them to be enabled on the Advanced cluster, or remove them from the source.", map[string]any{"missing": missingExt, "source": srcExt}, t)
+		p.emit(check.Blocker, true, "These source extensions are not available on the target: "+strings.Join(missingExt, ", ")+".", "Ask for them to be enabled on the Advanced cluster, or remove them from the source.", map[string]any{"missing": missingExt, "source": srcExt})
 	} else {
-		ok(r, "extensions", "", d.Source, fmt.Sprintf("All %d source extension(s) are available on the target.", len(srcExt)), map[string]any{"source": srcExt}, t)
+		p.ok(fmt.Sprintf("All %d source extension(s) are available on the target.", len(srcExt)), map[string]any{"source": srcExt})
 	}
 
-	t = time.Now()
-	var slotN, pubN, originN int
-	r.src.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&slotN)
-	sc.QueryRow(ctx, `SELECT count(*) FROM pg_publication WHERE pubname=$1`, d.SlotName).Scan(&pubN)
-	r.dst.QueryRow(ctx, `SELECT count(*) FROM pg_replication_origin WHERE roname=$1`, d.Origin).Scan(&originN)
 	for _, x := range []struct {
-		id, what string
-		n        int
-	}{{"slot_exists", "replication slot " + d.SlotName, slotN}, {"origin_exists", "replication origin " + d.Origin, originN}, {"publication_exists", "publication " + d.SlotName, pubN}} {
-		if x.n > 0 && !e.Resuming {
-			r.emit(x.id, "", d.Source, check.Blocker, true, "A leftover "+x.what+" from an earlier run exists.", "Run Clean up on the earlier migration, or drop it by hand.", map[string]any{"name": x.what}, t)
+		id, what, q string
+		c           *pgx.Conn
+		arg         string
+	}{
+		{"slot_exists", "replication slot " + d.SlotName, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, r.src, d.SlotName},
+		{"origin_exists", "replication origin " + d.Origin, `SELECT count(*) FROM pg_replication_origin WHERE roname=$1`, r.dst, d.Origin},
+		{"publication_exists", "publication " + d.SlotName, `SELECT count(*) FROM pg_publication WHERE pubname=$1`, sc, d.SlotName},
+	} {
+		p = r.probe(ctx, x.id, "", d.Source)
+		var n int
+		p.row(x.c, x.q, x.arg).Scan(&n)
+		if n > 0 && !e.Resuming {
+			p.emit(check.Blocker, true, "A leftover "+x.what+" from an earlier run exists.", "Run Clean up on the earlier migration, or drop it by hand.", map[string]any{"name": x.what})
 		} else {
-			ok(r, x.id, "", d.Source, "No leftover "+strings.SplitN(x.what, " ", 3)[0]+" "+strings.SplitN(x.what, " ", 3)[1]+".", map[string]any{"name": x.what}, t)
+			p.ok("No leftover "+strings.SplitN(x.what, " ", 3)[0]+" "+strings.SplitN(x.what, " ", 3)[1]+".", map[string]any{"name": x.what})
 		}
 	}
 
 	t = time.Now()
-	ap := TargetApplyPrivileges(ctx, firstConn(tc, r.dst), r.dstVer)
-	if !ap.OK {
+	ap, apErr := TargetApplyPrivileges(ctx, firstConn(tc, r.dst), r.dstVer)
+	switch {
+	case apErr != nil:
+		r.couldNotCheck("target_apply_privileges", "", d.Source, apErr, ap.Evidence(), t)
+	case !ap.OK:
 		r.emit("target_apply_privileges", "", d.Source, check.Blocker, true, "The target user cannot "+strings.Join(ap.Missing, " or ")+". Without this, pgcopydb 0.18 applies no changes and still reports success (Phase 0 finding F2).",
 			"Grant EXECUTE on the pg_replication_origin_* functions and SET on session_replication_role to "+e.Target.User+" (ask for these on the Advanced cluster), then run preflight again.", ap.Evidence(), t)
-	} else {
+	default:
 		ok(r, "target_apply_privileges", "", d.Source, "The target user can manage replication origins and set session_replication_role.", ap.Evidence(), t)
 	}
 
-	t = time.Now()
-	var canCreate bool
-	sc.QueryRow(ctx, `SELECT has_database_privilege(current_database(),'CREATE')`).Scan(&canCreate)
-	var hbExists bool
-	sc.QueryRow(ctx, `SELECT to_regclass('upwell.heartbeat') IS NOT NULL`).Scan(&hbExists)
+	p = r.probe(ctx, "heartbeat_possible", "", d.Source)
+	var canCreate, hbExists bool
+	p.row(sc, `SELECT has_database_privilege(current_database(),'CREATE')`).Scan(&canCreate)
+	p.row(sc, `SELECT to_regclass('upwell.heartbeat') IS NOT NULL`).Scan(&hbExists)
 	hbOn := e.Settings.Bool("heartbeat")
 	ev = map[string]any{"heartbeat": hbOn, "can_create": canCreate, "exists": hbExists}
 	switch {
 	case !hbOn:
-		r.emit("heartbeat_possible", "", d.Source, check.Warning, false, "The heartbeat is off, so GO will not require proof that the last writes arrived.", "Turn the heartbeat on in Options unless the customer forbids writes to the source.", ev, t)
+		p.emit(check.Warning, false, "The heartbeat is off, so GO will not require proof that the last writes arrived.", "Turn the heartbeat on in Options unless the customer forbids writes to the source.", ev)
 	case canCreate || hbExists:
-		ok(r, "heartbeat_possible", "", d.Source, "Upwell can create its heartbeat table (schema upwell) on the source.", ev, t)
+		p.ok("Upwell can create its heartbeat table (schema upwell) on the source.", ev)
 	default:
-		r.emit("heartbeat_possible", "", d.Source, check.Blocker, true, e.Source.User+" cannot create the upwell schema for the heartbeat table, and GO requires the final heartbeat.", "Grant CREATE on the database to the admin user, or turn the heartbeat off in Options (recorded as an accepted risk).", ev, t)
+		p.emit(check.Blocker, true, e.Source.User+" cannot create the upwell schema for the heartbeat table, and GO requires the final heartbeat.", "Grant CREATE on the database to the admin user, or turn the heartbeat off in Options (recorded as an accepted risk).", ev)
 	}
 
-	t = time.Now()
+	p = r.probe(ctx, "write_freeze_available", "", d.Source)
 	var owner, sigBackend bool
-	sc.QueryRow(ctx, `SELECT pg_has_role((SELECT datdba FROM pg_database WHERE datname=current_database()),'MEMBER'), pg_has_role('pg_signal_backend','MEMBER')`).Scan(&owner, &sigBackend)
+	p.row(sc, `SELECT pg_has_role((SELECT datdba FROM pg_database WHERE datname=current_database()),'MEMBER'), pg_has_role('pg_signal_backend','MEMBER')`).Scan(&owner, &sigBackend)
 	ev = map[string]any{"owner": owner, "pg_signal_backend": sigBackend}
 	msg := "Write freeze is coming soon; this database would support it."
 	if !owner || !sigBackend {
 		msg = "Write freeze is coming soon; this database would not support it (the admin does not own it or cannot end other sessions)."
 	}
-	r.emit("write_freeze_available", "", d.Source, check.Info, false, msg, "", ev, t)
+	p.emit(check.Info, false, msg, "", ev)
 }
 
 func firstConn(a, b *pgx.Conn) *pgx.Conn {
@@ -917,9 +932,9 @@ func limitList(s []string, n int) []string {
 	return s
 }
 
-func sortProbe(ctx context.Context, c *pgx.Conn) string {
+func sortProbe(p *probe, c *pgx.Conn) string {
 	var s string
-	c.QueryRow(ctx, `SELECT string_agg(x, '|' ORDER BY x) FROM (VALUES ('a'),('B'),('_c'),('ä'),('Z'),('1'),('é'),('e')) v(x)`).Scan(&s)
+	p.row(c, `SELECT string_agg(x, '|' ORDER BY x) FROM (VALUES ('a'),('B'),('_c'),('ä'),('Z'),('1'),('é'),('e')) v(x)`).Scan(&s)
 	return s
 }
 
@@ -944,15 +959,19 @@ var originFuncs = []string{
 	"pg_replication_origin_xact_reset()", "pg_replication_origin_advance(text,pg_lsn)", "pg_replication_origin_progress(text,boolean)",
 }
 
-// TargetApplyPrivileges checks what pgcopydb's apply needs on the target (F1).
-func TargetApplyPrivileges(ctx context.Context, c *pgx.Conn, verNum int) ApplyPrivileges {
+// TargetApplyPrivileges checks what pgcopydb's apply needs on the target
+// (F1). Any failed query is returned as an error: the caller must treat the
+// privileges as unconfirmed, never as present or missing.
+func TargetApplyPrivileges(ctx context.Context, c *pgx.Conn, verNum int) (ApplyPrivileges, error) {
 	a := ApplyPrivileges{Functions: map[string]bool{}}
-	c.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&a.Super)
+	if err := pg.QueryRow(ctx, c, `SELECT rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&a.Super); err != nil {
+		return a, err
+	}
 	missingFn := false
 	for _, f := range originFuncs {
 		var okf bool
-		if err := c.QueryRow(ctx, `SELECT has_function_privilege($1,'EXECUTE')`, f).Scan(&okf); err != nil {
-			okf = false
+		if err := pg.QueryRow(ctx, c, `SELECT has_function_privilege($1,'EXECUTE')`, f).Scan(&okf); err != nil {
+			return a, err
 		}
 		a.Functions[f] = okf
 		if !okf {
@@ -964,17 +983,18 @@ func TargetApplyPrivileges(ctx context.Context, c *pgx.Conn, verNum int) ApplyPr
 	}
 	if verNum >= 150000 {
 		var s bool
-		if err := c.QueryRow(ctx, `SELECT has_parameter_privilege('session_replication_role','SET')`).Scan(&s); err == nil {
-			a.SetSRR = &s
+		if err := pg.QueryRow(ctx, c, `SELECT has_parameter_privilege('session_replication_role','SET')`).Scan(&s); err != nil {
+			return a, err
 		}
-		if (a.SetSRR == nil || !*a.SetSRR) && !a.Super {
+		a.SetSRR = &s
+		if !s && !a.Super {
 			a.Missing = append(a.Missing, "SET session_replication_role")
 		}
 	} else if !a.Super {
 		a.Missing = append(a.Missing, "SET session_replication_role (PostgreSQL 14 allows it only for superusers)")
 	}
 	a.OK = len(a.Missing) == 0
-	return a
+	return a, nil
 }
 
 func replicationProbe(ctx context.Context, c pg.Conn) error {
@@ -1000,38 +1020,41 @@ func replicationProbe(ctx context.Context, c pg.Conn) error {
 // run the checks that depend on it.
 func (r *Runner) samplingChecks(ctx context.Context) {
 	e := r.Env
-	t := time.Now()
 	secs := e.Settings.Int("wal_sample_seconds")
 	if secs <= 0 {
 		secs = 60
 	}
+	// One sample feeds several checks: if any of its queries fails, every
+	// check that depends on it says it could not check.
+	sample := r.probe(ctx, "throughput_sample", "", "")
 	var a, b string
 	// Commit rate per database, sampled over the same window (F11: the engine
 	// applies a limited number of transactions a second).
 	commits := func() map[string]int64 {
 		out := map[string]int64{}
-		rows, err := r.src.Query(ctx, `SELECT datname, xact_commit FROM pg_stat_database WHERE datname IS NOT NULL`)
+		rows, err := pg.Query(ctx, r.src, `SELECT datname, xact_commit FROM pg_stat_database WHERE datname IS NOT NULL`)
 		if err != nil {
+			sample.fail(err)
 			return out
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var n string
 			var c int64
-			if rows.Scan(&n, &c) == nil {
-				out[n] = c
-			}
+			sample.fail(rows.Scan(&n, &c))
+			out[n] = c
 		}
+		sample.fail(rows.Err())
 		return out
 	}
 	c0 := commits()
-	r.src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&a)
+	sample.row(r.src, `SELECT pg_current_wal_lsn()::text`).Scan(&a)
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(time.Duration(secs) * time.Second):
 	}
-	r.src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&b)
+	sample.row(r.src, `SELECT pg_current_wal_lsn()::text`).Scan(&b)
 	c1 := commits()
 	r.walRateBps = float64(pg.LSNDiff(b, a)) / float64(secs)
 	mibs := e.Settings.Float("assumed_throughput_mibs")
@@ -1040,62 +1063,68 @@ func (r *Runner) samplingChecks(ctx context.Context) {
 	}
 	copySecs := float64(r.totalSourceBytes) / (mibs * 1024 * 1024)
 	ev := map[string]any{"_wal_rate_bytes_per_s": r.walRateBps, "_sample_seconds": secs, "assumed_mibs": mibs, "_estimated_copy_seconds": copySecs}
-	r.emit("throughput_sample", "", "", check.Info, false, fmt.Sprintf("At the assumed %.0f MiB/s the base copy of %s takes about %s; the source wrote %s of WAL per second during a %d s sample.",
-		mibs, humanBytes(float64(r.totalSourceBytes)), humanDuration(copySecs), humanBytes(r.walRateBps), secs), "", ev, t)
-	t = time.Now()
+	sample.emit(check.Info, false, fmt.Sprintf("At the assumed %.0f MiB/s the base copy of %s takes about %s; the source wrote %s of WAL per second during a %d s sample.",
+		mibs, humanBytes(float64(r.totalSourceBytes)), humanDuration(copySecs), humanBytes(r.walRateBps), secs), "", ev)
+	p := r.probe(ctx, "cdc_throughput", "", "")
+	p.fail(sample.err)
 	limit := mibs * 1024 * 1024 * 0.5
 	if r.walRateBps > limit {
-		r.emit("cdc_throughput", "", "", check.Warning, false, fmt.Sprintf("The source writes %s of WAL per second, more than half the assumed copy rate; streaming may not keep up and the backlog could grow until the slot is lost.", humanBytes(r.walRateBps)),
-			"Calibrate with a test migration on this droplet, or migrate during a quieter period.", ev, t)
+		p.emit(check.Warning, false, fmt.Sprintf("The source writes %s of WAL per second, more than half the assumed copy rate; streaming may not keep up and the backlog could grow until the slot is lost.", humanBytes(r.walRateBps)),
+			"Calibrate with a test migration on this droplet, or migrate during a quieter period.", ev)
 	} else {
-		ok(r, "cdc_throughput", "", "", fmt.Sprintf("The source writes %s of WAL per second, well within the assumed rate.", humanBytes(r.walRateBps)), ev, t)
+		p.ok(fmt.Sprintf("The source writes %s of WAL per second, well within the assumed rate.", humanBytes(r.walRateBps)), ev)
 	}
 	// Transactions per second per database against the engine's apply rate.
-	t = time.Now()
 	applyTPS := e.Settings.Float("assumed_apply_tps")
 	if applyTPS <= 0 {
 		applyTPS = 5
 	}
 	for _, d := range e.Databases {
+		p := r.probe(ctx, "apply_rate", "", d.Source)
+		p.fail(sample.err)
 		// Upwell's own sampling connections commit too; one a second is noise.
 		tps := float64(c1[d.Source]-c0[d.Source]) / float64(secs)
 		dev := map[string]any{"_commits_per_s": tps, "assumed_apply_tps": applyTPS, "_sample_seconds": secs}
 		if tps > applyTPS*0.8 {
-			r.emit("apply_rate", "", d.Source, check.Warning, false, fmt.Sprintf("This database commits %.1f transactions a second; pgcopydb 0.18 applied about %.0f a second in testing, so the target could fall further and further behind.", tps, applyTPS),
-				"Measure on this droplet with a test migration first (the In sync state and the cutover lag gate show whether it keeps up), or migrate during a quieter period.", dev, t)
+			p.emit(check.Warning, false, fmt.Sprintf("This database commits %.1f transactions a second; pgcopydb 0.18 applied about %.0f a second in testing, so the target could fall further and further behind.", tps, applyTPS),
+				"Measure on this droplet with a test migration first (the In sync state and the cutover lag gate show whether it keeps up), or migrate during a quieter period.", dev)
 		} else {
-			ok(r, "apply_rate", "", d.Source, fmt.Sprintf("This database commits %.1f transactions a second, within the assumed apply rate of %.0f.", tps, applyTPS), dev, t)
+			p.ok(fmt.Sprintf("This database commits %.1f transactions a second, within the assumed apply rate of %.0f.", tps, applyTPS), dev)
 		}
 	}
-	t = time.Now()
+	p = r.probe(ctx, "slot_wal_cap", "", "")
+	p.fail(sample.err)
 	var capStr string
-	r.src.QueryRow(ctx, `SHOW max_slot_wal_keep_size`).Scan(&capStr)
+	p.row(r.src, `SHOW max_slot_wal_keep_size`).Scan(&capStr)
 	retained := r.walRateBps * copySecs * 1.5
 	ev = map[string]any{"max_slot_wal_keep_size": capStr, "_estimated_retained_bytes": retained}
 	capBytes := parsePGSize(capStr)
 	switch {
 	case capBytes < 0:
-		r.emit("slot_wal_cap", "", "", check.Warning, false, fmt.Sprintf("max_slot_wal_keep_size is unlimited: slots can retain WAL until the source disk fills (estimated %s during the copy).", humanBytes(retained)), "Watch the source's disk during the base copy.", ev, t)
+		p.emit(check.Warning, false, fmt.Sprintf("max_slot_wal_keep_size is unlimited: slots can retain WAL until the source disk fills (estimated %s during the copy).", humanBytes(retained)), "Watch the source's disk during the base copy.", ev)
 	case float64(capBytes) < retained:
-		r.emit("slot_wal_cap", "", "", check.Warning, false, fmt.Sprintf("max_slot_wal_keep_size is %s but the slots may retain about %s during the copy; the slot would be invalidated and the database restarted.", capStr, humanBytes(retained)), "Raise max_slot_wal_keep_size, or migrate during a quieter period.", ev, t)
+		p.emit(check.Warning, false, fmt.Sprintf("max_slot_wal_keep_size is %s but the slots may retain about %s during the copy; the slot would be invalidated and the database restarted.", capStr, humanBytes(retained)), "Raise max_slot_wal_keep_size, or migrate during a quieter period.", ev)
 	default:
-		ok(r, "slot_wal_cap", "", "", fmt.Sprintf("max_slot_wal_keep_size %s covers the estimated %s.", capStr, humanBytes(retained)), ev, t)
+		p.ok(fmt.Sprintf("max_slot_wal_keep_size %s covers the estimated %s.", capStr, humanBytes(retained)), ev)
 	}
-	t = time.Now()
+	p = r.probe(ctx, "staging_space", "", "")
+	p.fail(sample.err)
 	staging := retained*e.Settings.Float("staging_factor") + float64(len(e.Databases))*2*(1<<30)
 	var st syscall.Statfs_t
 	var free float64
-	if syscall.Statfs(e.WorkDir, &st) == nil {
+	if err := syscall.Statfs(e.WorkDir, &st); err != nil {
+		p.fail(fmt.Errorf("reading the work volume's free space: %w", err))
+	} else {
 		free = float64(st.Bavail) * float64(st.Bsize)
 	}
 	ev = map[string]any{"_free_bytes": free, "_estimate_bytes": staging, "databases": len(e.Databases)}
 	switch {
 	case free < staging:
-		r.emit("staging_space", "", "", check.Blocker, false, fmt.Sprintf("The work volume has %s free; change staging may need %s (including about 2 GB per database for the file being written).", humanBytes(free), humanBytes(staging)), "Attach a larger volume, or accept the risk; the disk guard stops a database at 95%.", ev, t)
+		p.emit(check.Blocker, false, fmt.Sprintf("The work volume has %s free; change staging may need %s (including about 2 GB per database for the file being written).", humanBytes(free), humanBytes(staging)), "Attach a larger volume, or accept the risk; the disk guard stops a database at 95%.", ev)
 	case free < 2*staging:
-		r.emit("staging_space", "", "", check.Warning, false, fmt.Sprintf("The work volume has %s free, less than twice the %s staging estimate.", humanBytes(free), humanBytes(staging)), "Consider a larger volume.", ev, t)
+		p.emit(check.Warning, false, fmt.Sprintf("The work volume has %s free, less than twice the %s staging estimate.", humanBytes(free), humanBytes(staging)), "Consider a larger volume.", ev)
 	default:
-		ok(r, "staging_space", "", "", fmt.Sprintf("%s free for an estimated %s of staging.", humanBytes(free), humanBytes(staging)), ev, t)
+		p.ok(fmt.Sprintf("%s free for an estimated %s of staging.", humanBytes(free), humanBytes(staging)), ev)
 	}
 }
 

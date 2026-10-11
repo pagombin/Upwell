@@ -126,7 +126,7 @@ type Session struct {
 func ProbeSession(ctx context.Context, c *pgx.Conn, at Conn) (Session, error) {
 	var s Session
 	var addr *string
-	if err := c.QueryRow(ctx, `SELECT host(inet_client_addr())`, pgx.QueryExecModeSimpleProtocol).Scan(&addr); err != nil {
+	if err := QueryRow(ctx, c, `SELECT host(inet_client_addr())`, pgx.QueryExecModeSimpleProtocol).Scan(&addr); err != nil {
 		return s, err
 	}
 	if addr != nil {
@@ -149,7 +149,7 @@ func sessionPinned(ctx context.Context, c *pgx.Conn, at Conn) (bool, []int, erro
 	pinned := true
 	probe := func() error {
 		var pid int
-		if err := c.QueryRow(ctx, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid); err != nil {
+		if err := QueryRow(ctx, c, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid); err != nil {
 			return err
 		}
 		pids = append(pids, pid)
@@ -309,7 +309,7 @@ func trim(s string) string {
 // ServerVersionNum returns server_version_num.
 func ServerVersionNum(ctx context.Context, c *pgx.Conn) (int, error) {
 	var s string
-	if err := c.QueryRow(ctx, `SHOW server_version_num`).Scan(&s); err != nil {
+	if err := QueryRow(ctx, c, `SHOW server_version_num`).Scan(&s); err != nil {
 		return 0, err
 	}
 	return strconv.Atoi(s)
@@ -317,7 +317,7 @@ func ServerVersionNum(ctx context.Context, c *pgx.Conn) (int, error) {
 
 // QueryStrings runs q and returns the first column as strings.
 func QueryStrings(ctx context.Context, c *pgx.Conn, q string, args ...any) ([]string, error) {
-	rows, err := c.Query(ctx, q, args...)
+	rows, err := Query(ctx, c, q, args...)
 	if err != nil {
 		return nil, err
 	}

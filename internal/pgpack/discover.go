@@ -46,7 +46,7 @@ func Discover(ctx context.Context, src, dst pg.Conn) ([]DiscoveredDB, error) {
 		return nil, err
 	}
 	defer c.Close(ctx)
-	rows, err := c.Query(ctx, `SELECT datname, pg_database_size(oid), pg_encoding_to_char(encoding), datcollate
+	rows, err := pg.Query(ctx, c, `SELECT datname, pg_database_size(oid), pg_encoding_to_char(encoding), datcollate
 		FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname`)
 	if err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func Discover(ctx context.Context, src, dst pg.Conn) ([]DiscoveredDB, error) {
 			d.SkipReason = "cannot connect: " + err.Error()
 			continue
 		}
-		dc.QueryRow(ctx, `SELECT
+		pg.QueryRow(ctx, dc, `SELECT
 			(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND n.nspname <> 'upwell'),
 			(SELECT COALESCE(sum(GREATEST(c.reltuples,0)),0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema')),
 			(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='S' AND n.nspname NOT IN ('pg_catalog','information_schema')),
@@ -119,7 +119,7 @@ func ChoosePlugin(ctx context.Context, c *pgx.Conn, setting string) (PluginChoic
 	}
 	var unlogged, notOwned int
 	var create bool
-	err := c.QueryRow(ctx, `SELECT
+	err := pg.QueryRow(ctx, c, `SELECT
 		(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'),
 		(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND NOT pg_has_role(c.relowner,'USAGE')),
 		has_database_privilege(current_database(),'CREATE')`).Scan(&unlogged, &notOwned, &create)
@@ -163,7 +163,7 @@ func EnsureHeartbeat(ctx context.Context, c pg.Conn) error {
 		return err
 	}
 	defer conn.Close(ctx)
-	_, err = conn.Exec(ctx, HeartbeatDDL)
+	_, err = pg.Exec(ctx, conn, HeartbeatDDL)
 	return err
 }
 
@@ -175,10 +175,10 @@ func WriteHeartbeat(ctx context.Context, c pg.Conn, kind, token string) (before 
 		return "", err
 	}
 	defer conn.Close(ctx)
-	if err := conn.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&before); err != nil {
+	if err := pg.QueryRow(ctx, conn, `SELECT pg_current_wal_lsn()::text`).Scan(&before); err != nil {
 		return "", err
 	}
-	_, err = conn.Exec(ctx, `INSERT INTO upwell.heartbeat(kind, token) VALUES ($1, $2)`, kind, token)
+	_, err = pg.Exec(ctx, conn, `INSERT INTO upwell.heartbeat(kind, token) VALUES ($1, $2)`, kind, token)
 	return before, err
 }
 
@@ -186,10 +186,10 @@ func WriteHeartbeat(ctx context.Context, c pg.Conn, kind, token string) (before 
 // the source and the newest one applied on the target.
 func HeartbeatLatency(ctx context.Context, src, dst *pgx.Conn) (float64, bool) {
 	var s, d *time.Time
-	if src.QueryRow(ctx, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&s) != nil || s == nil {
+	if pg.QueryRow(ctx, src, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&s) != nil || s == nil {
 		return 0, false
 	}
-	if dst.QueryRow(ctx, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&d) != nil || d == nil {
+	if pg.QueryRow(ctx, dst, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&d) != nil || d == nil {
 		return 0, false
 	}
 	return s.Sub(*d).Seconds(), true
@@ -203,7 +203,7 @@ func HeartbeatOnTarget(ctx context.Context, c pg.Conn, token string) (bool, erro
 	}
 	defer conn.Close(ctx)
 	var n int
-	err = conn.QueryRow(ctx, `SELECT count(*) FROM upwell.heartbeat WHERE token=$1`, token).Scan(&n)
+	err = pg.QueryRow(ctx, conn, `SELECT count(*) FROM upwell.heartbeat WHERE token=$1`, token).Scan(&n)
 	if err != nil {
 		return false, err
 	}
@@ -218,7 +218,7 @@ func OriginProgress(ctx context.Context, c pg.Conn, origin string) (string, erro
 	}
 	defer conn.Close(ctx)
 	var lsn *string
-	err = conn.QueryRow(ctx, `SELECT pg_replication_origin_progress($1, false)::text`, origin).Scan(&lsn)
+	err = pg.QueryRow(ctx, conn, `SELECT pg_replication_origin_progress($1, false)::text`, origin).Scan(&lsn)
 	if err != nil {
 		return "", err
 	}
@@ -237,7 +237,9 @@ func EnsureTargetDB(ctx context.Context, src, dst pg.Conn, srcDB, dstDB string) 
 	}
 	defer t.Close(ctx)
 	var n int
-	t.QueryRow(ctx, `SELECT count(*) FROM pg_database WHERE datname=$1`, dstDB).Scan(&n)
+	if err := pg.QueryRow(ctx, t, `SELECT count(*) FROM pg_database WHERE datname=$1`, dstDB).Scan(&n); err != nil {
+		return false, fmt.Errorf("checking whether target database %s exists: %w", dstDB, err)
+	}
 	if n > 0 {
 		return false, nil
 	}
@@ -246,7 +248,7 @@ func EnsureTargetDB(ctx context.Context, src, dst pg.Conn, srcDB, dstDB string) 
 		return false, err
 	}
 	var enc, collate, ctype string
-	err = s.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname=$1`, srcDB).Scan(&enc, &collate, &ctype)
+	err = pg.QueryRow(ctx, s, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname=$1`, srcDB).Scan(&enc, &collate, &ctype)
 	s.Close(ctx)
 	if err != nil {
 		return false, err
@@ -254,16 +256,16 @@ func EnsureTargetDB(ctx context.Context, src, dst pg.Conn, srcDB, dstDB string) 
 	// Prefer template1 so the new database inherits what the provider set up
 	// there (grants included); template0 only when encoding or locale differ.
 	var tEnc, tCollate, tCtype string
-	t.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname='template1'`).Scan(&tEnc, &tCollate, &tCtype)
+	pg.QueryRow(ctx, t, `SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname='template1'`).Scan(&tEnc, &tCollate, &tCtype)
 	if tEnc == enc && NormalizeLocale(tCollate) == NormalizeLocale(collate) && NormalizeLocale(tCtype) == NormalizeLocale(ctype) {
-		if _, err := t.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE template1`, pg.QuoteIdent(dstDB))); err == nil {
+		if _, err := pg.Exec(ctx, t, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE template1`, pg.QuoteIdent(dstDB))); err == nil {
 			return true, nil
 		}
 	}
 	q := fmt.Sprintf(`CREATE DATABASE %s TEMPLATE template0 ENCODING %s LC_COLLATE %s LC_CTYPE %s`, pg.QuoteIdent(dstDB), pg.QuoteLiteral(enc), pg.QuoteLiteral(collate), pg.QuoteLiteral(ctype))
-	if _, err := t.Exec(ctx, q); err != nil {
+	if _, err := pg.Exec(ctx, t, q); err != nil {
 		// Locale names can differ between hosts; fall back to the target default.
-		if _, err2 := t.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE template0 ENCODING %s`, pg.QuoteIdent(dstDB), pg.QuoteLiteral(enc))); err2 != nil {
+		if _, err2 := pg.Exec(ctx, t, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE template0 ENCODING %s`, pg.QuoteIdent(dstDB), pg.QuoteLiteral(enc))); err2 != nil {
 			return false, fmt.Errorf("creating target database %s: %w", dstDB, err)
 		}
 	}
@@ -291,7 +293,7 @@ func EnsureExtensions(ctx context.Context, src, dst pg.Conn) (created, skipped [
 		return nil, nil, fmt.Errorf("source: %w", err)
 	}
 	defer sc.Close(ctx)
-	rows, err := sc.Query(ctx, `SELECT e.extname, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql' ORDER BY e.oid`)
+	rows, err := pg.Query(ctx, sc, `SELECT e.extname, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql' ORDER BY e.oid`)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -314,7 +316,9 @@ func EnsureExtensions(ctx context.Context, src, dst pg.Conn) (created, skipped [
 	defer dc.Close(ctx)
 	for _, x := range exts {
 		var present, schemaOK bool
-		_ = dc.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1), EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $2)`, x.name, x.schema).Scan(&present, &schemaOK)
+		if err := pg.QueryRow(ctx, dc, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1), EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $2)`, x.name, x.schema).Scan(&present, &schemaOK); err != nil {
+			return created, skipped, fmt.Errorf("checking extension %s on the target: %w", x.name, err)
+		}
 		if present {
 			continue
 		}

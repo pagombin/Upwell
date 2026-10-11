@@ -102,7 +102,7 @@ func (c *collector) currentLSN(ctx context.Context, conn pg.Conn) (string, error
 	}
 	defer cn.Close(ctx)
 	var s string
-	err = cn.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&s)
+	err = pg.QueryRow(ctx, cn, `SELECT pg_current_wal_lsn()::text`).Scan(&s)
 	return s, err
 }
 
@@ -124,7 +124,7 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 	defer scn.Close(ctx)
 	c.clearStale(m.ID, "source")
 	var cur string
-	scn.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&cur)
+	pg.QueryRow(ctx, scn, `SELECT pg_current_wal_lsn()::text`).Scan(&cur)
 	if p, ok := c.prev[m.ID+"|wal"]; ok && cur != "" {
 		dt := now.Sub(p.ts).Seconds()
 		if dt > 0 {
@@ -133,7 +133,7 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 	}
 	c.prev[m.ID+"|wal"] = prevSample{cur, now}
 	var conns, oldestXact, xminAge float64
-	scn.QueryRow(ctx, `SELECT count(*), COALESCE(max(extract(epoch FROM now()-xact_start)),0), COALESCE(max(age(backend_xmin)),0) FROM pg_stat_activity`).Scan(&conns, &oldestXact, &xminAge)
+	pg.QueryRow(ctx, scn, `SELECT count(*), COALESCE(max(extract(epoch FROM now()-xact_start)),0), COALESCE(max(age(backend_xmin)),0) FROM pg_stat_activity`).Scan(&conns, &oldestXact, &xminAge)
 	c.put(ctx, m.ID, "", "src_connections", conns, ts)
 	c.put(ctx, m.ID, "", "src_oldest_xact_s", oldestXact, ts)
 	c.put(ctx, m.ID, "", "src_xmin_age", xminAge, ts)
@@ -145,12 +145,12 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 		dcn = tc
 		c.clearStale(m.ID, "target")
 		var dconns float64
-		tc.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity`).Scan(&dconns)
+		pg.QueryRow(ctx, tc, `SELECT count(*) FROM pg_stat_activity`).Scan(&dconns)
 		c.put(ctx, m.ID, "", "dst_connections", dconns, ts)
 		if slowSizes {
 			for _, d := range dbs {
 				var tsz float64
-				if tc.QueryRow(ctx, `SELECT pg_database_size($1)`, d.TargetName).Scan(&tsz) == nil {
+				if pg.QueryRow(ctx, tc, `SELECT pg_database_size($1)`, d.TargetName).Scan(&tsz) == nil {
 					c.put(ctx, m.ID, d.SourceName, "target_size_bytes", tsz, ts)
 				}
 			}
@@ -179,7 +179,7 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 		var active *bool
 		var walStatus *string
 		var retained, safe *float64
-		err := scn.QueryRow(ctx, `SELECT active, wal_status, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::float8, safe_wal_size::float8 FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&active, &walStatus, &retained, &safe)
+		err := pg.QueryRow(ctx, scn, `SELECT active, wal_status, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::float8, safe_wal_size::float8 FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&active, &walStatus, &retained, &safe)
 		if err == nil {
 			a := 0.0
 			if active != nil && *active {
@@ -198,7 +198,7 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 		}
 		if slowSizes && activeDB[d.State] {
 			var ssz float64
-			if scn.QueryRow(ctx, `SELECT pg_database_size($1)`, d.SourceName).Scan(&ssz) == nil {
+			if pg.QueryRow(ctx, scn, `SELECT pg_database_size($1)`, d.SourceName).Scan(&ssz) == nil {
 				c.put(ctx, m.ID, d.SourceName, "source_size_bytes", ssz, ts)
 			}
 		}
@@ -206,12 +206,12 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 			if s, err := pg.Connect(ctx, src.WithDB(d.SourceName), 5*time.Second); err == nil {
 				if t, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 5*time.Second); err == nil {
 					var sMax, tMax *time.Time
-					s.QueryRow(ctx, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&sMax)
-					t.QueryRow(ctx, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&tMax)
+					pg.QueryRow(ctx, s, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&sMax)
+					pg.QueryRow(ctx, t, `SELECT max(written_at) FROM upwell.heartbeat`).Scan(&tMax)
 					if sMax != nil && tMax == nil {
 						// No heartbeat has reached the target at all: it is at
 						// least as far behind as the oldest one on the source.
-						s.QueryRow(ctx, `SELECT min(written_at) FROM upwell.heartbeat`).Scan(&tMax)
+						pg.QueryRow(ctx, s, `SELECT min(written_at) FROM upwell.heartbeat`).Scan(&tMax)
 					}
 					if sMax != nil && tMax != nil {
 						c.put(ctx, m.ID, d.SourceName, "heartbeat_latency_s", sMax.Sub(*tMax).Seconds(), ts)
