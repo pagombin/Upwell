@@ -571,14 +571,24 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		}
 		o.updateFlags(ctx, m.ID, func(f *Flags) { f.RolesCopied = true })
 	}
+	createdFrom := ""
 	if v.Bool("create_target_databases") {
-		created, err := pgpack.EnsureTargetDB(ctx, src, dst, d.SourceName, d.TargetName)
+		tdb, err := pgpack.EnsureTargetDB(ctx, src, dst, d.SourceName, d.TargetName)
 		if err != nil {
 			done("failed: " + err.Error())
 			return o.dbFailed(ctx, m, d, engine.FailPermanent, err.Error())
 		}
-		if created {
-			o.Event(ctx, m.ID, d.SourceName, "target_db", "info", "Created target database "+d.TargetName, nil)
+		if tdb.Created {
+			createdFrom = tdb.Template
+			o.Event(ctx, m.ID, d.SourceName, "target_db", "info", fmt.Sprintf("Created target database %s from %s with %s", d.TargetName, tdb.Template, tdb.Got),
+				map[string]any{"template": tdb.Template, "wanted": tdb.Wanted, "got": tdb.Got})
+		}
+		if tdb.Fallback != "" {
+			// Never silent (D53): text may sort and compare differently on the
+			// target, so text indexes may need a REINDEX and ORDER BY results
+			// can change after the switch.
+			o.Event(ctx, m.ID, d.SourceName, "collation_fallback", "warning", fmt.Sprintf("%s: the target database does not match the source's %s: %s; it was created with %s. Text may sort and compare differently on the target: review ORDER BY results and reindex text indexes after cutover, or recreate the target database with a matching collation and restart from zero.",
+				d.SourceName, tdb.Wanted, tdb.Fallback, tdb.Got), map[string]any{"wanted": tdb.Wanted, "got": tdb.Got, "reason": tdb.Fallback})
 		}
 	}
 	// Extensions first: tables may use their types, functions and operators.
@@ -608,8 +618,15 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		}
 		if !ap.OK {
 			done("failed: apply privileges")
+			why := ""
+			if createdFrom == "template0" {
+				// E7: preflight checked the maintenance database, where the
+				// grants exist; function grants are per database and template0
+				// never has them.
+				why = " Upwell created this database from template0, because the source's encoding or locale differs from the target's template1, so the grants run in template1 did not reach it; preflight checked the maintenance database, where they exist."
+			}
 			return o.dbFailed(ctx, m, d, engine.FailPermanent, "On target database "+d.TargetName+" the user cannot "+strings.Join(ap.Missing, " or ")+
-				". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it. Grant the privileges in that database and restart it from zero.")
+				". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it."+why+" Run the grant script in that database (it is in the target_apply_privileges evidence) and restart it from zero.")
 		}
 	}
 	if v.Bool("heartbeat") {
