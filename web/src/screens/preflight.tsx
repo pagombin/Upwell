@@ -103,12 +103,27 @@ export function PreflightResults({ mig, latest, refresh }: { mig: string; latest
           <p className="wrapany">{open.message}</p>
           {open.remediation && <div className="callout info"><div className="body"><strong>What to do</strong><span className="wrapany">{open.remediation}</span></div></div>}
           {open.accepted && <div className="callout warn"><div className="body"><strong>Accepted by {open.accepted.accepted_by} at {time(open.accepted.accepted_at)}</strong><span>{open.accepted.reason}</span></div></div>}
+          {SCRIPTS.filter(([k]) => typeof open.evidence?.[k] === "string").map(([k, label]) => <Script key={k} label={label} sql={open.evidence[k] as string} />)}
           <h3>Evidence</h3>
           <pre className="cmd">{JSON.stringify(open.evidence, null, 2)}</pre>
         </Dialog>
       )}
       {accepting && <AcceptDialog mig={mig} r={accepting} onClose={() => setAccepting(null)} onDone={refresh} />}
     </div>
+  );
+}
+
+// Copy-ready SQL a check puts in its evidence (E3).
+const SCRIPTS: [string, string][] = [["fix_sql", "Fix SQL"], ["grant_script", "Grant script (run by the platform, as a superuser)"], ["revoke_script", "Revoke script (after cutover)"]];
+
+function Script({ label, sql }: { label: string; sql: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => { navigator.clipboard?.writeText(sql).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }, () => {}); };
+  return (
+    <>
+      <div className="row"><h3>{label}</h3><button className="ghost" onClick={copy}>{copied ? "Copied" : "Copy"}</button></div>
+      <pre className="cmd">{sql}</pre>
+    </>
   );
 }
 

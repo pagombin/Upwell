@@ -2,6 +2,7 @@ package pgpack
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -666,16 +667,35 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 
 	p = r.probe(ctx, "replica_identity", "", d.Source)
-	noIdent, noIdentN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
-		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')`, 100)
+	// Leaf tables only: PostgreSQL checks the partition a row is in, never
+	// its partitioned parent (tested, D59). 'i' whose index was dropped
+	// behaves like NOTHING.
+	const noIdentWhere = `c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
+		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary))
+		  OR c.relreplident='n'
+		  OR (c.relreplident='i' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisreplident)))`
+	noIdent, noIdentN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE `+noIdentWhere, 100)
 	if noIdentN > 0 {
-		// Hard: with the migration's publication in place, PostgreSQL refuses the
-		// application's own UPDATE and DELETE on these tables on the source
-		// ("cannot update table ... publishes updates"), so accepting this would
-		// break the customer's writes while the migration runs (tested).
-		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have no primary key or replica identity (for example %s). While the migration runs, the application's UPDATE and DELETE on them would fail with an error on the source, and they could not be replayed.", noIdentN, noIdent[0]),
-			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent, "count": noIdentN})
+		var raw []byte
+		p.row(sc, `SELECT coalesce(json_agg(x ORDER BY x."table"), '[]') FROM (
+			SELECT format('%I.%I', n.nspname, c.relname) AS "table", pg_get_userbyid(c.relowner) AS owner, pg_has_role(c.relowner, 'USAGE') AS owned_by_you,
+			  c.relreplident::text AS identity, coalesce(s.n_tup_upd, 0) AS updates, coalesce(s.n_tup_del, 0) AS deletes, pg_total_relation_size(c.oid) AS size_bytes
+			FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid
+			WHERE `+noIdentWhere+` ORDER BY 1 LIMIT 100) x`).Scan(&raw)
+		var details []identityDetail
+		if p.err == nil {
+			p.fail(json.Unmarshal(raw, &details))
+		}
+		plugin := ""
+		if err == nil {
+			plugin = choice.Plugin
+		}
+		msg, fix, ev := replicaIdentityAdvice(plugin, e.Source.User, noIdentN, details)
+		ev["tables"], ev["count"] = noIdent, noIdentN
+		// Hard under every plugin: with pgoutput the source refuses the
+		// application's UPDATE and DELETE (tested); with test_decoding they
+		// are decoded without the old key and cannot be applied.
+		p.emit(check.Blocker, true, msg, fix, ev)
 	} else {
 		p.ok("Every table can replay updates and deletes.", map[string]any{"tables": []string{}, "count": 0})
 	}
@@ -701,7 +721,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	noEq, noEqN := p.sample(sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
 		JOIN pg_type ty ON ty.oid=a.atttypid LEFT JOIN pg_type el ON el.oid=ty.typelem AND ty.typlen=-1 AND ty.typelem<>0
-		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		WHERE c.relkind = 'r' AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
 		AND (ty.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle') OR el.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle'))`, 100)
 	if noEqN > 0 {
 		p.emit(check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", noEqN, noEq[0]),
@@ -711,7 +731,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 	p = r.probe(ctx, "identity_full_duplicates", "", d.Source)
 	fullNoKey, fullNoKeyN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
+		WHERE c.relkind = 'r' AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisunique AND i.indpred IS NULL)`, 100)
 	if fullNoKeyN > 0 {
 		p.emit(check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", fullNoKeyN, fullNoKey[0]),
@@ -876,9 +896,9 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		r.couldNotCheck("target_apply_privileges", "", d.Source, apErr, ap.Evidence(), t)
 	case !ap.OK:
 		r.emit("target_apply_privileges", "", d.Source, check.Blocker, true, "The target user cannot "+strings.Join(ap.Missing, " or ")+". Without this, pgcopydb 0.18 applies no changes and still reports success (Phase 0 finding F2).",
-			"Grant EXECUTE on the pg_replication_origin_* functions and SET on session_replication_role to "+e.Target.User+" (ask for these on the Advanced cluster), then run preflight again.", ap.Evidence(), t)
+			ApplyPrivilegeRemediation(e.Target.User, r.dstVer), ap.EvidenceFor(e.Target.User, r.dstVer), t)
 	default:
-		ok(r, "target_apply_privileges", "", d.Source, "The target user can manage replication origins and set session_replication_role.", ap.Evidence(), t)
+		ok(r, "target_apply_privileges", "", d.Source, "The target user can manage replication origins and set session_replication_role.", ap.EvidenceFor(e.Target.User, r.dstVer), t)
 	}
 
 	p = r.probe(ctx, "heartbeat_possible", "", d.Source)
@@ -987,7 +1007,7 @@ func TargetApplyPrivileges(ctx context.Context, c *pgx.Conn, verNum int) (ApplyP
 			a.Missing = append(a.Missing, "SET session_replication_role")
 		}
 	} else if !a.Super {
-		a.Missing = append(a.Missing, "SET session_replication_role (PostgreSQL 14 allows it only for superusers)")
+		a.Missing = append(a.Missing, "SET session_replication_role (before PostgreSQL 15, only superusers can; upgrade the target to PostgreSQL 15 or later)")
 	}
 	a.OK = len(a.Missing) == 0
 	return a, nil
