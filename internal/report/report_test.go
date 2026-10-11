@@ -1,6 +1,7 @@
 package report
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -58,5 +59,23 @@ func TestPostCutoverChecklist(t *testing.T) {
 	}
 	if strings.Contains(md, "Large objects") {
 		t.Error("a check that found nothing is on the checklist")
+	}
+}
+
+// TestPDFReport (overnight item 8): the PDF renders locally with the
+// checklist, verification and long text, and is a valid PDF.
+func TestPDFReport(t *testing.T) {
+	r := &Report{
+		Migration: orch.Migration{Name: "Shop → Advanced", ShortID: "abcde", Flags: orch.Flags{Verdict: "GO"}},
+		Preflight: []check.Result{{CheckID: "materialized_views", Database: "shop", Level: check.Warning, Title: "Materialized views", Message: strings.Repeat("A long preflight message that must wrap across several lines. ", 8), Evidence: map[string]any{"names": []any{"public.daily"}}}},
+		Events:    []map[string]any{{"ts": int64(1791600000000), "database": "shop", "message": "Base copy started"}},
+	}
+	r.Checklist = Checklist(r)
+	b, err := r.PDF()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(b, []byte("%PDF-")) || !bytes.Contains(b, []byte("%%EOF")) || len(b) < 2000 {
+		t.Fatalf("not a PDF (%d bytes)", len(b))
 	}
 }

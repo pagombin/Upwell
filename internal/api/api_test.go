@@ -1,7 +1,9 @@
 package api
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +37,16 @@ type client struct {
 	csrf string
 }
 
+var testStores sync.Map // server URL -> store
+
+func testStore(t *testing.T, srv *httptest.Server) *store.Store {
+	v, ok := testStores.Load(srv.URL)
+	if !ok {
+		t.Fatal("no store for the server")
+	}
+	return v.(*store.Store)
+}
+
 // newServer starts the API with no users, like a fresh install.
 func newServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
@@ -66,6 +78,7 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 	h := NewHealth()
 	srv := New(&Server{Cfg: cfg, Store: st, Auth: as, Audit: au, Orch: o, Settings: set, Bus: b, Log: lg, Version: "test", Health: h, TLSInfo: func() TLSInfo { return TLSInfo{Fingerprint: "AA:BB"} }})
 	ts := httptest.NewTLSServer(srv.Handler())
+	testStores.Store(ts.URL, st)
 	os.WriteFile(cfg.SetupToken, []byte("token-123\n"), 0o600)
 	t.Cleanup(func() { ts.Close(); lg.Close(); st.Close() })
 	return ts, "token-123"
@@ -554,5 +567,82 @@ func TestPrometheusMetrics(t *testing.T) {
 	}
 	if code, _, _ := a.req("GET", "/metrics", "", nil); code != 200 {
 		t.Fatalf("/metrics with an Admin session: %d", code)
+	}
+}
+
+// TestSupportBundle (overnight item 6, bug bash 9): the preview lists the
+// files, and the downloaded bundle contains no planted canary secret.
+func TestSupportBundle(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	pw := "correct-horse-battery-staple"
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	a.login("admin", pw)
+	canary := "canary-pw-91c4e7d2"
+	_, m, _ := a.req("POST", "/api/v1/migrations", k(), map[string]any{"name": "Bundle test"})
+	id := fmt.Sprint(m["id"])
+	a.req("PUT", "/api/v1/migrations/"+id+"/connections/source", k(), map[string]any{"host": "src.example", "port": 25060, "user": "doadmin", "password": canary, "sslmode": "require"})
+	a.req("PUT", "/api/v1/migrations/"+id+"/connections/target", k(), map[string]any{"host": "dst.example", "port": 25060, "user": "doadmin", "password": canary + "-t", "sslmode": "require"})
+	_, tm, _ := a.req("POST", "/api/v1/api-tokens", k(), map[string]any{"name": "ci", "scope": "read"})
+	apiTok := fmt.Sprint(tm["token"])
+	// Plant the canaries where a careless log line would put them.
+	st := testStore(t, srv)
+	for _, msg := range []string{
+		"connecting to postgres://doadmin:" + canary + "@src.example:25060/defaultdb",
+		"retrying with password=" + canary + " and token " + apiTok,
+		`{"password": "` + canary + `-t"}`,
+		"Authorization: Bearer " + apiTok,
+	} {
+		st.DB.Exec(`INSERT INTO logs(ts, level, component, migration_id, msg) VALUES (?, 'info', 'test', ?, ?)`, time.Now().UnixMilli(), id, msg)
+	}
+	code, pv, raw := a.req("GET", "/api/v1/migrations/"+id+"/support-bundle", "", nil)
+	if code != 200 {
+		t.Fatalf("preview: %d %s", code, raw)
+	}
+	names := map[string]bool{}
+	for _, f := range pv["files"].([]any) {
+		names[fmt.Sprint(f.(map[string]any)["name"])] = true
+	}
+	for _, want := range []string{"manifest.json", "migration.json", "preflight.json", "events.json", "alerts.json", "metrics-24h.json", "report.md", "logs/upwell.jsonl", "versions.json", "host.json"} {
+		if !names[want] {
+			t.Errorf("the bundle lacks %s", want)
+		}
+	}
+	if strings.Contains(raw, canary) || strings.Contains(raw, apiTok) {
+		t.Fatal("the preview shows a secret")
+	}
+	r, _ := http.NewRequest("GET", srv.URL+"/api/v1/migrations/"+id+"/support-bundle/download", nil)
+	res, err := a.c.Do(r)
+	if err != nil || res.StatusCode != 200 {
+		t.Fatalf("download: %v %v", err, res.StatusCode)
+	}
+	gz, err := gzip.NewReader(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	n := 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(tr)
+		n++
+		for _, secret := range []string{canary, apiTok, token} {
+			if strings.Contains(string(b), secret) {
+				t.Errorf("%s contains the canary %q", h.Name, secret[:8])
+			}
+		}
+		if strings.HasSuffix(h.Name, "logs/upwell.jsonl") && !strings.Contains(string(b), "[redacted]") {
+			t.Errorf("the planted log lines were not redacted: %s", b)
+		}
+	}
+	res.Body.Close()
+	if n < 10 {
+		t.Fatalf("only %d files in the bundle", n)
 	}
 }

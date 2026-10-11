@@ -227,3 +227,25 @@ func (o *Orchestrator) freezeJanitor(ctx context.Context, m Migration) {
 	}
 	_ = o.undoFreeze(ctx, m.ID, "Upwell", "the cutover is no longer running and did not end GO")
 }
+
+// MigrationSecrets returns the stored passwords of a migration's connections,
+// so exports (the support bundle) can scrub any literal occurrence.
+func (o *Orchestrator) MigrationSecrets(ctx context.Context, m Migration) []string {
+	var out []string
+	for _, cid := range []string{m.SourceConnID, m.TargetConnID} {
+		if cid == "" {
+			continue
+		}
+		c, err := o.GetConnection(ctx, cid)
+		if err != nil || c.PasswordSecretID == "" {
+			continue
+		}
+		if pw, err := o.vault.Get(ctx, c.PasswordSecretID); err == nil && pw != "" {
+			out = append(out, pw)
+		}
+	}
+	return out
+}
+
+// EngineLogPath is a database's engine log file.
+func (o *Orchestrator) EngineLogPath(d Database) string { return o.runLog(d) }

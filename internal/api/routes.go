@@ -92,7 +92,11 @@ func (s *Server) register() {
 	s.add("POST", "/api/v1/migrations/{id}/acceptances", operator, "Accept an acceptable blocker", s.accept)
 	s.add("GET", "/api/v1/migrations/{id}/plan", viewer, "Dry run: commands and estimates", s.plan)
 	s.add("POST", "/api/v1/migrations/{id}/start", operator, "Start", s.start)
-	s.add("POST", "/api/v1/migrations/{id}/queue", operator, "Queue (coming soon)", s.comingSoon("Queueing several migrations"))
+	s.add("POST", "/api/v1/migrations/{id}/queue", operator, "Queue a ready migration", s.queueAdd)
+	s.add("DELETE", "/api/v1/migrations/{id}/queue", operator, "Take a migration out of the queue", s.queueRemove)
+	s.add("PATCH", "/api/v1/migrations/{id}/queue", operator, "Turn auto-start on or off for a queued migration", s.queueAutoStart)
+	s.add("GET", "/api/v1/queue", viewer, "The run lock and the queue", s.queueList)
+	s.add("PUT", "/api/v1/queue/order", operator, "Reorder the queue", s.queueOrder)
 	s.add("POST", "/api/v1/migrations/{id}/pause", operator, "Pause (stop every database, keep slots)", s.pause)
 	s.add("POST", "/api/v1/migrations/{id}/resume", operator, "Resume", s.resume)
 	s.add("POST", "/api/v1/migrations/{id}/abort", operator, "Abort", s.abort)
@@ -118,7 +122,8 @@ func (s *Server) register() {
 	s.add("GET", "/api/v1/migrations/{id}/events", viewer, "Timeline", s.events)
 	s.add("GET", "/api/v1/migrations/{id}/operations", viewer, "Operations", s.listOps)
 	s.add("GET", "/api/v1/migrations/{id}/report", viewer, "Report (html or md; pdf coming soon)", s.report)
-	s.add("POST", "/api/v1/migrations/{id}/support-bundle", operator, "Support bundle (coming soon)", s.comingSoon("Support bundle"))
+	s.add("GET", "/api/v1/migrations/{id}/support-bundle", operator, "Preview the support bundle", s.bundlePreview)
+	s.add("GET", "/api/v1/migrations/{id}/support-bundle/download", operator, "Download the support bundle (.tar.gz, secrets removed)", s.bundleDownload)
 	s.add("GET", "/api/v1/migrations/{id}/source-health", viewer, "Source impact: snapshots, dead tuples, connections", s.sourceHealth)
 	s.add("GET", "/api/v1/operations/{id}", viewer, "Operation status and steps", s.getOp)
 	s.add("GET", "/api/v1/logs", viewer, "Log search across everything", s.logs)
@@ -424,6 +429,72 @@ func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) error {
 	}
 	s.Audit.Append(r.Context(), actor(r), "api_token.revoke", t.ID, nil, map[string]any{"name": t.Name, "prefix": t.Prefix})
 	return writeJSON(w, 200, t)
+}
+
+func (s *Server) queueAdd(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		AutoStart        bool `json:"auto_start"`
+		WarningsReviewed bool `json:"warnings_reviewed"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	m, err := s.Orch.QueueMigration(r.Context(), actor(r), r.PathValue("id"), in.AutoStart, in.WarningsReviewed)
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, m)
+}
+
+func (s *Server) queueRemove(w http.ResponseWriter, r *http.Request) error {
+	m, err := s.Orch.Unqueue(r.Context(), actor(r), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, m)
+}
+
+func (s *Server) queueAutoStart(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		AutoStart bool `json:"auto_start"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	if err := s.Orch.SetQueueAutoStart(r.Context(), actor(r), r.PathValue("id"), in.AutoStart); err != nil {
+		return err
+	}
+	return writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) queueList(w http.ResponseWriter, r *http.Request) error {
+	q, err := s.Orch.ListQueue(r.Context())
+	if err != nil {
+		return err
+	}
+	h, err := s.Orch.RunLockHolder(r.Context())
+	if err != nil {
+		return err
+	}
+	var holder any
+	if h != nil {
+		holder = map[string]any{"id": h.ID, "short_id": h.ShortID, "name": h.Name, "state": h.State}
+	}
+	return writeJSON(w, 200, map[string]any{"running": holder, "entries": q})
+}
+
+func (s *Server) queueOrder(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		IDs []string `json:"ids"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	q, err := s.Orch.ReorderQueue(r.Context(), actor(r), in.IDs)
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, q)
 }
 
 // failedLoginTarget names an unknown username in the audit log without
@@ -1278,15 +1349,25 @@ func (s *Server) getOp(w http.ResponseWriter, r *http.Request) error {
 
 func (s *Server) report(w http.ResponseWriter, r *http.Request) error {
 	format := r.URL.Query().Get("format")
-	if format == "pdf" {
-		return apiErr(501, "coming_soon", "PDF reports are coming soon; download HTML or Markdown.", "")
-	}
 	rep, err := report.Build(r.Context(), s.Orch, s.Store, r.PathValue("id"), s.Version)
 	if err != nil {
 		return err
 	}
 	name := "upwell-" + rep.Migration.ShortID
 	switch format {
+	case "pdf":
+		b, err := rep.PDF()
+		if err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "application/pdf")
+		disp := "inline"
+		if r.URL.Query().Get("download") == "1" {
+			disp = "attachment"
+		}
+		w.Header().Set("Content-Disposition", disp+`; filename="`+name+`.pdf"`)
+		w.Write(b)
+		return nil
 	case "md":
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		if r.URL.Query().Get("download") == "1" {

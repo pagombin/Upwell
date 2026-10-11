@@ -29,21 +29,26 @@ func (o *Orchestrator) IsOffline(ctx context.Context, m Migration) bool {
 	return o.Settings(ctx, m).Str("mode") == "offline"
 }
 
-func (o *Orchestrator) startOffline(ctx context.Context, a audit.Actor, m Migration, opts StartOptions, snap settings.Values) (Migration, error) {
+// offlineChecks: how writes stop must be settled before an offline start.
+func (o *Orchestrator) offlineChecks(ctx context.Context, m Migration, opts StartOptions) error {
 	if opts.WriteFreeze {
 		if opts.Role != "admin" {
-			return m, uerr("admin_only", "Only an Admin can apply the write freeze.", "Ask an Admin, or stop writers by hand and confirm it.")
+			return uerr("admin_only", "Only an Admin can apply the write freeze.", "Ask an Admin, or stop writers by hand and confirm it.")
 		}
 		src, _, err := o.Conns(ctx, m)
 		if err != nil {
-			return m, err
+			return err
 		}
 		if want := FreezeConfirmName(src.Host); opts.FreezeConfirm != want {
-			return m, uerr("freeze_confirm", "Type the source cluster's name ("+want+") to apply the write freeze.", "Review the freeze preview first.")
+			return uerr("freeze_confirm", "Type the source cluster's name ("+want+") to apply the write freeze.", "Review the freeze preview first.")
 		}
 	} else if !opts.ConfirmWritersStopped {
-		return m, uerr("confirm_writers", "An offline migration copies once: confirm that every writer to the source is stopped, or apply the write freeze.", "Writes made after this point would be missing on the target, and verification would end NO-GO.")
+		return uerr("confirm_writers", "An offline migration copies once: confirm that every writer to the source is stopped, or apply the write freeze.", "Writes made after this point would be missing on the target, and verification would end NO-GO.")
 	}
+	return nil
+}
+
+func (o *Orchestrator) startOffline(ctx context.Context, a audit.Actor, m Migration, opts StartOptions, snap settings.Values) (Migration, error) {
 	if m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0 {
 		return m, uerr("running", "The offline migration is already running.", "")
 	}

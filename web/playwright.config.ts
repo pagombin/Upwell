@@ -16,6 +16,7 @@ export default defineConfig({
     ignoreHTTPSErrors: true,
     launchOptions: { executablePath: process.env.PW_CHROMIUM || "/opt/pw-browsers/chromium" },
     trace: "retain-on-failure",
+    actionTimeout: 30_000,
   },
   projects: [
     { name: "setup", testMatch: /auth\.setup\.ts/ },

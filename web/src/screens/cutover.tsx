@@ -6,7 +6,7 @@ import { useApi, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { FreezePreview, FreezeState, Operation, VerificationRow } from "../lib/types";
 import { OpSteps, useOps } from "../components/ops";
-import { Card, ComingSoon, ConfirmDialog, Dialog, Empty, ErrorState, LevelPill, Pill, Skeleton, Trunc, useAction } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, LevelPill, Pill, Skeleton, Trunc, useAction } from "../components/ui";
 import { useMig } from "./migration";
 
 interface Cond { key: string; label: string; ok: boolean; detail: string; database?: string }
@@ -332,7 +332,7 @@ export function ReportTab() {
         <button className="ghost" onClick={() => setN((x) => x + 1)}>Refresh</button>
         <a className="btn" href={`/api/v1/migrations/${id}/report?format=html&download=1`} download>Download HTML</a>
         <a className="btn" href={`/api/v1/migrations/${id}/report?format=md&download=1`} download>Download Markdown</a>
-        <span className="row small muted" style={{ gap: 6 }}>PDF <ComingSoon what="PDF reports" /></span>
+        <a className="btn" href={`/api/v1/migrations/${id}/report?format=pdf&download=1`} download>Download PDF</a>
       </div>
       <iframe key={n} title={`Report for ${m.name}`} src={`/api/v1/migrations/${id}/report?format=html`} style={{ width: "100%", height: "calc(100vh - 300px)", minHeight: 480, border: "1px solid var(--border)", borderRadius: 6, background: "#fff" }} />
     </div>

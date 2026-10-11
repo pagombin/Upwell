@@ -435,6 +435,9 @@ func DeriveState(m Migration, dbs []Database, preflightOK, permissionOK bool) st
 		return MAborted
 	}
 	inc := included(dbs)
+	if !f.Started && f.Queued {
+		return MQueued
+	}
 	if !f.Started {
 		if preflightOK && permissionOK && len(inc) > 0 {
 			return MReady

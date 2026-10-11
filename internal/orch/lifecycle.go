@@ -436,6 +436,7 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 			}
 		}
 	}
+	o.st.DB.ExecContext(ctx, `DELETE FROM queue_entries WHERE migration_id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM migrations WHERE id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM logs WHERE migration_id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM events WHERE migration_id=?`, m.ID)
@@ -469,54 +470,19 @@ func (o *Orchestrator) Start(ctx context.Context, a audit.Actor, id string, opts
 	if err != nil {
 		return m, err
 	}
-	if m.Flags.Started {
-		return m, uerr("already_started", "This migration has already started.", "")
-	}
-	if m.Fixture {
-		return m, uerr("fixture", "This is a demonstration fixture and cannot be started.", "")
-	}
-	if err := o.requirePermission(ctx, m); err != nil {
+	if err := o.startChecks(ctx, m, opts); err != nil {
 		return m, err
 	}
-	// A mode the engine does not run must never be silently replaced by
-	// another (a value stored before it was refused, D51).
-	if mode, _ := m.Settings["mode"].(string); mode != "" {
-		if _, err := settings.Validate("mode", mode); err != nil {
-			return m, uerr("mode_unavailable", "This migration is set to "+mode+" mode: "+err.Error()+".", "Change the mode in the migration's options.")
+	snap := o.Settings(ctx, m)
+	if snap.Str("mode") == "offline" {
+		if err := o.offlineChecks(ctx, m, opts); err != nil {
+			return m, err
 		}
 	}
-	if !o.testHooks.SkipPreflightGate {
-		run, results, err := o.LatestPreflight(ctx, m.ID)
-		if err != nil || run == nil {
-			return m, uerr("preflight_required", "Run preflight before starting.", "")
-		}
-		if run.State != "done" {
-			return m, uerr("preflight_running", "Preflight is still running.", "Wait for it to finish.")
-		}
-		if !o.preflightStillValid(ctx, m) {
-			return m, uerr("preflight_stale", "The migration changed after the last preflight.", "Run preflight again.")
-		}
-		var blocking, warnings int
-		for _, r := range results {
-			if r.Blocking() {
-				blocking++
-			}
-			if r.Level == "warning" {
-				warnings++
-			}
-		}
-		if blocking > 0 {
-			return m, uerr("preflight_blocked", fmt.Sprintf("%d preflight blocker(s) are unresolved.", blocking), "Fix them, or accept the acceptable ones with a reason, and run preflight again.")
-		}
-		if warnings > 0 && !opts.WarningsReviewed {
-			return m, uerr("warnings_not_reviewed", fmt.Sprintf("Preflight raised %d warning(s).", warnings), "Tick \"I have reviewed the warnings\" to start.")
-		}
+	if err := o.acquireRunLock(ctx, m); err != nil {
+		return m, err
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
-	if len(included(dbs)) == 0 {
-		return m, uerr("no_databases", "No databases are selected.", "")
-	}
-	snap := o.Settings(ctx, m)
 	if snap.Str("mode") == "offline" {
 		return o.startOffline(ctx, a, m, opts, snap)
 	}
@@ -528,6 +494,58 @@ func (o *Orchestrator) Start(ctx context.Context, a audit.Actor, id string, opts
 	o.refreshState(ctx, m.ID)
 	go o.Tick(context.Background())
 	return o.GetMigration(ctx, m.ID)
+}
+
+// startChecks are the conditions to start (or queue) a migration.
+func (o *Orchestrator) startChecks(ctx context.Context, m Migration, opts StartOptions) error {
+	if m.Flags.Started {
+		return uerr("already_started", "This migration has already started.", "")
+	}
+	if m.Fixture {
+		return uerr("fixture", "This is a demonstration fixture and cannot be started.", "")
+	}
+	if err := o.requirePermission(ctx, m); err != nil {
+		return err
+	}
+	// A mode the engine does not run must never be silently replaced by
+	// another (a value stored before it was refused, D51).
+	if mode, _ := m.Settings["mode"].(string); mode != "" {
+		if _, err := settings.Validate("mode", mode); err != nil {
+			return uerr("mode_unavailable", "This migration is set to "+mode+" mode: "+err.Error()+".", "Change the mode in the migration's options.")
+		}
+	}
+	if !o.testHooks.SkipPreflightGate {
+		run, results, err := o.LatestPreflight(ctx, m.ID)
+		if err != nil || run == nil {
+			return uerr("preflight_required", "Run preflight before starting.", "")
+		}
+		if run.State != "done" {
+			return uerr("preflight_running", "Preflight is still running.", "Wait for it to finish.")
+		}
+		if !o.preflightStillValid(ctx, m) {
+			return uerr("preflight_stale", "The migration changed after the last preflight.", "Run preflight again.")
+		}
+		var blocking, warnings int
+		for _, r := range results {
+			if r.Blocking() {
+				blocking++
+			}
+			if r.Level == "warning" {
+				warnings++
+			}
+		}
+		if blocking > 0 {
+			return uerr("preflight_blocked", fmt.Sprintf("%d preflight blocker(s) are unresolved.", blocking), "Fix them, or accept the acceptable ones with a reason, and run preflight again.")
+		}
+		if warnings > 0 && !opts.WarningsReviewed {
+			return uerr("warnings_not_reviewed", fmt.Sprintf("Preflight raised %d warning(s).", warnings), "Tick \"I have reviewed the warnings\" to start.")
+		}
+	}
+	dbs, _ := o.ListDatabases(ctx, m.ID)
+	if len(included(dbs)) == 0 {
+		return uerr("no_databases", "No databases are selected.", "")
+	}
+	return nil
 }
 
 // dbSpec builds the engine spec for one database.

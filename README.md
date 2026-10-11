@@ -16,9 +16,9 @@ Upwell is a migration console for moving PostgreSQL databases between DigitalOce
 - A cutover console with manual stop-writes or an optional **write freeze** (with a preview of exactly what it runs and ends, an audit entry, automatic undo when the cutover does not end GO, and an always-available undo button), in both cases Upwell sampling the source to confirm writes really stopped, a write-pause timer, drain, sequence sync and **verification that compares data**, ending in GO or NO-GO.
 - An HTML and Markdown report, cleanup of slots, publications, origins, the heartbeat schema, work files and stored credentials, and alerts, events, logs, host metrics and system health screens.
 
-- Offline migrations (writes stopped first, confirmed or frozen; one copy; verification), a TOTP second factor with recovery codes (required for Admins by default), read-only API tokens, and a Prometheus `/metrics` endpoint.
+- Offline migrations (writes stopped first, confirmed or frozen; one copy; verification), a TOTP second factor with recovery codes (required for Admins by default), read-only API tokens, a Prometheus `/metrics` endpoint, a redacted support bundle with a preview, a run lock with a queue (reorder, unqueue, optional auto-start), and PDF reports rendered on the droplet.
 
-**Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand), notifications (Slack, email, PagerDuty), PDF reports, the support bundle, SSO, a queue of several migrations, offline bundles, and self-serve mode.
+**Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand), notifications (Slack, email, PagerDuty), SSO, offline bundles, and self-serve mode.
 
 ## Install
 
@@ -108,7 +108,7 @@ The verdict is decided per database and the migration is GO only if every databa
 - **Connection poolers.** Use the cluster's direct port when it has one. Behind a pooler, Upwell and pgcopydb work in session mode (tested with PgBouncer); transaction mode is refused by the connection test and preflight because the engine's session settings would be lost.
 - **DDL is not streamed.** Schema changes made on the source during a migration (a new table or partition, a changed column, a new enum value) do not reach the target. Upwell notices within a minute (a critical alert and a readiness condition that blocks the cutover), and verification would end NO-GO anyway (tested). Freeze schema changes until the cutover, or apply the same change on the target.
 - **Large objects are not streamed.** They are copied during the base copy and compared at verification; a change made while streaming ends NO-GO.
-- **The write freeze is a strong guard, not a lock.** It makes new sessions read-only by default and ends client sessions; a session can still run `SET default_transaction_read_only = off` and write, which the writers check detects. It needs the admin user to own each source database and be a member of `pg_signal_backend`; otherwise preflight says so and writers are stopped by hand. One migration runs at a time per operator action (no queue).
+- **The write freeze is a strong guard, not a lock.** It makes new sessions read-only by default and ends client sessions; a session can still run `SET default_transaction_read_only = off` and write, which the writers check detects. It needs the admin user to own each source database and be a member of `pg_signal_backend`; otherwise preflight says so and writers are stopped by hand. One migration runs at a time: others wait in the queue and start when an operator starts them (or by themselves with auto-start, never for offline migrations).
 - systemd as PID 1, the polkit rule, the watchdog and reboot recovery could not be exercised in the build container; they are implemented to spec and marked "needs droplet" in `docs/PROGRESS.md`.
 
 ## Where things are

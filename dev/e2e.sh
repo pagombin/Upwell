@@ -218,7 +218,8 @@ FREEZE_NAME="E2E: write freeze"
 FREEZE=$(define "$FREEZE_NAME" e2e_freeze e2e_freeze)
 api POST /api/v1/migrations/$FREEZE/preflight >/dev/null
 wait_preflight $FREEZE
-api POST /api/v1/migrations/$FREEZE/start '{"warnings_reviewed":true}' >/dev/null
+# Started by the feature test, once the running migration has ended (one
+# migration runs at a time: the run lock).
 
 log "Source database e2e_offline for the offline browser test"
 psql_su $SRC_PORT postgres -c "DROP DATABASE IF EXISTS e2e_offline WITH (FORCE)" -c "CREATE DATABASE e2e_offline OWNER doadmin"
@@ -246,9 +247,13 @@ set +e
 npx playwright test --project=ui $UPDATE "${PWARGS[@]}"
 RC=$?
 if [[ ${#PWARGS[@]} -eq 0 ]]; then
-  log "Browser walkthrough (writer stopped)"
+  log "Browser walkthrough (writer stopped; the running migration ends first: one runs at a time)"
   [[ -n "${WRITER:-}" ]] && kill "$WRITER" 2>/dev/null
   WRITER=""
+  api POST /api/v1/migrations/$MIG/abort "{\"confirm\":\"$MIG_NAME\"}" >/dev/null
+  sleep 12
+  api POST /api/v1/migrations/$MIG/cleanup "{\"confirm\":\"$MIG_NAME\"}" >/dev/null
+  sleep 8
   npx playwright test --project=flow
   RC2=$?
   [[ $RC -eq 0 ]] && RC=$RC2

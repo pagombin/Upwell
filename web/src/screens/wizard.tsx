@@ -307,6 +307,7 @@ function StepPlan({ v }: { v: MigrationView }) {
   const [stopped, setStopped] = useState(false);
   const [how, setHow] = useState<"confirm" | "freeze">("confirm");
   const [freezing, setFreezing] = useState(false);
+  const [autoStart, setAutoStart] = useState(false);
   const { me } = useSession();
   const offline = v.settings_effective?.mode === "offline";
   const sum = pf.data?.run?.summary;
@@ -348,7 +349,11 @@ function StepPlan({ v }: { v: MigrationView }) {
           </fieldset>
         )}
         <div className="row" style={{ justifyContent: "flex-end" }}>
-          <span className="small muted">Queue instead <ComingSoon what="Queueing several migrations" /></span>
+          {can("operator") && !offline && <label className="check small"><input type="checkbox" checked={autoStart} onChange={(x) => setAutoStart(x.target.checked)} />Auto-start when it reaches the front of the queue</label>}
+          {can("operator") && <button disabled={!sum?.can_start || (sum.needs_warning_review && !reviewed) || !!busy} onClick={async () => {
+            const r = await run("queue", () => api.post(`/api/v1/migrations/${v.migration.id}/queue`, { warnings_reviewed: reviewed, auto_start: autoStart && !offline }), "Queued");
+            if (r) nav("/");
+          }}>Queue instead</button>}
           {can("operator") && <button className="primary" disabled={!sum?.can_start || (sum.needs_warning_review && !reviewed) || (offline && how === "confirm" && !stopped) || !!busy} onClick={start}>{busy && <span className="spin" />}{offline ? "Start offline migration" : "Start migration"}</button>}
         </div>
         {freezing && <FreezeDialog mig={v.migration.id} title="Start the offline migration with a write freeze" onClose={() => setFreezing(false)} onConfirm={async (typed) => {

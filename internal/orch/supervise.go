@@ -78,6 +78,7 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 			}
 		}
 	}
+	o.runLockJanitor(tctx)
 	t0 := time.Now()
 	o.metrics.hostSample(tctx)
 	if d := time.Since(t0); d > slowestFor {

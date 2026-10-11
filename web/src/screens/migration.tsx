@@ -10,7 +10,7 @@ import { Sparkline } from "../components/charts";
 import { useOps } from "../components/ops";
 import { DataTable } from "../components/table";
 import { MIG_TABS } from "../components/shell";
-import { Card, ConfirmDialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction } from "../components/ui";
 import { Stepper } from "./home";
 
 interface MigCtx { view: Loaded<MigrationView>; id: string; metrics: Loaded<Series[]>; lastEvent: number }
@@ -74,7 +74,7 @@ function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => voi
   const { run, busy } = useAction();
   const ops = useOps();
   const nav = useNavigate();
-  const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | null>(null);
+  const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | "bundle" | null>(null);
   const m = v.migration, f = m.flags;
   if (!can("operator")) return null;
   if (m.fixture) return <div className="actions"><span className="small muted">Demonstration data: actions are turned off</span></div>;
@@ -88,6 +88,8 @@ function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => voi
       {f.started && !f.aborted && !f.verdict && !inCutover && <button className="danger" onClick={() => setDlg("abort")}>Abort</button>}
       {(f.aborted || f.verdict || !f.started) && !f.cleaned_up && !f.cleanup_running && <button onClick={() => setDlg("cleanup")}>Clean up</button>}
       {f.cleaned_up && <button className="danger" onClick={() => setDlg("delete")}>Delete</button>}
+      <button className="ghost" onClick={() => setDlg("bundle")}>Support bundle</button>
+      {dlg === "bundle" && <SupportBundleDialog mig={mid} onClose={() => setDlg(null)} />}
       {dlg === "pause" && (
         <ConfirmDialog title="Pause every database" confirmLabel="Pause" onClose={() => setDlg(null)} onConfirm={async () => { await api.post(`/api/v1/migrations/${mid}/pause`); refresh(); }}>
           <p>Every running engine stops within about 10 seconds. Replication slots stay on the source, so WAL accumulates there until you resume; watch the slot headroom.</p>
@@ -211,3 +213,22 @@ export function EventList({ rows, now }: { rows: EventRow[]; now: number }) {
   );
 }
 
+
+interface BundlePreview { files: { name: string; size: number; redactions: number }[]; total_size: number; redaction_rules: string[] }
+
+// The support bundle (overnight item 6): what it holds, previewed before download.
+function SupportBundleDialog({ mig, onClose }: { mig: string; onClose: () => void }) {
+  const pv = useApi<BundlePreview>(`/api/v1/migrations/${mig}/support-bundle`);
+  return (
+    <Dialog title="Support bundle" wide onClose={onClose} footer={<><button onClick={onClose}>Close</button><a className="btn primary" href={`/api/v1/migrations/${mig}/support-bundle/download`} download>Download .tar.gz</a></>}>
+      <p>A .tar.gz for support: the migration's settings and connections (without passwords), databases, preflight, verification, operations, events, alerts, 24 hours of metrics, the report, Upwell's and the engine's logs, versions and host facts. Downloading it is recorded in the audit log.</p>
+      {pv.error ? <ErrorState error={pv.error} retry={pv.refresh} /> : !pv.data ? <Skeleton lines={6} /> : <>
+        <div className="tablewrap"><table className="data" aria-label="Support bundle files">
+          <thead><tr><th>File</th><th>Size</th><th>Values removed</th></tr></thead>
+          <tbody>{pv.data.files.map((f) => <tr key={f.name}><td className="mono">{f.name}</td><td>{bytes(f.size)}</td><td>{f.redactions || "—"}</td></tr>)}</tbody>
+        </table></div>
+        <p className="small muted">Total {bytes(pv.data.total_size)}. Removed before anything is written: {pv.data.redaction_rules.join("; ")}.</p>
+      </>}
+    </Dialog>
+  );
+}

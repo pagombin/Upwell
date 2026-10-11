@@ -10,6 +10,14 @@ const FREEZE = process.env.E2E_FREEZE || "";
 
 test("write freeze: preview, apply at cutover, GO, undo", async ({ page }) => {
   test.skip(!FREEZE, "dev/e2e.sh prepares the write-freeze migration");
+  // Start it from the plan review (the run lock is free once the walkthrough's
+  // migration ended GO), and let it reach In sync.
+  await page.goto(`/migrations/${FREEZE}/setup?step=6`);
+  await expect(page.getByText("Engine command per database")).toBeVisible();
+  const review = page.getByLabel(/I reviewed the \d+ preflight warnings/);
+  if (await review.count()) await review.check();
+  await page.getByRole("button", { name: "Start migration" }).click();
+  await expect(page.locator("table[aria-label='Databases'] .pill", { hasText: "In sync" })).toBeVisible({ timeout: 300_000 });
   await page.goto(`/migrations/${FREEZE}/cutover`);
   await expect(page.locator(".pill", { hasText: /^Ready$/ })).toBeVisible({ timeout: 300_000 });
   await page.getByLabel(/Write freeze: Upwell makes the source databases read-only/).check();
@@ -137,4 +145,26 @@ test("second factor: set up, sign in with a code and a recovery code", async ({ 
   await page.getByRole("menuitem", { name: "Sign out" }).click();
   await signIn(codes[0]);
   await ctx.close();
+});
+
+test("support bundle: preview, then download", async ({ page }) => {
+  test.skip(!process.env.E2E_MIG, "dev/e2e.sh prepares the running migration");
+  await page.goto(`/migrations/${process.env.E2E_MIG}`);
+  await page.getByRole("button", { name: "Support bundle" }).click();
+  const dlg = page.getByRole("dialog", { name: "Support bundle" });
+  const files = dlg.locator("table[aria-label='Support bundle files']");
+  await expect(files).toContainText("manifest.json");
+  await expect(files).toContainText("logs/upwell.jsonl");
+  const [dl] = await Promise.all([page.waitForEvent("download"), dlg.getByRole("link", { name: "Download .tar.gz" }).click()]);
+  expect(dl.suggestedFilename()).toMatch(/^upwell-support-.*\.tar\.gz$/);
+});
+
+test("PDF report: download from the report tab", async ({ page }) => {
+  test.skip(!FREEZE, "dev/e2e.sh prepares the write-freeze migration (GO after the freeze test)");
+  await page.goto(`/migrations/${FREEZE}/report`);
+  const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("link", { name: "Download PDF" }).click()]);
+  expect(dl.suggestedFilename()).toMatch(/^upwell-.*\.pdf$/);
+  const path = await dl.path();
+  const fs = await import("node:fs");
+  expect(fs.readFileSync(path).subarray(0, 5).toString()).toBe("%PDF-");
 });

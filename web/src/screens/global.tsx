@@ -326,7 +326,7 @@ function UsersSection() {
                   <td>{u.disabled ? <Pill kind="warn" text="Disabled" /> : <Pill kind="ok" text="Active" />}</td>
                   <td>{u.totp_enabled ? <Pill kind="ok" text="On" /> : <span className="muted">Off</span>}</td>
                   <td>{u.last_login_at ? time(u.last_login_at) : "Never"}</td>
-                  <td>{u.id !== me?.user.id && <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
+                  <td>{u.id !== me?.user.id && <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
                     <button className="ghost" onClick={() => update(u, { disabled: !u.disabled })}>{u.disabled ? "Enable" : "Disable"}</button>
                     <button className="ghost" onClick={() => setReset(u)}>Reset password</button>
                     {u.totp_enabled && <button className="ghost" onClick={() => setResetMfa(u)}>Reset second factor</button>}
