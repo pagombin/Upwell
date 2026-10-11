@@ -99,6 +99,30 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 			}
 			out = append(out, lc)
 		}
+		// Apply progress, measured independently of the engine (E2): a
+		// sample that is missing, failed or too old is not a pass.
+		ac := Condition{Key: "apply", Label: d.SourceName + " target applying changes", Database: d.SourceName}
+		w, seen := o.metrics.ApplyWatch(d.ID)
+		if !w.At.IsZero() {
+			ac.SampleAgeMS = ageMS(w.At)
+		}
+		switch {
+		case !seen || (w.At.IsZero() && w.Err == nil):
+			ac.Detail = "Not measured yet: the first sample is taken within seconds of streaming"
+		case w.Err != nil && !w.ErrAt.Before(w.At):
+			ac.Detail = fmt.Sprintf("Could not measure apply progress: %v", w.Err)
+		case time.Since(w.At) > lagMaxAge:
+			ac.Detail = fmt.Sprintf("Not measured for %s (last measured %s)", humanDuration(time.Since(w.At).Seconds()), ago(w.At))
+		case w.Stalled:
+			ac.Detail = fmt.Sprintf("Stalled: the target origin has not moved for %s while the source's tables changed %d time(s) (measured %s)", humanDuration(time.Since(w.OriginChangedAt).Seconds()), w.ChangesSince(), ago(w.At))
+		case w.ChangesSince() == 0:
+			ac.OK = true
+			ac.Detail = fmt.Sprintf("Nothing changed on the source since the target last applied (origin at %s, measured %s)", orNone(w.Origin), ago(w.At))
+		default:
+			ac.OK = true
+			ac.Detail = fmt.Sprintf("The target origin moved %s ago; %d source change(s) since (measured %s)", humanDuration(time.Since(w.OriginChangedAt).Seconds()), w.ChangesSince(), ago(w.At))
+		}
+		out = append(out, ac)
 		// DDL is not streamed: a schema changed on the source ends NO-GO at
 		// verification, so refuse the cutover now and say why. A comparison
 		// that has not run, failed, or is too old is not a pass.

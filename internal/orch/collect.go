@@ -32,6 +32,7 @@ type collector struct {
 	last      map[string]float64
 	lastWrite time.Time
 	drift     map[string]driftSample // database ID -> last schema comparison while streaming
+	apply     map[string]applyWatch  // database ID -> apply-progress watchdog (E2)
 	lastAt    map[string]time.Time   // when each series was last sampled
 }
 
@@ -49,7 +50,7 @@ type prevSample struct {
 }
 
 func newCollector(o *Orchestrator) *collector {
-	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, lastAt: map[string]time.Time{}}
+	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, apply: map[string]applyWatch{}, lastAt: map[string]time.Time{}}
 }
 
 func (c *collector) seriesID(ctx context.Context, mig, db, name string) int64 {
@@ -159,9 +160,8 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 	c.put(ctx, m.ID, "", "src_oldest_xact_s", oldestXact, ts)
 	c.put(ctx, m.ID, "", "src_xmin_age", xminAge, ts)
 	slowSizes := c.due(m.ID+"|sizes", 30*time.Second)
-	var dcn interface {
-		Close(context.Context) error
-	}
+	var dcn *pgx.Conn
+	dstErr := error(nil)
 	if tc, err := pg.Connect(ctx, dst, 5*time.Second); err == nil {
 		dcn = tc
 		c.clearStale(m.ID, "target")
@@ -177,6 +177,7 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 			}
 		}
 	} else {
+		dstErr = err
 		c.markStale(ctx, m, "target", err)
 	}
 	if dcn != nil {
@@ -242,6 +243,9 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 				s.Close(ctx)
 			}
 		}
+		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|apply", 10*time.Second) {
+			c.applySample(ctx, m, d, scn, dcn, dstErr, src)
+		}
 		// Schema drift: DDL on the source is not streamed. Catch it within a
 		// minute instead of at the cutover's verification.
 		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|drift", 60*time.Second) {
@@ -275,6 +279,53 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 		c.put(ctx, m.ID, d.SourceName, "log_errors", errs, ts)
 	}
 	c.o.bus.Publish("migration", "metrics", m.ID, map[string]any{"ts": ts})
+}
+
+// applySample takes one apply-watchdog sample (E2): the target origin's
+// progress, the source slot's confirmed flush position, and the source's
+// row-change counter for logged user tables (unlogged tables are not
+// decoded). Any failure is recorded as such, never as progress.
+func (c *collector) applySample(ctx context.Context, m Migration, d Database, scn, dcn *pgx.Conn, dstErr error, src pg.Conn) {
+	now := time.Now()
+	stallAfter := time.Duration(max(c.o.globalSettings(ctx).Int("apply_stall_seconds"), 10)) * time.Second
+	fail := func(err error) { c.setApplyWatch(d.ID, func(w applyWatch) applyWatch { return w.failed(now, err) }) }
+	if dcn == nil {
+		fail(fmt.Errorf("target: %w", dstErr))
+		return
+	}
+	var origin, flush *string
+	if err := pg.QueryRow(ctx, dcn, `SELECT pg_replication_origin_progress($1, false)::text`, d.OriginName).Scan(&origin); err != nil {
+		fail(fmt.Errorf("target origin %s: %w", d.OriginName, err))
+		return
+	}
+	if err := pg.QueryRow(ctx, scn, `SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&flush); err != nil {
+		fail(fmt.Errorf("source slot %s: %w", d.SlotName, err))
+		return
+	}
+	s, err := pg.Connect(ctx, src.WithDB(d.SourceName), 5*time.Second)
+	if err != nil {
+		fail(fmt.Errorf("source: %w", err))
+		return
+	}
+	defer s.Close(ctx)
+	var counter int64
+	if err := pg.QueryRow(ctx, s, `SELECT coalesce(sum(t.n_tup_ins + t.n_tup_upd + t.n_tup_del), 0)::bigint FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid WHERE c.relpersistence = 'p'`).Scan(&counter); err != nil {
+		fail(fmt.Errorf("source statistics: %w", err))
+		return
+	}
+	w := c.setApplyWatch(d.ID, func(w applyWatch) applyWatch {
+		return w.observe(now, deref(origin), counter, deref(flush), stallAfter)
+	})
+	ts := now.UnixMilli()
+	c.put(ctx, m.ID, d.SourceName, "apply_gap_bytes", float64(w.GapBytes), ts)
+	c.put(ctx, m.ID, d.SourceName, "apply_idle_s", now.Sub(w.OriginChangedAt).Seconds(), ts)
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (c *collector) markStale(ctx context.Context, m Migration, side string, err error) {
@@ -566,6 +617,10 @@ func (a *alerter) evaluate(ctx context.Context, m Migration, dbs []Database) {
 		drift := a.o.metrics.Drift(d.ID)
 		a.cond(ctx, len(drift) > 0 && activeDB[d.State], m.ID, "schema_drift", d.SourceName, "critical",
 			fmt.Sprintf("%s: the schema changed on the source while streaming (%s). Schema changes are not streamed: apply the same change on the target, or restart this database from zero, before the cutover.", d.SourceName, strings.Join(limitStrings(drift, 3), "; ")))
+		w, _ := a.o.metrics.ApplyWatch(d.ID)
+		a.cond(ctx, w.Stalled && activeDB[d.State], m.ID, "apply_stalled", d.SourceName, "critical",
+			fmt.Sprintf("%s: the target has applied nothing for %s while the source's tables changed %d time(s) (target origin at %s, source slot confirmed through %s). The engine may be stuck without logging it (Phase 0 finding F2): look for locks on the target and at the engine's log, or restart this database.",
+				d.SourceName, humanDuration(time.Since(w.OriginChangedAt).Seconds()), w.ChangesSince(), orNone(w.Origin), orNone(w.ConfirmedFlush)))
 		if lat, ok := a.o.metrics.Last(m.ID, d.SourceName, "heartbeat_latency_s"); ok {
 			lim := float64(g.Int("alert_heartbeat_seconds"))
 			a.cond(ctx, d.State == DInSync && lim > 0 && lat > lim, m.ID, "heartbeat_latency", d.SourceName, "warning", fmt.Sprintf("%s: heartbeat latency is %.0f s", d.SourceName, lat))
@@ -622,6 +677,13 @@ func (o *Orchestrator) diskGuard(ctx context.Context, pct float64) {
 	o.endAttempt(ctx, bestD, nil, "disk guard")
 	o.setDB(ctx, bestD.ID, map[string]any{"state": DStopped, "next_retry_at": nil, "last_error": fmt.Sprintf("Stopped by the disk guard: the work volume reached %.0f%%", pct)})
 	o.Event(ctx, bestM.ID, bestD.SourceName, "disk_guard", "critical", fmt.Sprintf("Disk guard stopped %s (largest staging, %s) at %.0f%% work-volume use", bestD.SourceName, humanSize(best), pct), nil)
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none yet"
+	}
+	return s
 }
 
 func humanSize(b int64) string {
