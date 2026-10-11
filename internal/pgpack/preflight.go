@@ -740,21 +740,26 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		p.ok("Every table with full replica identity has a unique key.", map[string]any{})
 	}
 
-	simple := []struct{ id, q, msg, fix string }{
-		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards; verification compares them, so any change during the migration ends NO-GO.", "Do not change large objects while the migration runs."},
-		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated."},
-		{"materialized_views", `SELECT count(*) FROM pg_matviews`, "%d materialized view(s) are created but must be refreshed on the target after cutover.", "Refresh them after cutover (it is in the post-cutover checklist)."},
-		{"foreign_servers", `SELECT count(*) FROM pg_foreign_server`, "%d foreign server(s) need their user mappings and credentials re-created on the target.", "Re-create user mappings on the target after cutover."},
-		{"event_triggers", `SELECT count(*) FROM pg_event_trigger`, "%d event trigger(s) are not copied by the engine.", "Re-create them on the target after cutover."},
-		{"pg_cron", `SELECT count(*) FROM pg_extension WHERE extname='pg_cron'`, "pg_cron is installed; its jobs live in the cron schema and need review before cutover%.0d.", "Recreate or disable scheduled jobs on the target after cutover."},
-		{"pg_partman", `SELECT count(*) FROM pg_extension WHERE extname='pg_partman'`, "pg_partman is installed; partition maintenance must run on only one side at a time%.0d.", "Pause partition maintenance on the source after cutover."},
+	simple := []struct{ id, q, msg, fix, names string }{
+		{"large_objects", `SELECT count(*) FROM pg_largeobject_metadata`, "%d large object(s) are copied once during the base copy and not streamed afterwards; verification compares them, so any change during the migration ends NO-GO.", "Do not change large objects while the migration runs.", ""},
+		{"unlogged_tables", `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence='u' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'`, "%d unlogged table(s) are copied once and not streamed; changes to them after the base copy are lost.", "Make them logged before starting, or accept that their later changes are not migrated.", ""},
+		{"materialized_views", `SELECT count(*) FROM pg_matviews`, "%d materialized view(s) are created but must be refreshed on the target after cutover.", "Refresh them after cutover (it is in the post-cutover checklist).", `SELECT format('%I.%I', schemaname, matviewname) FROM pg_matviews`},
+		{"foreign_servers", `SELECT count(*) FROM pg_foreign_server`, "%d foreign server(s) need their user mappings and credentials re-created on the target.", "Re-create user mappings on the target after cutover (it is in the post-cutover checklist).", `SELECT srvname::text FROM pg_foreign_server`},
+		{"event_triggers", `SELECT count(*) FROM pg_event_trigger`, "%d event trigger(s) are not copied by the engine.", "Re-create them on the target after cutover (it is in the post-cutover checklist).", `SELECT evtname::text FROM pg_event_trigger`},
+		{"pg_cron", `SELECT count(*) FROM pg_extension WHERE extname='pg_cron'`, "pg_cron is installed; its jobs live in the cron schema and need review before cutover%.0d.", "Recreate or disable scheduled jobs on the target after cutover.", ""},
+		{"pg_partman", `SELECT count(*) FROM pg_extension WHERE extname='pg_partman'`, "pg_partman is installed; partition maintenance must run on only one side at a time%.0d.", "Pause partition maintenance on the source after cutover.", ""},
 	}
 	for _, s := range simple {
 		p = r.probe(ctx, s.id, "", d.Source)
 		var n int64
 		p.row(sc, s.q).Scan(&n)
 		if n > 0 {
-			p.emit(check.Warning, false, fmt.Sprintf(s.msg, n), s.fix, map[string]any{"count": n})
+			ev := map[string]any{"count": n}
+			if s.names != "" {
+				names, _ := p.sample(sc, s.names, 100)
+				ev["names"] = names
+			}
+			p.emit(check.Warning, false, fmt.Sprintf(s.msg, n), s.fix, ev)
 		} else {
 			p.ok("None.", map[string]any{"count": 0})
 		}

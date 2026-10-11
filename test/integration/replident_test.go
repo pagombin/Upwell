@@ -49,7 +49,8 @@ func TestReplicaIdentityMatrix(t *testing.T) {
 		CREATE TABLE pn(a int NOT NULL, b text) PARTITION BY RANGE(a);
 		CREATE TABLE pn1 PARTITION OF pn FOR VALUES FROM (0) TO (100);
 		INSERT INTO nokey_d SELECT g, 'x' FROM generate_series(1, 50) g;
-		UPDATE nokey_d SET b = 'y' WHERE a <= 20; DELETE FROM nokey_d WHERE a > 45;`)
+		UPDATE nokey_d SET b = 'y' WHERE a <= 20; DELETE FROM nokey_d WHERE a > 45;
+		CREATE MATERIALIZED VIEW "Daily Sales" AS SELECT customer, sum(amount) FROM orders GROUP BY 1;`)
 	superExec(t, db, `DO $$BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='ri_app_owner') THEN CREATE ROLE ri_app_owner; END IF; END$$;
 		CREATE TABLE app_owned(a int, b text); ALTER TABLE app_owned OWNER TO ri_app_owner; GRANT SELECT ON app_owned TO doadmin;`)
 	t.Cleanup(func() { dropDB(t, db); superExec(t, "defaultdb", `DROP ROLE IF EXISTS ri_app_owner`) })
@@ -62,7 +63,11 @@ func TestReplicaIdentityMatrix(t *testing.T) {
 		t.Run(plugin, func(t *testing.T) {
 			env := failClosedEnv(t, db)
 			env.Settings["decoding_plugin"] = plugin
-			r := preflightResults(t, env)["replica_identity"]
+			all := preflightResults(t, env)
+			if mv := all["materialized_views"]; fmt.Sprint(mv.Evidence["names"]) != `[public."Daily Sales"]` {
+				t.Errorf("materialized_views names (for the post-cutover checklist): %v", mv.Evidence["names"])
+			}
+			r := all["replica_identity"]
 			t.Logf("%s: %s\nremediation: %s", r.Level, r.Message, r.Remediation)
 			raw, _ := json.Marshal(r.Evidence)
 			t.Logf("evidence: %.1500s", raw)

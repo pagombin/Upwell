@@ -2,6 +2,55 @@
 
 Branch `overnight-build`. Status legend: **done**; **partial** (what is missing is stated); **needs droplet** (implemented to spec and tested as far as a container allows, but it needs systemd as PID 1, a real DigitalOcean cluster or a DO account to prove); **stub** (labelled "Coming soon" in the UI, never a dead button).
 
+## Overnight build 2 (2026-10-11): the audit of 643e4c1
+
+Branch `overnight-build-2`. Every item below was first given a test that failed because of the problem, then fixed, then the test was run again; the decision entry has the before and after evidence. Tests run against the local clusters only (PostgreSQL 16 source and target, PostgreSQL 18 target without ICU).
+
+### Codebase findings
+
+| # | Finding | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| 1 | Preflight fails open | done: all 73 injected query failures end as a blocker (13 before) | `TestPreflightFailsClosed` | D47 |
+| 2 | Writers check fails open, misses open transactions | done | `TestWritersOpenTransactionRefused`, `TestWritesAfterVerificationNoGo`, `TestWritersCheckFailsClosed` | D48 |
+| 3 | Stale readiness | done (with E6) | `TestStaleReadinessTurnsRed` | D50 |
+| 4 | Admin override makes verification meaningless | done | `TestOverrideWithWritesRunningNoGo` | D49 |
+| 5 | mode=offline ignored | done: refused until offline mode exists | `TestModeOfflineNeverIgnored` | D51 |
+| 6 | Silent collation fallback | done (confirmed, and wider: the provider was ignored too) | `TestCollationFallbackWarned` | D53 |
+| 7 | Counts and quoting | done | `TestPreflightCountsAndQuoting` | D52 |
+| 8 | Plan errors ignored | done | `TestPlanErrorStopsEndPositions` (hung 15 min before) | D55 |
+| 9 | Sequence sync failures shown as done | done | `TestSequenceSyncFailureShown` | D56 |
+| 10 | Verification rows can be lost | done: NO-GO | `TestVerificationStoreFailureNoGo` | D57 |
+| 11 | Overrides proceed without their audit entry | done: refused | `TestAuditFailureRefusesOverrides` | D58 |
+
+### Preflight findings
+
+| # | Finding | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| 1 | Replica identity message wrong under test_decoding | done: verified on PG16 (the statement succeeds and is decoded without the old key) | `TestReplicaIdentityMatrix` | D59 |
+| 2 | FULL cost understated | done: `n_tup_upd`, `n_tup_del`, size and a cost verdict per table | `TestReplicaIdentityMatrix` | D59 |
+| 3 | lock_timeout | done | `TestReplicaIdentityMatrix` | D59 |
+| 4 | PK rewrite warning | done | `TestReplicaIdentityMatrix` | D59 |
+| 5 | Who can run it | done: ownership per table, named in the message | `TestReplicaIdentityMatrix` | D59 |
+| 6 | Privilege trade-off and revoke | done: stated, revoke script shipped and proven | `TestApplyPrivilegeGuidance` | D60 |
+| 7 | "before PostgreSQL 15" | done | `TestApplyPrivilegeGuidance` | D60 |
+| 8 | template1 gap | confirmed; guidance in the remediation and the grant script, launch message (E7) | `TestApplyPrivilegeGuidance`, `TestTemplate0LaunchExplains` | D54, D60 |
+| 9 | `'i'` with a dropped index; partitioned parents | verified on PG16 and pgcopydb's source: `'i'` behaves like NOTHING (now covered); parents were a false blocker (now leaf tables only) | `TestReplicaIdentityMatrix` | D59 |
+| 10 | Verify apply progress | done (with E2) | `TestApplyWatchStall`, `TestApplyStallDetected` | D61 |
+
+### Enhancements
+
+| # | Enhancement | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| E1 | Apply-rate measurement and calibration | done: 4.8 tps measured here | `TestApplyRateMeasured` | D62 |
+| E2 | Apply-progress watchdog | done | `TestApplyWatchStall`, `TestApplyStallDetected` | D61 |
+| E3 | Copy-ready fix SQL | done: `fix_sql`, `grant_script`, `revoke_script` with a Copy button | `TestReplicaIdentityMatrix`, `TestApplyPrivilegeGuidance` | D59, D60 |
+| E4 | FULL evidence | done | `TestReplicaIdentityMatrix` | D59 |
+| E5 | Post-cutover checklist | done | `TestPostCutoverChecklist` | D63 |
+| E6 | Sample age | done | `TestStaleReadinessTurnsRed` | D50 |
+| E7 | template0 explanation at launch | done | `TestTemplate0LaunchExplains` | D54 |
+
+The droplet fixes made while this branch started (D43 to D46: target connection lost mid-COPY reported as such, `pg_dumpall --database`, supervision deadlines, restart from zero with `--drop-if-exists`) are on `overnight-build` and merged here.
+
 ## Summary
 
 Upwell is demo-ready for the end-to-end test. Everything below was verified in the build container against two local PostgreSQL 16 clusters that mimic the pair (a Standard-like source with a non-superuser `doadmin` with REPLICATION, an Advanced-like target with a non-superuser `doadmin` holding the F1 privileges and a `doadmin.aries_health` table). No DigitalOcean cluster or real credential was used.

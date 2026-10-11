@@ -113,6 +113,44 @@ export function PreflightResults({ mig, latest, refresh }: { mig: string; latest
   );
 }
 
+interface ApplyMeasurement { id: string; migration_id: string; ts: number; tps: number; txns: number; seconds: number; lower_bound: boolean; suggested: number; assumed_then: number; by: string }
+
+// The engine's apply rate, measured on scratch databases on both clusters,
+// and the calibration of assumed_apply_tps from it (E1).
+function ApplyRateCard({ mig }: { mig: string }) {
+  const ms = useApi<ApplyMeasurement[]>("/api/v1/apply-rate");
+  const { run, busy } = useAction();
+  const ops = useOps();
+  const { can } = useSession();
+  const last = ms.data?.[0];
+  const [since, setSince] = useState(0);
+  useEffect(() => {
+    if (!since) return;
+    const t = setInterval(() => { if (Date.now() - since > 20 * 60_000) setSince(0); else ms.refresh(); }, 5000);
+    return () => clearInterval(t);
+  }, [since, ms.refresh]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <Card title="Engine apply rate" actions={can("operator") && (
+      <button disabled={!!busy} onClick={async () => {
+        const r = await run("rate", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${mig}/apply-rate`));
+        if (r) { ops.open(r.operation_id, "Measure apply rate"); setSince(Date.now()); }
+      }}>{busy === "rate" && <span className="spin" />}Measure apply rate</button>
+    )}>
+      <p className="small muted">Preflight's apply_rate check compares each database's commit rate with assumed_apply_tps. The measurement creates a scratch database on both clusters, runs the engine on it, writes single-row transactions for 15 seconds and counts how many a second reach the target, for up to two minutes. It removes everything it created afterwards.</p>
+      {ms.error ? <ErrorState error={ms.error} retry={ms.refresh} /> : !ms.data ? <Skeleton lines={2} /> : !last ? <p className="muted">Not measured yet.</p> : (
+        <div className="stack">
+          <p><strong>{last.lower_bound ? "At least " : ""}{last.tps.toFixed(1)} transactions a second</strong> <span className="small muted">({last.txns} written, measured over {Math.round(last.seconds)} s by {last.by}, {time(last.ts)}; assumed_apply_tps was {last.assumed_then})</span></p>
+          {can("admin") && (
+            <div className="row"><button onClick={async () => {
+              await run("cal", () => api.patch("/api/v1/settings", { assumed_apply_tps: last.suggested }), `assumed_apply_tps set to ${last.suggested}`);
+            }} disabled={!!busy}>Use {last.suggested} as assumed_apply_tps</button><span className="small muted">20% below the measured rate. Run preflight again to re-check every database.</span></div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 // Copy-ready SQL a check puts in its evidence (E3).
 const SCRIPTS: [string, string][] = [["fix_sql", "Fix SQL"], ["grant_script", "Grant script (run by the platform, as a superuser)"], ["revoke_script", "Revoke script (after cutover)"]];
 
@@ -174,6 +212,7 @@ export function PreflightScreen({ mig }: { mig: string }) {
         <PreflightSummary run={l.data.run} />
         <PreflightResults mig={mig} latest={l.data} refresh={l.refresh} />
       </>}
+      <ApplyRateCard mig={mig} />
       <Card title="Accepted risks">
         {accepted.length === 0 ? <p className="muted">No risks are accepted on the latest run.</p> : (
           <ul className="stack" style={{ margin: 0, paddingLeft: 18 }}>

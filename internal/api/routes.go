@@ -103,6 +103,8 @@ func (s *Server) register() {
 	s.add("POST", "/api/v1/migrations/{id}/verify", operator, "Run verification again", s.verify)
 	s.add("GET", "/api/v1/migrations/{id}/verification", viewer, "Latest verification", s.verification)
 	s.add("POST", "/api/v1/migrations/{id}/cleanup", operator, "Clean up", s.cleanup)
+	s.add("POST", "/api/v1/migrations/{id}/apply-rate", operator, "Measure the engine's apply rate", s.measureApplyRate)
+	s.add("GET", "/api/v1/apply-rate", viewer, "Measured apply rates", s.applyRates)
 	s.add("GET", "/api/v1/migrations/{id}/metrics", viewer, "Time series", s.metrics)
 	s.add("GET", "/api/v1/migrations/{id}/logs", viewer, "Log search and download", s.logs)
 	s.add("GET", "/api/v1/migrations/{id}/events", viewer, "Timeline", s.events)
@@ -872,6 +874,19 @@ func (s *Server) cleanup(w http.ResponseWriter, r *http.Request) error {
 	}
 	op, err := s.Orch.Cleanup(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"), in.Confirm)
 	return opResponse(w, op, err)
+}
+
+func (s *Server) measureApplyRate(w http.ResponseWriter, r *http.Request) error {
+	op, err := s.Orch.MeasureApplyRate(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"))
+	return opResponse(w, op, err)
+}
+
+func (s *Server) applyRates(w http.ResponseWriter, r *http.Request) error {
+	ms, err := s.Orch.ApplyMeasurements(r.Context(), 20)
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, ms)
 }
 
 func qint(r *http.Request, k string) int64 {
