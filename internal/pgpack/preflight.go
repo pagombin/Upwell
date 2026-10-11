@@ -642,13 +642,13 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 
 	p := r.probe(ctx, "read_privs", "", d.Source)
-	noRead := p.strings(sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	noRead, noReadN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p','S') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
-		AND NOT has_table_privilege(c.oid,'SELECT') ORDER BY 1 LIMIT 50`)
-	if len(noRead) > 0 {
-		p.emit(check.Blocker, true, fmt.Sprintf("%s cannot read %d table(s) or sequence(s), for example %s.", e.Source.User, len(noRead), noRead[0]), "Grant SELECT on them to the admin user, or migrate as their owner.", map[string]any{"unreadable": noRead})
+		AND NOT has_table_privilege(c.oid,'SELECT')`, 50)
+	if noReadN > 0 {
+		p.emit(check.Blocker, true, fmt.Sprintf("%s cannot read %d table(s) or sequence(s), for example %s.", e.Source.User, noReadN, noRead[0]), "Grant SELECT on them to the admin user, or migrate as their owner.", map[string]any{"unreadable": noRead, "count": noReadN})
 	} else {
-		p.ok("Every table and sequence is readable.", map[string]any{"unreadable": []string{}})
+		p.ok("Every table and sequence is readable.", map[string]any{"unreadable": []string{}, "count": 0})
 	}
 
 	t = time.Now()
@@ -666,31 +666,29 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 
 	p = r.probe(ctx, "replica_identity", "", d.Source)
-	noIdent := p.strings(sc, `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	noIdent, noIdentN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
-		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')
-		ORDER BY 1 LIMIT 100`)
-	if len(noIdent) > 0 {
+		AND ((c.relreplident='d' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary)) OR c.relreplident='n')`, 100)
+	if noIdentN > 0 {
 		// Hard: with the migration's publication in place, PostgreSQL refuses the
 		// application's own UPDATE and DELETE on these tables on the source
 		// ("cannot update table ... publishes updates"), so accepting this would
 		// break the customer's writes while the migration runs (tested).
-		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have no primary key or replica identity (for example %s). While the migration runs, the application's UPDATE and DELETE on them would fail with an error on the source, and they could not be replayed.", len(noIdent), noIdent[0]),
-			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent})
+		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have no primary key or replica identity (for example %s). While the migration runs, the application's UPDATE and DELETE on them would fail with an error on the source, and they could not be replayed.", noIdentN, noIdent[0]),
+			"Give each table a primary key, or run ALTER TABLE <table> REPLICA IDENTITY FULL (no lock beyond a brief ACCESS EXCLUSIVE; slightly more WAL on updates), then run preflight again.", map[string]any{"tables": noIdent, "count": noIdentN})
 	} else {
-		p.ok("Every table can replay updates and deletes.", map[string]any{"tables": []string{}})
+		p.ok("Every table can replay updates and deletes.", map[string]any{"tables": []string{}, "count": 0})
 	}
 
 	// Row-level security that applies to the admin user: the engine's COPY
 	// would return only the rows its policies allow, silently.
 	p = r.probe(ctx, "row_security", "", d.Source)
-	rls := p.strings(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	rls, rlsN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND c.relrowsecurity AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
 		AND NOT (SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname=current_user)
-		AND (c.relforcerowsecurity OR NOT pg_has_role(c.relowner, 'USAGE'))
-		ORDER BY 1 LIMIT 100`)
-	if len(rls) > 0 {
-		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have row-level security that applies to %s (for example %s): the copy would contain only the rows its policies allow, and verification cannot read them all.", len(rls), e.Source.User, rls[0]),
+		AND (c.relforcerowsecurity OR NOT pg_has_role(c.relowner, 'USAGE'))`, 100)
+	if rlsN > 0 {
+		p.emit(check.Blocker, true, fmt.Sprintf("%d table(s) have row-level security that applies to %s (for example %s): the copy would contain only the rows its policies allow, and verification cannot read them all.", rlsN, e.Source.User, rls[0]),
 			"Disable or relax the policies for the migration (ALTER TABLE ... NO FORCE ROW LEVEL SECURITY when the admin user owns the table), or migrate with a user that bypasses row-level security.", map[string]any{"tables": rls})
 	} else {
 		p.ok("No row-level security hides rows from the migration.", map[string]any{})
@@ -700,25 +698,23 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	// column. Types without an equality operator (json, xml, the geometric
 	// types) make that comparison fail, so updates and deletes cannot apply.
 	p = r.probe(ctx, "identity_full_types", "", d.Source)
-	noEq := p.strings(sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
+	noEq, noEqN := p.sample(sc, `SELECT DISTINCT format('%I.%I', n.nspname, c.relname)||' ('||a.attname||' '||format_type(a.atttypid, a.atttypmod)||')'
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
 		JOIN pg_type ty ON ty.oid=a.atttypid LEFT JOIN pg_type el ON el.oid=ty.typelem AND ty.typlen=-1 AND ty.typelem<>0
 		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
-		AND (ty.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle') OR el.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle'))
-		ORDER BY 1 LIMIT 100`)
-	if len(noEq) > 0 {
-		p.emit(check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", len(noEq), noEq[0]),
+		AND (ty.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle') OR el.typname IN ('json','xml','point','line','lseg','box','path','polygon','circle'))`, 100)
+	if noEqN > 0 {
+		p.emit(check.Blocker, true, fmt.Sprintf("%d column(s) in tables with REPLICA IDENTITY FULL have a type with no equality operator (for example %s), so the engine cannot find the old row: updates and deletes on these tables would fail to apply.", noEqN, noEq[0]),
 			"Give these tables a primary key (or a unique index used with REPLICA IDENTITY USING INDEX), or change json columns to jsonb, then run preflight again.", map[string]any{"columns": noEq})
 	} else {
 		p.ok("Tables with full replica identity have only comparable columns.", map[string]any{})
 	}
 	p = r.probe(ctx, "identity_full_duplicates", "", d.Source)
-	fullNoKey := p.strings(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	fullNoKey, fullNoKeyN := p.sample(sc, `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND c.relreplident='f' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%'
-		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisunique AND i.indpred IS NULL)
-		ORDER BY 1 LIMIT 100`)
-	if len(fullNoKey) > 0 {
-		p.emit(check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", len(fullNoKey), fullNoKey[0]),
+		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisunique AND i.indpred IS NULL)`, 100)
+	if fullNoKeyN > 0 {
+		p.emit(check.Warning, false, fmt.Sprintf("%d table(s) with REPLICA IDENTITY FULL have no unique key (for example %s). If two rows are exactly identical, an update or delete of one of them is applied to both on the target; verification would then end NO-GO.", fullNoKeyN, fullNoKey[0]),
 			"Add a primary key if the table can hold identical rows.", map[string]any{"tables": fullNoKey})
 	} else {
 		p.ok("Every table with full replica identity has a unique key.", map[string]any{})
@@ -805,7 +801,7 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	}
 	p = r.probe(ctx, "dst_conflicts", "", d.Source)
 	p.fail(tcErr)
-	objQ := `SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	objQ := `SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p','S','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ORDER BY 1`
 	srcObjs := p.strings(sc, objQ)
 	var dstObjs []string

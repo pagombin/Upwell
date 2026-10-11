@@ -473,6 +473,13 @@ func (o *Orchestrator) Start(ctx context.Context, a audit.Actor, id string, opts
 	if err := o.requirePermission(ctx, m); err != nil {
 		return m, err
 	}
+	// A mode the engine does not run must never be silently replaced by
+	// another (a value stored before it was refused, D51).
+	if mode, _ := m.Settings["mode"].(string); mode != "" {
+		if _, err := settings.Validate("mode", mode); err != nil {
+			return m, uerr("mode_unavailable", "This migration is set to "+mode+" mode: "+err.Error()+".", "Change the mode in the migration's options.")
+		}
+	}
 	if !o.testHooks.SkipPreflightGate {
 		run, results, err := o.LatestPreflight(ctx, m.ID)
 		if err != nil || run == nil {

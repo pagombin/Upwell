@@ -3,6 +3,7 @@ package pgpack
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -88,4 +89,30 @@ func (r *Runner) couldNotCheck(id, scope, db string, err error, ev map[string]an
 	ev["checked"] = false
 	r.emit(id, scope, db, check.Blocker, def(id).FailsAs == "hard", "Could not check: "+err.Error()+".",
 		"Run preflight again. If it keeps failing, check the connection and the user's privileges on this cluster.", ev, t)
+}
+
+// sample runs q (one text column, no ORDER BY or LIMIT) and returns up to
+// limit values in order with the total number of rows, so a message can say
+// "250 tables, for example ..." instead of reporting the sample's size.
+func (p *probe) sample(c *pgx.Conn, q string, limit int, args ...any) ([]string, int) {
+	rows, err := pg.Query(p.ctx, c, `SELECT v, count(*) OVER () FROM (`+q+`) s(v) ORDER BY 1 LIMIT `+strconv.Itoa(limit), args...)
+	if err != nil {
+		p.fail(err)
+		return nil, 0
+	}
+	defer rows.Close()
+	var out []string
+	total := 0
+	for rows.Next() {
+		var v string
+		var n int64
+		if err := rows.Scan(&v, &n); err != nil {
+			p.fail(err)
+			return out, total
+		}
+		out = append(out, v)
+		total = int(n)
+	}
+	p.fail(rows.Err())
+	return out, total
 }

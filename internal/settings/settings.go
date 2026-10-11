@@ -102,10 +102,17 @@ func Lookup(key string) (Def, bool) {
 }
 
 // Validate coerces and checks a value for key.
+// OfflineAvailable is set when offline migrations are implemented; until
+// then mode=offline is refused rather than accepted and ignored (D51).
+var OfflineAvailable = false
+
 func Validate(key string, v any) (any, error) {
 	d, ok := Lookup(key)
 	if !ok {
 		return nil, fmt.Errorf("unknown setting %s", key)
+	}
+	if key == "mode" && v == "offline" && !OfflineAvailable {
+		return nil, fmt.Errorf("offline mode is not available in this version; use online")
 	}
 	switch d.Type {
 	case "int", "float":
