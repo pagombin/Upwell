@@ -20,7 +20,9 @@ func (r *Report) PDF() ([]byte, error) {
 	p.SetMargins(15, 15, 15)
 	p.SetAutoPageBreak(true, 15)
 	tr := p.UnicodeTranslatorFromDescriptor("") // cp1252 for the core fonts
-	txt := func(s string) string { return tr(strings.NewReplacer("→", "->", "…", "...", "—", "-", "·", "-").Replace(s)) }
+	txt := func(s string) string {
+		return tr(strings.NewReplacer("→", "->", "…", "...", "—", "-", "·", "-").Replace(s))
+	}
 	p.SetFooterFunc(func() {
 		p.SetY(-12)
 		p.SetFont("Helvetica", "", 8)
