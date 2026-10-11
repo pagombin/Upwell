@@ -18,7 +18,7 @@ Upwell is a migration console for moving PostgreSQL databases between DigitalOce
 
 - Offline migrations (writes stopped first, confirmed or frozen; one copy; verification), a TOTP second factor with recovery codes (required for Admins by default), read-only API tokens, a Prometheus `/metrics` endpoint, a redacted support bundle with a preview, a run lock with a queue (reorder, unqueue, optional auto-start), PDF reports rendered on the droplet, watched tables with exact counts on both sides, saved log views, network throughput on the Host screen, and TLS certificate upload with rollback.
 
-**Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand), notifications (Slack, email, PagerDuty), SSO, offline bundles, and self-serve mode.
+**Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand) and notifications (Slack, email, PagerDuty). **Not in this build** (no UI at all, since each needs an external service or was out of scope): SSO, update checks, offline install bundles, and self-serve mode.
 
 ## Install
 
