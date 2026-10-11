@@ -150,3 +150,18 @@ export async function axeViolations(page: Page) {
   const r = await new AxeBuilder({ page: page as unknown as ConstructorParameters<typeof AxeBuilder>[0]["page"] }).analyze();
   return r.violations.map((v) => `${v.id} (${v.impact}): ${v.help} — ${v.nodes.slice(0, 3).map((n) => n.target.join(" ")).join(" | ")}`);
 }
+
+// totp is the RFC 6238 code for a base32 secret, offset by whole steps.
+export async function totp(secret: string, offset = 0): Promise<string> {
+  const { createHmac } = await import("node:crypto");
+  const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const c of secret.replace(/=+$/, "").toUpperCase()) bits += alpha.indexOf(c).toString(2).padStart(5, "0");
+  const key = Buffer.from((bits.match(/.{8}/g) || []).map((b) => parseInt(b, 2)));
+  const step = Math.floor(Date.now() / 30000) + offset;
+  const msg = Buffer.alloc(8);
+  msg.writeBigUInt64BE(BigInt(step));
+  const h = createHmac("sha1", key).update(msg).digest();
+  const o = h[h.length - 1] & 15;
+  return String((h.readUInt32BE(o) & 0x7fffffff) % 1000000).padStart(6, "0");
+}

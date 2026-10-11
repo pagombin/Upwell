@@ -131,6 +131,7 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 	o := orch.New(orch.Deps{Config: cfg, Store: st, Vault: vault, Engine: pgcopydb.New("pgcopydb", r), Runner: r, Logger: lg, Bus: b, Audit: au, Settings: set})
 	o.SetTestHooks(hooks)
 	as := auth.NewService(st)
+	as.Vault = vault
 	as.FastHashForTests()
 	health := api.NewHealth()
 	health.Ready = func() (bool, map[string]any) { return true, map[string]any{} }
@@ -141,7 +142,8 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 	e := &Env{t: t, Dir: dir, Cfg: cfg, Store: st, Orch: o, cancel: cancel, log: lg, Audit: au}
 	// Fast settings for tests.
 	for k, v := range map[string]any{"wal_sample_seconds": 10, "cutover_stable_seconds": 5, "cutover_write_sample_seconds": 5, "sample_interval_seconds": 2,
-		"alert_disk_crit_pct": 99, "alert_disk_warn_pct": 98, "disk_guard_stop_pct": 99, "cutover_drain_timeout_seconds": 120, "retry_base_seconds": 2} {
+		"alert_disk_crit_pct": 99, "alert_disk_warn_pct": 98, "disk_guard_stop_pct": 99, "cutover_drain_timeout_seconds": 120, "retry_base_seconds": 2,
+		"mfa_required_for_admins": false} {
 		if _, _, err := set.Set(ctx, k, v, "test"); err != nil {
 			t.Fatal(err)
 		}

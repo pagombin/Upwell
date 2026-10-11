@@ -205,3 +205,55 @@ func endSessions(ctx context.Context, conn *pgx.Conn, since string) (int, []stri
 	}
 	return n, not, nil
 }
+
+// CopyDBProperties copies a source database's own ALTER DATABASE ... SET
+// properties to the target database, except default_transaction_read_only
+// (a write freeze sets it on the source). Role-specific settings (ALTER
+// ROLE ... IN DATABASE) are listed as skipped.
+func CopyDBProperties(ctx context.Context, src, dst pg.Conn) (set, skipped []string, err error) {
+	sc, err := pg.Connect(ctx, src, 30*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer sc.Close(ctx)
+	rows, err := pg.Query(ctx, sc, `SELECT COALESCE(r.rolname::text, ''), s FROM pg_db_role_setting d LEFT JOIN pg_roles r ON r.oid = d.setrole, unnest(d.setconfig) s
+		WHERE d.setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database()) ORDER BY 1, 2`)
+	if err != nil {
+		return nil, nil, err
+	}
+	type kv struct{ role, k, v string }
+	var all []kv
+	for rows.Next() {
+		var role, s string
+		if err := rows.Scan(&role, &s); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		k, v, _ := strings.Cut(s, "=")
+		all = append(all, kv{role, k, v})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	dc, err := pg.Connect(ctx, dst, 30*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer dc.Close(ctx)
+	for _, x := range all {
+		switch {
+		case x.k == "default_transaction_read_only":
+			continue
+		case x.role != "":
+			skipped = append(skipped, fmt.Sprintf("ALTER ROLE %s IN DATABASE ... SET %s = %s", x.role, x.k, x.v))
+			continue
+		}
+		if _, err := pg.Exec(ctx, dc, `ALTER DATABASE `+pg.QuoteIdent(dst.DBName)+` SET `+pg.QuoteIdent(x.k)+` = `+pg.QuoteLiteral(x.v)); err != nil {
+			skipped = append(skipped, fmt.Sprintf("%s = %s (%s)", x.k, x.v, firstLine(err)))
+			continue
+		}
+		set = append(set, x.k+" = "+x.v)
+	}
+	return set, skipped, nil
+}

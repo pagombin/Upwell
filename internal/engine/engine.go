@@ -41,7 +41,12 @@ type DatabaseSpec struct {
 	// before restoring it: set on a launch that follows an earlier attempt
 	// (a restart from zero), whose objects may still be on the target.
 	DropIfExists bool
-	ExtraArgs    []string // test hook only; never set from the API
+	// Offline copies once without streaming: no slot, origin or plugin.
+	Offline bool
+	// SkipDBProperties: Upwell copies the database's ALTER DATABASE SET
+	// properties itself (during a write freeze, D65).
+	SkipDBProperties bool
+	ExtraArgs        []string // test hook only; never set from the API
 }
 
 // RunPlan is the exact command for one database: what the dry run shows.

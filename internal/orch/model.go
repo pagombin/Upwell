@@ -47,6 +47,7 @@ const (
 	DDegraded        = "degraded"
 	DStopped         = "stopped"
 	DRestartRequired = "restart_required"
+	DCopied          = "copied" // offline: the one-time copy finished
 )
 
 // activeDB states have (or should have) a running engine unit.

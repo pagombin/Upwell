@@ -453,6 +453,11 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 // StartOptions are the operator's confirmations at start.
 type StartOptions struct {
 	WarningsReviewed bool `json:"warnings_reviewed"`
+	// Offline only: how writes stop before the copy.
+	ConfirmWritersStopped bool   `json:"confirm_writers_stopped"`
+	WriteFreeze           bool   `json:"write_freeze"`
+	FreezeConfirm         string `json:"freeze_confirm"`
+	Role                  string `json:"-"` // the caller's role, set by the API
 }
 
 // Start freezes the settings and begins the migration. The scheduler launches
@@ -512,6 +517,9 @@ func (o *Orchestrator) Start(ctx context.Context, a audit.Actor, id string, opts
 		return m, uerr("no_databases", "No databases are selected.", "")
 	}
 	snap := o.Settings(ctx, m)
+	if snap.Str("mode") == "offline" {
+		return o.startOffline(ctx, a, m, opts, snap)
+	}
 	now := store.Now()
 	o.st.DB.ExecContext(ctx, `UPDATE migrations SET settings_snapshot=?, started_at=?, frozen_at=?, updated_at=? WHERE id=?`, toJSON(snap), now, now, now, m.ID)
 	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Started = true; f.Paused = false })
@@ -534,6 +542,14 @@ func (o *Orchestrator) dbSpec(ctx context.Context, m Migration, d Database) (eng
 	spec := engine.DatabaseSpec{MigrationID: m.ID, Source: d.SourceName, Target: d.TargetName, SourceConn: src, TargetConn: dst,
 		Instance: d.Instance, SlotName: d.SlotName, OriginName: d.OriginName, Plugin: d.Plugin,
 		RunDir: filepath.Join(o.cfg.RunsDir(), d.Instance), TableJobs: tj, IndexJobs: ij, SplitLarger: v.Str("split_tables_larger_than"),
+		Offline: v.Str("mode") == "offline",
+	}
+	// Under a write freeze the source database's properties include
+	// default_transaction_read_only = on, which pgcopydb would copy to the
+	// target (making its own restore, and later the applications, read-only):
+	// Upwell copies the properties itself instead (D65).
+	if _, frozen := m.Flags.Freeze.dbPrior(d.SourceName); frozen {
+		spec.SkipDBProperties = true
 	}
 	if o.testHooks.ExtraEngineArgs != nil {
 		spec.ExtraArgs = o.testHooks.ExtraEngineArgs(d.SourceName)
@@ -603,55 +619,71 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 			o.Event(ctx, m.ID, d.SourceName, "extensions", "warning", "Extensions not created on the target: "+strings.Join(skipped, "; "), nil)
 		}
 	}
-	// The data-safety gate starts here: re-check the apply privileges inside the
-	// database the engine will apply into (function grants are per database).
-	if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err != nil {
-		done("failed: " + err.Error())
-		return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not connect to target database "+d.TargetName+" to confirm the apply privileges, so it did not start the engine (finding F2): "+err.Error()+". Nothing was copied; restart it from zero once the target is reachable.")
-	} else {
-		ver, verr := pg.ServerVersionNum(ctx, tc)
-		ap, err := pgpack.TargetApplyPrivileges(ctx, tc, ver)
-		tc.Close(ctx)
-		if err = firstErr(verr, err); err != nil {
-			done("failed: apply privileges not confirmed")
-			return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not confirm the apply privileges on target database "+d.TargetName+" ("+err.Error()+"), so it did not start the engine (finding F2). Nothing was copied; restart it from zero.")
-		}
-		if !ap.OK {
-			done("failed: apply privileges")
-			why := ""
-			if createdFrom == "template0" {
-				// E7: preflight checked the maintenance database, where the
-				// grants exist; function grants are per database and template0
-				// never has them.
-				why = " Upwell created this database from template0, because the source's encoding or locale differs from the target's template1, so the grants run in template1 did not reach it; preflight checked the maintenance database, where they exist."
-			}
-			return o.dbFailed(ctx, m, d, engine.FailPermanent, "On target database "+d.TargetName+" the user cannot "+strings.Join(ap.Missing, " or ")+
-				". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it."+why+" Run the grant script in that database (it is in the target_apply_privileges evidence) and restart it from zero.")
-		}
-	}
-	if v.Bool("heartbeat") {
-		if err := pgpack.EnsureHeartbeat(ctx, src.WithDB(d.SourceName)); err != nil {
+	// Streaming only: an offline copy applies no changes (pgcopydb sets
+	// session_replication_role only in its apply), needs no heartbeat and
+	// decodes nothing (D65).
+	if !spec.Offline {
+		// The data-safety gate starts here: re-check the apply privileges inside the
+		// database the engine will apply into (function grants are per database).
+		if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err != nil {
 			done("failed: " + err.Error())
-			return o.dbFailed(ctx, m, d, engine.FailPermanent, "creating the heartbeat table: "+err.Error())
+			return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not connect to target database "+d.TargetName+" to confirm the apply privileges, so it did not start the engine (finding F2): "+err.Error()+". Nothing was copied; restart it from zero once the target is reachable.")
+		} else {
+			ver, verr := pg.ServerVersionNum(ctx, tc)
+			ap, err := pgpack.TargetApplyPrivileges(ctx, tc, ver)
+			tc.Close(ctx)
+			if err = firstErr(verr, err); err != nil {
+				done("failed: apply privileges not confirmed")
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not confirm the apply privileges on target database "+d.TargetName+" ("+err.Error()+"), so it did not start the engine (finding F2). Nothing was copied; restart it from zero.")
+			}
+			if !ap.OK {
+				done("failed: apply privileges")
+				why := ""
+				if createdFrom == "template0" {
+					// E7: preflight checked the maintenance database, where the
+					// grants exist; function grants are per database and template0
+					// never has them.
+					why = " Upwell created this database from template0, because the source's encoding or locale differs from the target's template1, so the grants run in template1 did not reach it; preflight checked the maintenance database, where they exist."
+				}
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "On target database "+d.TargetName+" the user cannot "+strings.Join(ap.Missing, " or ")+
+					". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it."+why+" Run the grant script in that database (it is in the target_apply_privileges evidence) and restart it from zero.")
+			}
+		}
+		if v.Bool("heartbeat") {
+			if err := pgpack.EnsureHeartbeat(ctx, src.WithDB(d.SourceName)); err != nil {
+				done("failed: " + err.Error())
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "creating the heartbeat table: "+err.Error())
+			}
+		}
+		// Decoding plugin.
+		if conn, err := pg.Connect(ctx, src.WithDB(d.SourceName), 30*time.Second); err == nil {
+			choice, err := pgpack.ChoosePlugin(ctx, conn, v.Str("decoding_plugin"))
+			conn.Close(ctx)
+			if err == nil {
+				if !choice.OK {
+					done("failed: plugin")
+					return o.dbFailed(ctx, m, d, engine.FailPermanent, "pgoutput is forced but cannot work: "+strings.Join(choice.Reasons, "; "))
+				}
+				spec.Plugin = choice.Plugin
+				if choice.Plugin == "pgoutput" && v.Str("decoding_plugin") == "auto" {
+					spec.Plugin = "" // engine default
+				}
+				o.setDB(ctx, d.ID, map[string]any{"plugin": choice.Plugin})
+				if len(choice.Reasons) > 0 {
+					o.Event(ctx, m.ID, d.SourceName, "plugin", "warning", d.SourceName+" uses test_decoding: "+strings.Join(choice.Reasons, "; "), nil)
+				}
+			}
 		}
 	}
-	// Decoding plugin.
-	if conn, err := pg.Connect(ctx, src.WithDB(d.SourceName), 30*time.Second); err == nil {
-		choice, err := pgpack.ChoosePlugin(ctx, conn, v.Str("decoding_plugin"))
-		conn.Close(ctx)
-		if err == nil {
-			if !choice.OK {
-				done("failed: plugin")
-				return o.dbFailed(ctx, m, d, engine.FailPermanent, "pgoutput is forced but cannot work: "+strings.Join(choice.Reasons, "; "))
-			}
-			spec.Plugin = choice.Plugin
-			if choice.Plugin == "pgoutput" && v.Str("decoding_plugin") == "auto" {
-				spec.Plugin = "" // engine default
-			}
-			o.setDB(ctx, d.ID, map[string]any{"plugin": choice.Plugin})
-			if len(choice.Reasons) > 0 {
-				o.Event(ctx, m.ID, d.SourceName, "plugin", "warning", d.SourceName+" uses test_decoding: "+strings.Join(choice.Reasons, "; "), nil)
-			}
+	if spec.SkipDBProperties {
+		set, skipped, err := pgpack.CopyDBProperties(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
+		if err != nil {
+			done("failed: " + err.Error())
+			return o.dbFailed(ctx, m, d, engine.FailPermanent, "copying the database properties during the write freeze: "+err.Error())
+		}
+		o.Event(ctx, m.ID, d.SourceName, "db_properties", "info", fmt.Sprintf("Copied %d database propert(ies) to %s without the write freeze's default_transaction_read_only", len(set), d.TargetName), map[string]any{"set": set, "skipped": skipped})
+		if len(skipped) > 0 {
+			o.Event(ctx, m.ID, d.SourceName, "db_properties", "warning", "Not copied to the target (set them by hand if needed): "+strings.Join(skipped, "; "), nil)
 		}
 	}
 	os.RemoveAll(spec.RunDir)

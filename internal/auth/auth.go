@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
+	"github.com/pagombin/upwell/internal/secrets"
 	"github.com/pagombin/upwell/internal/store"
 )
 
@@ -68,6 +69,7 @@ type User struct {
 	Disabled    bool   `json:"disabled"`
 	LastLoginAt *int64 `json:"last_login_at,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
+	TOTPEnabled bool   `json:"totp_enabled"`
 }
 
 // Session is a signed-in browser session.
@@ -76,11 +78,14 @@ type Session struct {
 	User      User
 	CSRF      string
 	ExpiresAt int64
+	// UsedRecoveryCode is set by Login when a recovery code was spent.
+	UsedRecoveryCode bool
 }
 
 // Service holds auth state.
 type Service struct {
 	Store     *store.Store
+	Vault     *secrets.Vault // TOTP secrets
 	IdleMin   func() int
 	MaxHours  func() int
 	argonMem  uint32
@@ -358,7 +363,7 @@ func (s *Service) DeleteUser(ctx context.Context, id string) error {
 
 // ListUsers returns all users.
 func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := s.Store.DB.QueryContext(ctx, `SELECT id, username, role, disabled, last_login_at, created_at FROM users ORDER BY username`)
+	rows, err := s.Store.DB.QueryContext(ctx, `SELECT id, username, role, disabled, last_login_at, created_at, totp_enabled_at IS NOT NULL FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +372,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	for rows.Next() {
 		var u User
 		var last sql.NullInt64
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &last, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &last, &u.CreatedAt, &u.TOTPEnabled); err != nil {
 			return nil, err
 		}
 		if last.Valid {
@@ -382,8 +387,8 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 func (s *Service) GetUser(ctx context.Context, id string) (User, error) {
 	var u User
 	var last sql.NullInt64
-	err := s.Store.DB.QueryRowContext(ctx, `SELECT id, username, role, disabled, last_login_at, created_at FROM users WHERE id=?`, id).
-		Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &last, &u.CreatedAt)
+	err := s.Store.DB.QueryRowContext(ctx, `SELECT id, username, role, disabled, last_login_at, created_at, totp_enabled_at IS NOT NULL FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &last, &u.CreatedAt, &u.TOTPEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return u, store.ErrNotFound
 	}
@@ -400,12 +405,17 @@ func (s *Service) GetUser(ctx context.Context, id string) (User, error) {
 // revealed, so neither the answer nor its timing tells whether a username
 // exists. A locked account answers ErrLocked whatever the password, so
 // guessing cannot continue while it is locked.
-func (s *Service) Login(ctx context.Context, username, password, ip, ua string) (string, Session, error) {
+//
+// A user with the second factor on must also give otp: a current TOTP code
+// or an unused recovery code. Without it Login answers ErrMFARequired (the
+// password was right, so it is not a failure); a wrong one counts towards
+// the lockout like a wrong password.
+func (s *Service) Login(ctx context.Context, username, password, otp, ip, ua string) (string, Session, error) {
 	var id, hash string
-	var disabled bool
+	var disabled, totpOn, usedRecovery bool
 	var locked sql.NullInt64
-	err := s.Store.DB.QueryRowContext(ctx, `SELECT id, password_hash, disabled, locked_until FROM users WHERE username=?`, username).
-		Scan(&id, &hash, &disabled, &locked)
+	err := s.Store.DB.QueryRowContext(ctx, `SELECT id, password_hash, disabled, locked_until, totp_enabled_at IS NOT NULL FROM users WHERE username=?`, username).
+		Scan(&id, &hash, &disabled, &locked, &totpOn)
 	if errors.Is(err, sql.ErrNoRows) {
 		if _, err := s.verify(ctx, s.dummyHash(), password); err != nil {
 			return "", Session{}, err
@@ -436,6 +446,26 @@ func (s *Service) Login(ctx context.Context, username, password, ip, ua string) 
 	if disabled {
 		return "", Session{}, ErrDisabled
 	}
+	if totpOn {
+		if strings.TrimSpace(otp) == "" {
+			return "", Session{}, ErrMFARequired
+		}
+		ok, rec, err := s.CheckSecondFactor(ctx, id, otp)
+		if err != nil {
+			return "", Session{}, err
+		}
+		usedRecovery = rec
+		if !ok {
+			lockedNow, err := s.recordFailure(ctx, id, now)
+			if err != nil {
+				return "", Session{}, err
+			}
+			if lockedNow {
+				return "", Session{}, ErrLocked
+			}
+			return "", Session{}, ErrBadOTP
+		}
+	}
 	if _, err := s.Store.DB.ExecContext(ctx, `UPDATE users SET failed_logins=0, locked_until=NULL, last_login_at=? WHERE id=?`, now, id); err != nil {
 		return "", Session{}, err
 	}
@@ -447,6 +477,7 @@ func (s *Service) Login(ctx context.Context, username, password, ip, ua string) 
 		return "", Session{}, err
 	}
 	sess.User, err = s.GetUser(ctx, id)
+	sess.UsedRecoveryCode = usedRecovery
 	return tok, sess, err
 }
 

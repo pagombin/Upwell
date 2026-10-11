@@ -128,7 +128,7 @@ func (c *collector) currentLSN(ctx context.Context, conn pg.Conn) (string, error
 	return s, err
 }
 
-var stateCode = map[string]float64{DPending: 0, DPreparing: 1, DBaseCopy: 2, DCatchUp: 3, DInSync: 4, DDraining: 5, DDrained: 6, DVerified: 7, DStopped: 8, DFailed: 9, DDegraded: 10, DRestartRequired: 11}
+var stateCode = map[string]float64{DPending: 0, DPreparing: 1, DBaseCopy: 2, DCatchUp: 3, DInSync: 4, DDraining: 5, DDrained: 6, DVerified: 7, DStopped: 8, DFailed: 9, DDegraded: 10, DRestartRequired: 11, DCopied: 12}
 
 // sample collects per-database and cluster metrics for one migration.
 func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {

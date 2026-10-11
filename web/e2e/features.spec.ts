@@ -1,4 +1,4 @@
-import { expect, test } from "./helpers";
+import { expect, test, totp } from "./helpers";
 
 // The overnight items, each driven through the browser end to end. dev/e2e.sh
 // runs these after the walkthrough, against migrations it prepared.
@@ -32,4 +32,109 @@ test("write freeze: preview, apply at cutover, GO, undo", async ({ page }) => {
   await banner.getByRole("button", { name: "Undo write freeze" }).click();
   await page.getByRole("dialog", { name: "Undo the write freeze" }).getByRole("button", { name: "Undo write freeze" }).click();
   await expect(page.getByTestId("freeze-undone")).toContainText("Write freeze undone", { timeout: 30_000 });
+});
+
+// defineInWizard walks the wizard's first five steps for one database.
+async function defineInWizard(page: import("@playwright/test").Page, name: string, db: string, mode?: string) {
+  const PW = process.env.E2E_PASSWORD_DB || "spike-password-not-secret";
+  await page.goto("/migrations/new");
+  await page.getByLabel("Migration name").fill(name);
+  await page.getByLabel("Customer", { exact: true }).fill("Example Customer");
+  await page.getByLabel("Customer account ID").fill("acct-0001");
+  await page.getByLabel("Support ticket").fill("SUP-1234");
+  await page.getByLabel("Permission granted by").fill("Jamie Customer");
+  await page.getByRole("button", { name: "Save and continue" }).click();
+  for (const [title, port] of [["Source cluster", "55432"], ["Target cluster", "55433"]] as const) {
+    await expect(page.getByRole("heading", { name: title })).toBeVisible();
+    await page.getByLabel("Host").fill("127.0.0.1");
+    await page.getByLabel("Port").fill(port);
+    await page.getByLabel("User").fill("doadmin");
+    await page.getByLabel("Password").fill(PW);
+    await page.getByLabel("TLS mode").selectOption("disable");
+    await page.getByRole("button", { name: "Test connection" }).click();
+    await expect(page.getByRole("list", { name: "Connection test results" })).toBeVisible();
+    await page.getByRole("button", { name: "Save and continue" }).click();
+  }
+  const table = page.locator("table[aria-label='Databases to migrate']");
+  await expect(table).toBeVisible();
+  for (const box of await table.locator("input[type=checkbox]").all()) {
+    const label = (await box.getAttribute("aria-label")) || "";
+    if (await box.isDisabled()) continue;
+    const want = label === `Include ${db}`;
+    if ((await box.isChecked()) !== want) await box.click();
+  }
+  await page.getByRole("button", { name: "Save and continue" }).click();
+  await expect(page.getByLabel("Decoding plugin")).toBeVisible();
+  if (mode) await page.getByLabel("Mode").selectOption(mode);
+  await page.getByRole("button", { name: "Save and continue" }).click();
+  await page.getByRole("button", { name: "Run preflight" }).click();
+  const panel = page.getByRole("dialog", { name: "Preflight" });
+  await expect(panel.getByText("Done", { exact: true }).first()).toBeVisible({ timeout: 180_000 });
+  await panel.getByRole("button", { name: "Close" }).last().click();
+  await expect(page.locator(".tile").filter({ hasText: "Can start" })).toContainText("Yes");
+  await page.getByRole("button", { name: "Continue to plan review" }).click();
+  await expect(page.getByText("Engine command per database")).toBeVisible();
+}
+
+async function cleanUp(page: import("@playwright/test").Page, name: string) {
+  await page.getByRole("button", { name: "Clean up" }).click();
+  const confirm = page.getByRole("dialog", { name: "Clean up" });
+  await confirm.getByLabel(/Type .* to confirm/).fill(name);
+  await confirm.getByRole("button", { name: "Clean up" }).click();
+  const cleanup = page.getByRole("dialog", { name: "Clean up" });
+  await expect(cleanup.getByText("Done", { exact: true }).first()).toBeVisible({ timeout: 180_000 });
+  await cleanup.getByRole("button", { name: "Close" }).last().click();
+}
+
+test("offline migration from the wizard to GO", async ({ page }) => {
+  const name = `Offline ${new Date().toISOString().slice(11, 19)}`;
+  await defineInWizard(page, name, process.env.E2E_OFFLINE_DB || "e2e_offline", "offline");
+  // The engine command copies once.
+  await expect(page.locator("pre.cmd").first()).not.toContainText("--follow");
+  const review = page.getByLabel(/I reviewed the \d+ preflight warnings/);
+  if (await review.count()) await review.check();
+  const startBtn = page.getByRole("button", { name: "Start offline migration" });
+  await expect(startBtn).toBeDisabled();
+  await page.getByRole("checkbox", { name: "Every application writer to the source is stopped" }).check();
+  await startBtn.click();
+  const verdict = page.getByTestId("verdict");
+  await expect(verdict).toBeVisible({ timeout: 600_000 });
+  await expect(verdict.locator(".verdict")).toHaveText("GO");
+  await expect(page.getByText("Offline migration", { exact: true })).toBeVisible();
+  await cleanUp(page, name);
+});
+
+test("second factor: set up, sign in with a code and a recovery code", async ({ browser }) => {
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const pw = process.env.E2E_PASSWORD || "correct-horse-battery-staple";
+  const signIn = async (otp?: string) => {
+    await page.goto("/login");
+    await page.getByLabel("Username").fill("mfa-user");
+    await page.getByLabel("Password").fill(pw);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    if (otp) {
+      await page.getByLabel("Authentication code").fill(otp);
+      await page.getByRole("button", { name: "Sign in" }).click();
+    }
+    await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
+  };
+  await signIn();
+  await page.goto("/account");
+  await page.getByRole("button", { name: "Set up" }).click();
+  const secret = (await page.getByTestId("totp-secret").textContent()) || "";
+  await page.getByLabel("Code from the app").fill(await totp(secret));
+  await page.getByRole("button", { name: "Turn on" }).click();
+  const codes = ((await page.getByTestId("recovery-codes").locator("pre").textContent()) || "").split("\n");
+  expect(codes).toHaveLength(10);
+  await page.getByRole("button", { name: "I saved them" }).click();
+  await expect(page.locator(".pill", { hasText: /^On$/ })).toBeVisible();
+  // Sign out; sign in again with the next step's code, then with a recovery code.
+  await page.getByRole("button", { name: /mfa-user/ }).click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await signIn(await totp(secret, 1));
+  await page.getByRole("button", { name: /mfa-user/ }).click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await signIn(codes[0]);
+  await ctx.close();
 });

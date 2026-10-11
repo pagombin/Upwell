@@ -135,7 +135,23 @@ type Runner struct {
 	totalSourceBytes int64
 }
 
+// streamingOnly are the checks an offline migration does not need: it
+// creates no slot, publication, origin or heartbeat, decodes nothing and
+// applies no changes (D65). Offline, their problems are reported as info.
+var streamingOnly = map[string]bool{
+	"staging_space": true, "apply_rate": true, "cdc_throughput": true, "wal_level": true, "repl_slots": true, "wal_senders": true,
+	"repl_privilege": true, "prepared_xacts": true, "long_transactions": true, "slot_wal_cap": true, "repl_protocol": true,
+	"publication_privs": true, "replica_identity": true, "identity_full_types": true, "identity_full_duplicates": true,
+	"slot_exists": true, "origin_exists": true, "publication_exists": true, "target_apply_privileges": true, "heartbeat_possible": true,
+	"unlogged_tables": true, "large_objects": true,
+}
+
 func (r *Runner) emit(id, scope, db, level string, hard bool, msg, remediation string, ev map[string]any, start time.Time) {
+	if streamingOnly[id] && level != check.OK && r.Env.Settings.Str("mode") == "offline" {
+		level, hard = check.Info, false
+		msg = "Not needed for an offline migration (no replication slot, decoding, change apply or heartbeat). " + msg
+		remediation = ""
+	}
 	d := def(id)
 	if scope == "" {
 		scope = d.Scope

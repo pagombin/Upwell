@@ -37,6 +37,19 @@ type FreezeDB struct {
 	Undone        bool     `json:"undone"`
 }
 
+// dbPrior returns a frozen database's setting from before the freeze.
+func (f *FreezeState) dbPrior(name string) (string, bool) {
+	if !f.Active() {
+		return "", false
+	}
+	for _, d := range f.Databases {
+		if d.Name == name && !d.Undone {
+			return d.Prior, true
+		}
+	}
+	return "", false
+}
+
 // Active reports whether any database may still be frozen.
 func (f *FreezeState) Active() bool { return f != nil && f.State != "undone" }
 
@@ -201,7 +214,7 @@ func (o *Orchestrator) undoFreeze(ctx context.Context, migID, by, reason string)
 // cutover is not running and did not end GO (a failed undo, or one the
 // restart could not finish). Called from supervision.
 func (o *Orchestrator) freezeJanitor(ctx context.Context, m Migration) {
-	if !m.Flags.Freeze.Active() || m.Flags.Verdict == "GO" {
+	if !m.Flags.Freeze.Active() || m.Flags.Verdict == "GO" || m.Flags.Verifying {
 		return
 	}
 	if c := m.Flags.Cutover; c != nil && c.EndedAt == 0 {

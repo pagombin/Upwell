@@ -49,18 +49,25 @@ func (s *Server) register() {
 	r = s.add("POST", "/api/v1/auth/login", "", "Sign in", s.login)
 	pub(r)
 	noIdem(r)
-	noIdem(s.add("POST", "/api/v1/auth/logout", viewer, "Sign out", s.logout))
-	s.add("GET", "/api/v1/auth/me", viewer, "Current user and CSRF token", s.me)
+	lo := s.add("POST", "/api/v1/auth/logout", viewer, "Sign out", s.logout)
+	lo.mfaExempt = true
+	noIdem(lo)
+	s.add("GET", "/api/v1/auth/me", viewer, "Current user and CSRF token", s.me).mfaExempt = true
 	pub(s.add("GET", "/api/v1/auth/session", "", "Session status without an error when signed out", s.sessionStatus))
-	s.add("POST", "/api/v1/auth/totp", viewer, "TOTP (coming soon)", s.comingSoon("TOTP second factor"))
+	s.add("POST", "/api/v1/auth/totp/enroll", viewer, "Start setting up the second factor (TOTP)", s.totpEnroll).mfaExempt = true
+	s.add("POST", "/api/v1/auth/totp/confirm", viewer, "Turn the second factor on with a code", s.totpConfirm).mfaExempt = true
+	s.add("POST", "/api/v1/auth/totp/disable", viewer, "Turn the second factor off", s.totpDisable)
+	s.add("POST", "/api/v1/auth/totp/recovery-codes", viewer, "Replace your recovery codes", s.totpRecoveryCodes)
+	s.add("POST", "/api/v1/users/{id}/totp/reset", admin, "Turn off another user's second factor (lost device)", s.totpReset)
 	s.add("POST", "/api/v1/auth/password", viewer, "Change own password", s.changePassword)
 
 	s.add("GET", "/api/v1/users", admin, "List users", s.listUsers)
 	s.add("POST", "/api/v1/users", admin, "Create a user", s.createUser)
 	s.add("PATCH", "/api/v1/users/{id}", admin, "Change a user's role or disable them", s.updateUser)
 	s.add("DELETE", "/api/v1/users/{id}", admin, "Delete a user", s.deleteUser)
-	s.add("GET", "/api/v1/api-tokens", admin, "API tokens (coming soon)", s.emptyList)
-	s.add("POST", "/api/v1/api-tokens", admin, "API tokens (coming soon)", s.comingSoon("API tokens"))
+	s.add("GET", "/api/v1/api-tokens", admin, "API tokens", s.listTokens)
+	s.add("POST", "/api/v1/api-tokens", admin, "Create an API token (shown once)", s.createToken)
+	s.add("DELETE", "/api/v1/api-tokens/{id}", admin, "Revoke an API token", s.revokeToken)
 
 	s.add("GET", "/api/v1/settings", viewer, "Settings catalog with values", s.getSettings)
 	s.add("PATCH", "/api/v1/settings", admin, "Change global defaults", s.patchSettings)
@@ -123,7 +130,7 @@ func (s *Server) register() {
 	s.add("GET", "/api/v1/system", viewer, "System health and versions", s.system)
 	s.add("GET", "/api/v1/host/metrics", viewer, "Droplet metrics", s.hostMetrics)
 	s.add("POST", "/api/v1/system/restart", admin, "Restart the app (engines keep running)", s.restartApp)
-	s.add("GET", "/metrics", admin, "Prometheus (coming soon)", s.comingSoon("Prometheus metrics"))
+	s.add("GET", "/metrics", admin, "Prometheus metrics (an API token with the metrics or read scope, or an Admin session)", s.prometheus)
 	s.add("POST", "/api/v1/dev/fixtures", admin, "Create demonstration fixtures (dev only)", s.devFixtures)
 
 	s.add("GET", "/api/v1/stream/migrations/{id}", viewer, "Live migration stream (SSE)", s.streamMigration)
@@ -224,6 +231,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		OTP      string `json:"otp"`
 	}
 	if err := decode(r, &in); err != nil {
 		return err
@@ -232,7 +240,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 		return tooManyAttempts()
 	}
 	username := strings.TrimSpace(strings.ToLower(in.Username))
-	tok, sess, err := s.Auth.Login(r.Context(), username, in.Password, clientIP(r), r.UserAgent())
+	tok, sess, err := s.Auth.Login(r.Context(), username, in.Password, in.OTP, clientIP(r), r.UserAgent())
+	if errors.Is(err, auth.ErrMFARequired) {
+		// The password was right: ask for the second factor, count nothing.
+		return apiErr(401, "mfa_required", err.Error(), "Or enter one of your recovery codes.")
+	}
 	if err != nil {
 		// A mistyped username is sometimes a password typed in the wrong
 		// field: name only users that exist, others by a hash prefix.
@@ -242,15 +254,176 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 			a.UserID, a.Username, target = id, username, username
 		}
 		s.Audit.Append(r.Context(), a, "auth.login_failed", target, nil, map[string]any{"reason": err.Error()})
+		if errors.Is(err, auth.ErrBadOTP) {
+			return apiErr(401, "bad_otp", err.Error(), "Check your authenticator app's clock, or use a recovery code.")
+		}
 		if errors.Is(err, auth.ErrBadCredentials) || errors.Is(err, auth.ErrLocked) || errors.Is(err, auth.ErrDisabled) {
 			return apiErr(401, "bad_credentials", err.Error(), "")
 		}
 		return err
 	}
 	a := audit.Actor{UserID: sess.User.ID, Username: sess.User.Username, IP: clientIP(r)}
-	s.Audit.Append(r.Context(), a, "auth.login", sess.User.ID, nil, nil)
+	s.Audit.Append(r.Context(), a, "auth.login", sess.User.ID, nil, map[string]any{"second_factor": sess.User.TOTPEnabled, "recovery_code": sess.UsedRecoveryCode})
+	if sess.UsedRecoveryCode {
+		s.Audit.Append(r.Context(), a, "auth.recovery_code_used", sess.User.ID, nil, map[string]any{"left": s.Auth.RecoveryCodesLeft(r.Context(), sess.User.ID)})
+	}
 	http.SetCookie(w, &http.Cookie{Name: "upwell_session", Value: tok, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, Expires: time.UnixMilli(sess.ExpiresAt)})
 	return writeJSON(w, 200, map[string]any{"user": sess.User, "csrf_token": sess.CSRF, "expires_at": sess.ExpiresAt})
+}
+
+// mfaEnrollmentRequired: an Admin without the second factor while
+// mfa_required_for_admins is on may only set it up (or sign out).
+func (s *Server) mfaEnrollmentRequired(ctx context.Context, u auth.User) bool {
+	if u.Role != auth.RoleAdmin || u.TOTPEnabled {
+		return false
+	}
+	g, err := s.Settings.Global(ctx)
+	return err != nil || g.Bool("mfa_required_for_admins")
+}
+
+func (s *Server) totpEnroll(w http.ResponseWriter, r *http.Request) error {
+	e, err := s.Auth.TOTPEnroll(r.Context(), session(r).User.ID)
+	if errors.Is(err, auth.ErrTOTPEnabled) {
+		return apiErr(409, "totp_enabled", err.Error(), "")
+	}
+	if err != nil {
+		return err
+	}
+	s.Audit.Append(r.Context(), actor(r), "auth.totp_enroll_started", session(r).User.ID, nil, nil)
+	return writeJSON(w, 200, e)
+}
+
+type otpBody struct {
+	Code string `json:"code"`
+}
+
+func (s *Server) totpConfirm(w http.ResponseWriter, r *http.Request) error {
+	var in otpBody
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	codes, err := s.Auth.TOTPConfirm(r.Context(), session(r).User.ID, in.Code)
+	switch {
+	case errors.Is(err, auth.ErrBadOTP):
+		return apiErr(422, "bad_otp", err.Error(), "Enter the current code from the app you added the secret to; check the phone's clock.")
+	case errors.Is(err, auth.ErrNoPending), errors.Is(err, auth.ErrTOTPEnabled):
+		return apiErr(409, "totp_state", err.Error(), "")
+	case err != nil:
+		return err
+	}
+	s.Audit.Append(r.Context(), actor(r), "auth.totp_enabled", session(r).User.ID, nil, map[string]any{"recovery_codes": len(codes)})
+	return writeJSON(w, 200, map[string]any{"recovery_codes": codes})
+}
+
+// checkOwnOTP checks the caller's current code or a recovery code.
+func (s *Server) checkOwnOTP(r *http.Request, code string) error {
+	ok, rec, err := s.Auth.CheckSecondFactor(r.Context(), session(r).User.ID, code)
+	if errors.Is(err, auth.ErrTOTPNotSet) {
+		return apiErr(409, "totp_state", err.Error(), "")
+	}
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return apiErr(422, "bad_otp", auth.ErrBadOTP.Error(), "")
+	}
+	if rec {
+		s.Audit.Append(r.Context(), actor(r), "auth.recovery_code_used", session(r).User.ID, nil, nil)
+	}
+	return nil
+}
+
+func (s *Server) totpDisable(w http.ResponseWriter, r *http.Request) error {
+	var in otpBody
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	u := session(r).User
+	if u.Role == auth.RoleAdmin {
+		if g, err := s.Settings.Global(r.Context()); err != nil || g.Bool("mfa_required_for_admins") {
+			return apiErr(409, "mfa_required", "Admins must keep the second factor while mfa_required_for_admins is on.", "Replace your recovery codes instead, or ask another Admin to reset it if you lost the device.")
+		}
+	}
+	if err := s.checkOwnOTP(r, in.Code); err != nil {
+		return err
+	}
+	if err := s.Auth.TOTPDisable(r.Context(), u.ID); err != nil {
+		return err
+	}
+	s.Audit.Append(r.Context(), actor(r), "auth.totp_disabled", u.ID, nil, nil)
+	return writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) totpRecoveryCodes(w http.ResponseWriter, r *http.Request) error {
+	var in otpBody
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	if err := s.checkOwnOTP(r, in.Code); err != nil {
+		return err
+	}
+	codes, err := s.Auth.RegenerateRecoveryCodes(r.Context(), session(r).User.ID)
+	if err != nil {
+		return err
+	}
+	s.Audit.Append(r.Context(), actor(r), "auth.recovery_codes_replaced", session(r).User.ID, nil, nil)
+	return writeJSON(w, 200, map[string]any{"recovery_codes": codes})
+}
+
+func (s *Server) totpReset(w http.ResponseWriter, r *http.Request) error {
+	id := r.PathValue("id")
+	if id == session(r).User.ID {
+		return apiErr(409, "self", "Use your own second-factor settings, or ask another Admin.", "")
+	}
+	u, err := s.Auth.GetUser(r.Context(), id)
+	if err != nil {
+		return err
+	}
+	if err := s.Auth.TOTPDisable(r.Context(), id); err != nil {
+		return err
+	}
+	s.Audit.Append(r.Context(), actor(r), "auth.totp_reset", id, nil, map[string]any{"username": u.Username})
+	return writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) error {
+	ts, err := s.Auth.ListAPITokens(r.Context())
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, ts)
+}
+
+func (s *Server) createToken(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		Name  string `json:"name"`
+		Scope string `json:"scope"`
+		Days  int    `json:"expires_days"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	if in.Days == 0 {
+		in.Days = 90
+	}
+	if in.Scope == "" {
+		in.Scope = auth.ScopeRead
+	}
+	raw, t, err := s.Auth.CreateAPIToken(r.Context(), in.Name, in.Scope, session(r).User.Username, time.Duration(in.Days)*24*time.Hour)
+	if err != nil {
+		return apiErr(422, "invalid", err.Error(), "")
+	}
+	s.Audit.Append(r.Context(), actor(r), "api_token.create", t.ID, nil, map[string]any{"name": t.Name, "scope": t.Scope, "prefix": t.Prefix, "expires_at": t.ExpiresAt})
+	return writeJSON(w, 201, map[string]any{"token": raw, "record": t})
+}
+
+func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) error {
+	t, err := s.Auth.RevokeAPIToken(r.Context(), r.PathValue("id"), session(r).User.Username)
+	if err != nil {
+		return err
+	}
+	s.Audit.Append(r.Context(), actor(r), "api_token.revoke", t.ID, nil, map[string]any{"name": t.Name, "prefix": t.Prefix})
+	return writeJSON(w, 200, t)
 }
 
 // failedLoginTarget names an unknown username in the audit log without
@@ -278,7 +451,8 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) error {
 	s.Store.DB.QueryRowContext(r.Context(), `SELECT value FROM settings WHERE key='_time_zone'`).Scan(&tz)
 	tz, _ = strconv.Unquote(tz)
 	g, _ := s.Settings.Global(r.Context())
-	return writeJSON(w, 200, map[string]any{"user": sess.User, "csrf_token": sess.CSRF, "expires_at": sess.ExpiresAt, "idle_minutes": g.Int("session_idle_minutes"), "time_zone": tz, "version": s.Version})
+	return writeJSON(w, 200, map[string]any{"user": sess.User, "csrf_token": sess.CSRF, "expires_at": sess.ExpiresAt, "idle_minutes": g.Int("session_idle_minutes"), "time_zone": tz, "version": s.Version,
+		"mfa_enrollment_required": s.mfaEnrollmentRequired(r.Context(), sess.User), "recovery_codes_left": s.Auth.RecoveryCodesLeft(r.Context(), sess.User.ID)})
 }
 
 // sessionStatus lets the UI find out whether it is signed in without a 401.
@@ -711,6 +885,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &in); err != nil {
 		return err
 	}
+	in.Role = session(r).User.Role
 	m, err := s.Orch.Start(r.Context(), actor(r), r.PathValue("id"), in)
 	if err != nil {
 		return err

@@ -143,6 +143,7 @@ function UserMenu({ name, role, onLogout, onPassword }: { name: string; role: st
       {open && (
         <div className="card" role="menu" style={{ position: "absolute", right: 0, top: 40, zIndex: 30, padding: 8, minWidth: 200, boxShadow: "var(--shadow)" }}>
           <div className="stack" style={{ gap: 4 }}>
+            <Link role="menuitem" className="btn ghost" style={{ justifyContent: "flex-start" }} to="/account" onClick={() => setOpen(false)}>Account and second factor</Link>
             <button role="menuitem" className="ghost" style={{ justifyContent: "flex-start" }} onClick={() => { setOpen(false); onPassword(); }}>Change password</button>
             <button role="menuitem" className="ghost" style={{ justifyContent: "flex-start" }} onClick={onLogout}>Sign out</button>
           </div>

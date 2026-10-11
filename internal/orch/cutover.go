@@ -195,6 +195,9 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	if m.Fixture {
 		return nil, uerr("fixture", "This is a demonstration fixture.", "")
 	}
+	if o.IsOffline(ctx, m) && m.Flags.Started {
+		return nil, uerr("offline", "An offline migration has no separate cutover: it verifies as soon as the copy finishes.", "Use Verify again after restarting a database.")
+	}
 	continuing := m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0
 	if continuing {
 		if prev, err := o.GetOperation(ctx, m.Flags.Cutover.OpID); err == nil && prev.State == "running" {
@@ -690,15 +693,22 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	v := o.Settings(ctx, m)
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	inc := included(dbs)
-	hbOn := v.Bool("heartbeat")
-	// Only a database whose engine reached the end position can be GO.
+	offline := v.Str("mode") == "offline"
+	hbOn := v.Bool("heartbeat") && !offline
+	// Only a database whose engine reached the end position (offline: whose
+	// copy finished) can be GO.
 	undrained := o.stopUndrained(ctx, m, inc)
 
-	// 6. Origin progress (D3).
-	o.setPhase(ctx, m.ID, "origin")
-	op.StepStart("origin", "")
+	// 6. Origin progress (D3). Offline there is no origin: nothing streamed.
 	originFail := map[string]string{}
+	if !offline {
+		o.setPhase(ctx, m.ID, "origin")
+		op.StepStart("origin", "")
+	}
 	for _, d := range inc {
+		if offline {
+			break
+		}
 		if d.HBBeforeLSN == "" {
 			if hbOn {
 				originFail[d.SourceName] = "no final heartbeat position recorded"
@@ -718,13 +728,15 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			op.LogDB("info", d.SourceName, "target origin %s is past the final heartbeat at %s", origin, d.HBBeforeLSN)
 		}
 	}
-	if len(originFail) > 0 {
+	switch {
+	case offline:
+	case len(originFail) > 0:
 		var parts []string
 		for k, x := range originFail {
 			parts = append(parts, k+": "+x)
 		}
 		op.StepEnd("origin", "failed", "NO-GO for "+strings.Join(parts, "; "))
-	} else {
+	default:
 		op.StepEnd("origin", "done", "every database's target origin reached its final heartbeat")
 	}
 
@@ -760,7 +772,7 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		}
 		cur, _ := o.GetDatabase(ctx, m.ID, d.ID)
 		res, err := pgpack.Verify(ctx, pgpack.VerifyInput{Source: src.WithDB(d.SourceName), Target: dst.WithDB(d.TargetName), TargetMaint: dst, Origin: d.OriginName,
-			HeartbeatRequired: hbOn, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
+			HeartbeatRequired: hbOn, Offline: offline, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
 			ExactCountMaxBytes: int64(v.Int("exact_count_max_mb")) << 20, ChecksumBudget: time.Duration(v.Int("verify_checksum_budget_seconds")) * time.Second, Database: d.SourceName})
 		if err != nil {
 			res.GO = false
@@ -782,8 +794,11 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		}
 		if undrained[d.SourceName] {
 			res.GO = false
-			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName,
-				Message: "The engine did not reach this database's end position during the cutover, so changes before it may be missing on the target."})
+			msg := "The engine did not reach this database's end position during the cutover, so changes before it may be missing on the target."
+			if offline {
+				msg = "The offline copy of this database did not finish."
+			}
+			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName, Message: msg})
 		}
 		table := "verifications"
 		if o.testHooks.FailVerificationStore {
@@ -952,12 +967,22 @@ func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key stri
 		return nil, uerr("busy", "A cutover or verification is already running.", "Wait for its verdict.")
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
+	offline := o.IsOffline(ctx, m)
 	for _, d := range included(dbs) {
+		if offline {
+			if !d.Drained || (d.State != DCopied && d.State != DVerified && d.State != DFailed) {
+				return nil, uerr("not_copied", "Verification runs after every database's offline copy finished.", "")
+			}
+			continue
+		}
 		if d.EndPos == "" || (d.State != DDrained && d.State != DVerified && d.State != DFailed) {
 			return nil, uerr("not_drained", "Verification runs after the cutover drained every database.", "")
 		}
 	}
 	steps := []Step{{Key: "origin", Title: "Check target origin reached the final heartbeat"}, {Key: "sequences", Title: "Sync sequences"}, {Key: "verify", Title: "Verify data"}, {Key: "verdict", Title: "Verdict"}}
+	if offline {
+		steps = steps[1:]
+	}
 	op, err := o.newOp(ctx, m.ID, "verify", key, a.Username, steps, nil)
 	if err != nil {
 		return op, err

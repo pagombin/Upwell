@@ -78,6 +78,9 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 		return engine.RunPlan{}, fmt.Errorf("database name %q or %q is not allowed", d.Source, d.Target)
 	}
 	work := filepath.Join(d.RunDir, "clone")
+	if d.Offline && resume {
+		return engine.RunPlan{}, fmt.Errorf("an offline copy cannot be resumed; restart it from zero")
+	}
 	args := []string{"clone", "--follow",
 		"--source", d.SourceConn.WithDB(d.Source).URI(),
 		"--target", d.TargetConn.WithDB(d.Target).URI(),
@@ -88,6 +91,20 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 		"--index-jobs", strconv.Itoa(max(d.IndexJobs, 1)),
 		"--skip-extensions", "--no-owner",
 	}
+	if d.Offline {
+		// A one-time copy with writes stopped: no --follow, so no slot, no
+		// origin and no decoding plugin (offline mode, D65).
+		args = append([]string{"clone"}, args[2:]...)
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--slot-name" || args[i] == "--origin" {
+				args = append(args[:i], args[i+2:]...)
+				i--
+			}
+		}
+	}
+	if d.SkipDBProperties {
+		args = append(args, "--skip-db-properties")
+	}
 	if d.SplitLarger != "" && d.SplitLarger != "off" && d.SplitLarger != "auto" {
 		args = append(args, "--split-tables-larger-than", d.SplitLarger)
 	}
@@ -97,7 +114,7 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	if resume {
 		// pgcopydb reads the plugin from its own catalog on resume: never pass --plugin.
 		args = append(args, "--resume", "--not-consistent")
-	} else if d.Plugin != "" {
+	} else if d.Plugin != "" && !d.Offline {
 		args = append(args, "--plugin", d.Plugin)
 	}
 	if !resume && d.DropIfExists {

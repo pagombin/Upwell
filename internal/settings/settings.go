@@ -47,7 +47,7 @@ func boolean(key string, dflt bool, scope, group, desc string) Def {
 
 // Catalog is every setting, in display order.
 var Catalog = []Def{
-	enum("mode", "online", []string{"online", "offline"}, "migration", "Migration defaults", "Online copies and then streams changes until cutover; offline is a one-time copy with writes stopped (coming soon)."),
+	enum("mode", "online", []string{"online", "offline"}, "migration", "Migration defaults", "Online copies and then streams changes until cutover; offline is a one-time copy with writes stopped first (confirmed, or the write freeze), then verified."),
 	def("table_jobs", "int", 0, 0, 64, "migration", "Migration defaults", "workers", "Parallel COPY workers per database. 0 means automatic: CPU count (4 to 16) divided by the number of databases, at least 2."),
 	def("index_jobs", "int", 0, 0, 32, "migration", "Migration defaults", "workers", "Parallel CREATE INDEX workers per database. 0 means automatic: half the CPU count (2 to 8) divided by databases, at least 1."),
 	{Key: "split_tables_larger_than", Type: "string", Default: "auto", Scope: "migration", Group: "Migration defaults", Description: "Same-table parallel copy: auto (largest table divided by table jobs when that is 10 GB or more), off, or a size such as 50GB."},
@@ -89,6 +89,7 @@ var Catalog = []Def{
 	enum("log_level", "info", []string{"trace", "debug", "info", "warn", "error"}, "global", "Logging", "App log verbosity. Engine logs are always kept in full."),
 	def("log_retention_days", "int", 30, 1, 365, "global", "Logging", "days", "Log retention."),
 	def("session_idle_minutes", "int", 30, 5, 240, "global", "Access", "min", "Sign-in sessions end after this much inactivity."),
+	boolean("mfa_required_for_admins", true, "global", "Access", "Admins must turn on the second factor (TOTP) before they can do anything else."),
 	def("session_max_hours", "int", 12, 1, 72, "global", "Access", "h", "Sign-in sessions end after this long regardless of activity."),
 }
 
@@ -105,7 +106,7 @@ func Lookup(key string) (Def, bool) {
 // Validate coerces and checks a value for key.
 // OfflineAvailable is set when offline migrations are implemented; until
 // then mode=offline is refused rather than accepted and ignored (D51).
-var OfflineAvailable = false
+var OfflineAvailable = true
 
 func Validate(key string, v any) (any, error) {
 	d, ok := Lookup(key)

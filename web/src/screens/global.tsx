@@ -264,8 +264,8 @@ export function SettingsScreen() {
           ))}
         </nav>
         <div className="stack" style={{ minWidth: 0 }}>
-          {sec === "Users and roles" ? <UsersSection /> : sec === "TLS" ? <TLSSection /> : sec === "System" ? <Card title="System"><p>Versions, services, watchdog and restart are on the <Link to="/system">System</Link> screen.</p></Card>
-            : ["Notifications", "DigitalOcean API", "API tokens", "Metrics export"].includes(sec) ? <Card title={sec} actions={<ComingSoon what={sec} />}><p className="muted">{sec} is not part of this build.</p></Card>
+          {sec === "Users and roles" ? <UsersSection /> : sec === "TLS" ? <TLSSection /> : sec === "API tokens" ? <TokensSection /> : sec === "Metrics export" ? <MetricsSection /> : sec === "System" ? <Card title="System"><p>Versions, services, watchdog and restart are on the <Link to="/system">System</Link> screen.</p></Card>
+            : ["Notifications", "DigitalOcean API"].includes(sec) ? <Card title={sec} actions={<ComingSoon what={sec} />}><p className="muted">{sec} is not part of this build.</p></Card>
             : cat.error ? <ErrorState error={cat.error} retry={cat.refresh} /> : !cat.data ? <Skeleton lines={8} /> : <CatalogSection key={sec} items={cat.data.filter((i) => i.group === sec)} title={sec} refresh={cat.refresh} />}
         </div>
       </div>
@@ -307,26 +307,29 @@ function UsersSection() {
   const [create, setCreate] = useState(false);
   const [del, setDel] = useState<User | null>(null);
   const [reset, setReset] = useState<User | null>(null);
+  const [resetMfa, setResetMfa] = useState<User | null>(null);
   const { run } = useAction();
   if (!can("admin")) return <Card title="Users and roles"><p className="muted">Only Admins manage users.</p></Card>;
   const update = (u: User, p: Partial<User>) => run("u", () => api.patch(`/api/v1/users/${u.id}`, { role: p.role ?? u.role, disabled: p.disabled ?? u.disabled }), "User updated").then(users.refresh);
   return (
     <Card title="Users and roles" actions={<button className="primary" onClick={() => setCreate(true)}>Add user</button>}>
       <div className="stack">
-        <p className="small muted">Viewers see everything. Operators also run migrations, preflight, cutover and cleanup. Admins also manage users and settings. SSO and TOTP are coming soon.</p>
+        <p className="small muted">Viewers see everything. Operators also run migrations, preflight, cutover and cleanup. Admins also manage users and settings, and must use a second factor while mfa_required_for_admins is on. SSO is not part of this build.</p>
         {users.error ? <ErrorState error={users.error} retry={users.refresh} /> : !users.data ? <Skeleton lines={4} /> : (
           <div className="tablewrap">
             <table className="data" aria-label="Users">
-              <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last sign-in</th><th><span className="sr-only">Actions</span></th></tr></thead>
+              <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Second factor</th><th>Last sign-in</th><th><span className="sr-only">Actions</span></th></tr></thead>
               <tbody>{users.data.map((u) => (
                 <tr key={u.id}>
                   <td style={{ maxWidth: 240 }}><Trunc>{u.username}</Trunc></td>
                   <td><select aria-label={`Role of ${u.username}`} value={u.role} disabled={u.id === me?.user.id} onChange={(e) => update(u, { role: e.target.value as User["role"] })}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option></select></td>
                   <td>{u.disabled ? <Pill kind="warn" text="Disabled" /> : <Pill kind="ok" text="Active" />}</td>
+                  <td>{u.totp_enabled ? <Pill kind="ok" text="On" /> : <span className="muted">Off</span>}</td>
                   <td>{u.last_login_at ? time(u.last_login_at) : "Never"}</td>
                   <td>{u.id !== me?.user.id && <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
                     <button className="ghost" onClick={() => update(u, { disabled: !u.disabled })}>{u.disabled ? "Enable" : "Disable"}</button>
                     <button className="ghost" onClick={() => setReset(u)}>Reset password</button>
+                    {u.totp_enabled && <button className="ghost" onClick={() => setResetMfa(u)}>Reset second factor</button>}
                     <button className="ghost" onClick={() => setDel(u)}>Delete</button>
                   </div>}</td>
                 </tr>
@@ -337,6 +340,7 @@ function UsersSection() {
       </div>
       {create && <CreateUser onClose={() => setCreate(false)} onDone={users.refresh} />}
       {reset && <ResetPassword u={reset} onClose={() => setReset(null)} />}
+      {resetMfa && <ConfirmDialog title={`Reset ${resetMfa.username}'s second factor`} danger confirmLabel="Reset second factor" onClose={() => setResetMfa(null)} onConfirm={async () => { await api.post(`/api/v1/users/${resetMfa.id}/totp/reset`); users.refresh(); }}><p>For a lost device: their authenticator app and recovery codes stop working, and they sign in with their password (an Admin must then set up a new second factor). Recorded in the audit log.</p></ConfirmDialog>}
       {del && <ConfirmDialog title={`Delete ${del.username}`} danger typeToConfirm={del.username} confirmLabel="Delete user" onClose={() => setDel(null)} onConfirm={async () => { await api.del(`/api/v1/users/${del.id}`); users.refresh(); }}><p>The user can no longer sign in. Their audit entries stay.</p></ConfirmDialog>}
     </Card>
   );
@@ -380,4 +384,89 @@ function TLSSection() {
 
 export function NotFound() {
   return <Page title="Not found"><Empty title="This page does not exist" action={<Link className="btn" to="/">Go home</Link>}>Check the address, or use Ctrl K to jump to a screen or migration.</Empty></Page>;
+}
+
+interface APIToken { id: string; name: string; prefix: string; scope: string; created_by: string; created_at: number; expires_at: number; last_used_at?: number; revoked_at?: number; revoked_by?: string }
+
+// API tokens (overnight item 4): read-only bearer tokens, shown once.
+function TokensSection() {
+  const { can } = useSession();
+  const list = useApi<APIToken[]>(can("admin") ? "/api/v1/api-tokens" : null);
+  const [create, setCreate] = useState(false);
+  const [shown, setShown] = useState<string | null>(null);
+  const [revoke, setRevoke] = useState<APIToken | null>(null);
+  if (!can("admin")) return <Card title="API tokens"><p className="muted">Only Admins manage API tokens.</p></Card>;
+  const now = Date.now();
+  return (
+    <Card title="API tokens" actions={<button className="primary" onClick={() => setCreate(true)}>Create token</button>}>
+      <div className="stack">
+        <p className="small muted">Tokens let scripts read Upwell with <span className="mono">Authorization: Bearer &lt;token&gt;</span>. They are read-only: <strong>read</strong> sees what a Viewer sees; <strong>metrics</strong> reads only <span className="mono">/metrics</span>. Upwell stores only a hash, so a token is shown once. Revoking one stops it on its next request.</p>
+        {shown && (
+          <div className="callout warn" role="status" data-testid="new-token"><div className="body">
+            <strong>Copy the token now; it is not shown again</strong>
+            <code className="mono wrapany">{shown}</code>
+            <div className="row"><button onClick={() => { navigator.clipboard?.writeText(shown).catch(() => {}); }}>Copy</button><button className="ghost" onClick={() => setShown(null)}>Done</button></div>
+          </div></div>
+        )}
+        {list.error ? <ErrorState error={list.error} retry={list.refresh} /> : !list.data ? <Skeleton lines={3} /> : list.data.length === 0 ? <Empty title="No API tokens">Create one for a script or for Prometheus.</Empty> : (
+          <div className="tablewrap">
+            <table className="data" aria-label="API tokens">
+              <thead><tr><th>Name</th><th>Token</th><th>Scope</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead>
+              <tbody>{list.data.map((t) => (
+                <tr key={t.id}>
+                  <td style={{ maxWidth: 220 }}><Trunc>{t.name}</Trunc></td>
+                  <td className="mono">{t.prefix}…</td>
+                  <td>{t.scope}</td>
+                  <td>{time(t.created_at)} <span className="small muted">by {t.created_by}</span></td>
+                  <td>{time(t.expires_at)}</td>
+                  <td>{t.last_used_at ? time(t.last_used_at) : "Never"}</td>
+                  <td>{t.revoked_at ? <Pill kind="crit" text="Revoked" /> : t.expires_at < now ? <Pill kind="warn" text="Expired" /> : <Pill kind="ok" text="Active" />}</td>
+                  <td>{!t.revoked_at && <button className="ghost" onClick={() => setRevoke(t)}>Revoke</button>}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      {create && <CreateToken onClose={() => setCreate(false)} onDone={(tok) => { setShown(tok); list.refresh(); }} />}
+      {revoke && <ConfirmDialog title={`Revoke ${revoke.name}`} danger confirmLabel="Revoke token" onClose={() => setRevoke(null)} onConfirm={async () => { await api.del(`/api/v1/api-tokens/${revoke.id}`); list.refresh(); }}><p>Anything using this token stops working on its next request. Recorded in the audit log.</p></ConfirmDialog>}
+    </Card>
+  );
+}
+
+function CreateToken({ onClose, onDone }: { onClose: () => void; onDone: (token: string) => void }) {
+  const [f, setF] = useState({ name: "", scope: "read", expires_days: 90 });
+  const [err, setErr] = useState<Error>();
+  const save = async () => {
+    try { const r = await api.post<{ token: string }>("/api/v1/api-tokens", f); onDone(r.token); onClose(); } catch (e) { setErr(e as Error); }
+  };
+  return (
+    <Dialog title="Create an API token" onClose={onClose} footer={<><button onClick={onClose}>Cancel</button><button className="primary" disabled={!f.name.trim()} onClick={save}>Create token</button></>}>
+      <Field label="Name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="What uses it, e.g. prometheus" /></Field>
+      <Field label="Scope"><select value={f.scope} onChange={(e) => setF({ ...f, scope: e.target.value })}><option value="read">read: everything a Viewer can read</option><option value="metrics">metrics: only /metrics</option></select></Field>
+      <Field label="Expires after (days)"><input type="number" min={1} max={366} value={f.expires_days} onChange={(e) => setF({ ...f, expires_days: Number(e.target.value) })} /></Field>
+      {err && <ErrorState error={err} />}
+    </Dialog>
+  );
+}
+
+// Metrics export (overnight item 5): the Prometheus endpoint.
+function MetricsSection() {
+  const origin = window.location.origin;
+  const example = `scrape_configs:
+  - job_name: upwell
+    scheme: https
+    tls_config: { insecure_skip_verify: true }   # or ca_file: the droplet's certificate
+    authorization: { credentials: "<token with the metrics scope>" }
+    static_configs: [{ targets: ["${window.location.host}"] }]
+    metrics_path: /metrics`;
+  return (
+    <Card title="Metrics export">
+      <div className="stack">
+        <p>Upwell serves Prometheus metrics at <span className="mono">{origin}/metrics</span>: migration state, verdict and write freeze; per database its state, backlog, heartbeat lag, apply watchdog, slot retention and sizes; per cluster connections, WAL rate and the oldest transaction; the droplet's disk, CPU and memory; and firing alerts. Series are labelled <span className="mono">migration</span>, <span className="mono">database</span> and <span className="mono">scope</span>. No passwords, connection strings or hostnames are exported.</p>
+        <p>Scrape it with an API token that has the <strong>metrics</strong> scope (create one in API tokens). Nothing is sent anywhere: Prometheus pulls.</p>
+        <pre className="cmd">{example}</pre>
+      </div>
+    </Card>
+  );
 }

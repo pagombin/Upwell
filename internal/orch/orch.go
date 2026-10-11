@@ -445,8 +445,11 @@ func DeriveState(m Migration, dbs []Database, preflightOK, permissionOK bool) st
 		return MCompleted
 	}
 	if f.Cutover != nil && f.Cutover.EndedAt == 0 {
-		if f.Cutover.Phase == "verify" {
+		switch f.Cutover.Phase {
+		case "verify":
 			return MVerifying
+		case "copy":
+			return MRunning // offline: the one-time copy (D65)
 		}
 		return MCutover
 	}
@@ -533,7 +536,7 @@ func Label(s string) string {
 		MDraft: "Draft", MReady: "Ready", MQueued: "Queued", MRunning: "Running", MStreaming: "Streaming", MCutover: "Cutover",
 		MVerifying: "Verifying", MCompleted: "Completed", MNeedsAttention: "Needs attention", MPaused: "Paused", MAborted: "Aborted", MCleanedUp: "Cleaned up",
 		DPending: "Pending", DPreparing: "Preparing", DBaseCopy: "Base copy", DCatchUp: "Catch-up", DInSync: "In sync", DDraining: "Draining",
-		DDrained: "Drained", DVerified: "Verified", DFailed: "Failed", DDegraded: "Degraded", DStopped: "Stopped", DRestartRequired: "Restart required",
+		DDrained: "Drained", DVerified: "Verified", DFailed: "Failed", DDegraded: "Degraded", DStopped: "Stopped", DRestartRequired: "Restart required", DCopied: "Copied",
 	}[s]
 }
 

@@ -52,12 +52,14 @@ export function CutoverTab() {
   const pauseStart = c?.writes_stopped_at || c?.started_at;
   const pauseMs = pauseStart ? (c?.ended_at || now) - pauseStart : 0;
   const retryable = m.flags.verdict === "NO-GO" && !endposSet;
-  const canStart = can("operator") && !m.fixture && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
+  const offline = v.settings_effective?.mode === "offline";
+  const canStart = !offline && can("operator") && !m.fixture && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
   return (
     <div className="stack" style={{ gap: 24 }}>
       <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
       {m.flags.freeze && <FreezeBanner mig={id} f={m.flags.freeze} canUndo={can("operator") && !m.fixture} onDone={view.refresh} />}
-      <div className="grid cols-2">
+      {offline && <div className="callout info"><div className="body"><strong>Offline migration</strong><span>Writes stopped before the copy (confirmed, or the write freeze); Upwell copies each database once, then syncs sequences and verifies, and the verdict below decides. There is no separate cutover.{!m.flags.started && !c ? " Start it from the plan review." : ""}</span></div></div>}
+      <div className="grid cols-2" style={offline ? { display: "none" } : undefined}>
         <Card title="Readiness" actions={ready.data ? <Pill kind={ready.data.ready ? "ok" : "warn"} text={ready.data.ready ? "Ready" : "Not ready"} /> : undefined}>
           {ready.error ? <ErrorState error={ready.error} retry={ready.refresh} /> : !ready.data ? <Skeleton lines={5} /> : (
             <ul className="opsteps" aria-label="Readiness conditions">
@@ -178,6 +180,15 @@ function FreezeBanner({ mig, f, canUndo, onDone }: { mig: string; f: FreezeState
 }
 
 function FreezeCutoverDialog({ mig, onClose, onStarted }: { mig: string; onClose: () => void; onStarted: (op: string) => void }) {
+  return <FreezeDialog mig={mig} title="Start the cutover with a write freeze" onClose={onClose} onConfirm={async (typed) => {
+    const r = await api.post<{ operation_id: string }>(`/api/v1/migrations/${mig}/cutover`, { write_freeze: true, freeze_confirm: typed });
+    onStarted(r.operation_id);
+  }} />;
+}
+
+// FreezeDialog previews the write freeze and asks for the source cluster's
+// name; onConfirm starts whatever applies it (a cutover, an offline start).
+export function FreezeDialog({ mig, title, onClose, onConfirm }: { mig: string; title: string; onClose: () => void; onConfirm: (typed: string) => Promise<void> }) {
   const pv = useApi<FreezePreview>(`/api/v1/migrations/${mig}/cutover/freeze`);
   const [typed, setTyped] = useState("");
   const [err, setErr] = useState<Error>();
@@ -185,13 +196,10 @@ function FreezeCutoverDialog({ mig, onClose, onStarted }: { mig: string; onClose
   const p = pv.data;
   const go = async () => {
     setBusy(true); setErr(undefined);
-    try {
-      const r = await api.post<{ operation_id: string }>(`/api/v1/migrations/${mig}/cutover`, { write_freeze: true, freeze_confirm: typed });
-      onStarted(r.operation_id); onClose();
-    } catch (e) { setErr(e as Error); } finally { setBusy(false); }
+    try { await onConfirm(typed); onClose(); } catch (e) { setErr(e as Error); } finally { setBusy(false); }
   };
   return (
-    <Dialog title="Start the cutover with a write freeze" wide onClose={onClose} footer={<><button onClick={onClose}>Cancel</button><button className="cutover" disabled={!p?.available || typed !== p?.confirm || busy} onClick={go}>{busy && <span className="spin" />}Apply the freeze and start</button></>}>
+    <Dialog title={title} wide onClose={onClose} footer={<><button onClick={onClose}>Cancel</button><button className="cutover" disabled={!p?.available || typed !== p?.confirm || busy} onClick={go}>{busy && <span className="spin" />}Apply the freeze and start</button></>}>
       {pv.error ? <ErrorState error={pv.error} retry={pv.refresh} /> : !p ? <Skeleton lines={6} /> : <>
         <p>Exactly what Upwell will run on the source, per database, before sampling for writes. Nothing has changed yet.</p>
         {p.databases.map((d) => (

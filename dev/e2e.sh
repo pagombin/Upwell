@@ -68,6 +68,12 @@ api() { # METHOD PATH [JSON]
     -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" ${d:+-d "$d"} "$BASE$p"
 }
 json() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
+totp() { # SECRET [STEP_OFFSET] -> the current RFC 6238 code
+  python3 -c 'import base64,hashlib,hmac,struct,sys,time
+k=base64.b32decode(sys.argv[1]+"="*(-len(sys.argv[1])%8)); s=int(time.time())//30+int(sys.argv[2])
+h=hmac.new(k,struct.pack(">Q",s),hashlib.sha1).digest(); o=h[-1]&15
+print("%06d"%((struct.unpack(">I",h[o:o+4])[0]&0x7fffffff)%1000000))' "$1" "${2:-0}"
+}
 
 # --reuse: keep a server from an earlier E2E_KEEP=1 run and only rerun Playwright.
 if [[ $REUSE -eq 1 && -f $DATA/e2e.env ]] && curl -sk $BASE/readyz | grep -q '"ok":true'; then
@@ -129,6 +135,15 @@ log "First Admin"
 TOKEN=$(cat $DATA/setup-token)
 curl -sk -H 'Content-Type: application/json' -H "Idempotency-Key: setup-1" -d "{\"setup_token\":\"$TOKEN\",\"username\":\"admin\",\"password\":\"$PW\",\"time_zone\":\"UTC\"}" $BASE/api/v1/setup >/dev/null
 CSRF=$(curl -sk -c "$JAR" -H 'Content-Type: application/json' -H "Idempotency-Key: login-1" -d "{\"username\":\"admin\",\"password\":\"$PW\"}" $BASE/api/v1/auth/login | json 'd["csrf_token"]')
+# Admins must use a second factor by default (mfa_required_for_admins): set it
+# up through the API, turn the requirement off for the suite (the browser
+# tests sign in with passwords), then turn the Admin's second factor off with
+# a recovery code. features.spec.ts tests the second factor in the browser.
+SECRET=$(api POST /api/v1/auth/totp/enroll '{}' | json 'd["secret"]')
+RECOVERY=$(api POST /api/v1/auth/totp/confirm "{\"code\":\"$(totp "$SECRET")\"}" | json 'd["recovery_codes"][0]')
+api PATCH /api/v1/settings '{"mfa_required_for_admins":false}' >/dev/null
+api POST /api/v1/auth/totp/disable "{\"code\":\"$RECOVERY\"}" >/dev/null
+api POST /api/v1/users "{\"username\":\"mfa-user\",\"password\":\"$PW\",\"role\":\"operator\"}" >/dev/null
 api POST /api/v1/users "{\"username\":\"viewer\",\"password\":\"$PW\",\"role\":\"viewer\"}" >/dev/null
 api POST /api/v1/users "{\"username\":\"operator\",\"password\":\"$PW\",\"role\":\"operator\"}" >/dev/null
 # Fast cadence so charts and live updates move during the suite. The container's
@@ -204,6 +219,11 @@ FREEZE=$(define "$FREEZE_NAME" e2e_freeze e2e_freeze)
 api POST /api/v1/migrations/$FREEZE/preflight >/dev/null
 wait_preflight $FREEZE
 api POST /api/v1/migrations/$FREEZE/start '{"warnings_reviewed":true}' >/dev/null
+
+log "Source database e2e_offline for the offline browser test"
+psql_su $SRC_PORT postgres -c "DROP DATABASE IF EXISTS e2e_offline WITH (FORCE)" -c "CREATE DATABASE e2e_offline OWNER doadmin"
+psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS e2e_offline WITH (FORCE)"
+psql_do $SRC_PORT e2e_offline -c "CREATE TABLE orders(id bigserial PRIMARY KEY, customer int NOT NULL, amount numeric(12,2), note text); INSERT INTO orders(customer, amount, note) SELECT g%1000, 1, md5(g::text) FROM generate_series(1,5000) g;"
 
 log "Draft migration for the wizard"
 psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS ${DB}_draft WITH (FORCE)"

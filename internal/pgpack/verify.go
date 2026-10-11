@@ -20,6 +20,7 @@ type VerifyInput struct {
 	TargetMaint        pg.Conn
 	Origin             string
 	HeartbeatRequired  bool
+	Offline            bool // writes were stopped before a one-time copy
 	HeartbeatToken     string
 	HBBeforeLSN        string
 	OriginLSN          string // measured after the drain; empty to measure now
@@ -172,7 +173,11 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			}
 		}
 	} else {
-		add(vres("final_heartbeat", db, check.Warning, "Final heartbeat on the target", "Heartbeat is off for this migration (accepted risk): no proof the last writes arrived beyond the data comparison.", map[string]any{"required": false}))
+		if in.Offline {
+			add(vres("final_heartbeat", db, check.Info, "Final heartbeat on the target", "Offline migration: writes were stopped before the copy, so no heartbeat is needed; the writes_stopped check proves the source did not change.", map[string]any{"required": false, "offline": true}))
+		} else {
+			add(vres("final_heartbeat", db, check.Warning, "Final heartbeat on the target", "Heartbeat is off for this migration (accepted risk): no proof the last writes arrived beyond the data comparison.", map[string]any{"required": false}))
+		}
 	}
 
 	// 2. Origin reached the final heartbeat's position (D3).

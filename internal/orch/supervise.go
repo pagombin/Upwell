@@ -249,6 +249,24 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	}
 
 	// The unit is no longer running.
+	if spec.Offline && st.ExitCode != nil && *st.ExitCode == 0 && classes.errors == 0 && !classes.baseCopyFailed && !classes.fatal {
+		// An offline copy ends by exiting: on a clean exit with no error in
+		// its log, the copy is done. Verification decides the rest (D65).
+		o.endAttempt(ctx, d, st.ExitCode, "copy finished")
+		if prior, frozen := m.Flags.Freeze.dbPrior(d.SourceName); frozen && prior != "" {
+			// The source had its own default_transaction_read_only before the
+			// freeze: give the target the same.
+			if tc, err := pg.Connect(ctx, spec.TargetConn, 30*time.Second); err == nil {
+				if _, err := pg.Exec(ctx, tc, `ALTER DATABASE `+pg.QuoteIdent(d.TargetName)+` SET default_transaction_read_only = `+pg.QuoteLiteral(prior)); err != nil {
+					o.Event(ctx, m.ID, d.SourceName, "db_properties", "warning", "Could not set default_transaction_read_only = "+prior+" on the target: "+err.Error(), nil)
+				}
+				tc.Close(ctx)
+			}
+		}
+		o.setDB(ctx, d.ID, map[string]any{"state": DCopied, "base_copy_done": 1, "drained": 1, "last_error": nil, "error_class": nil})
+		o.Event(ctx, m.ID, d.SourceName, "db_state", "info", "Offline copy of "+d.SourceName+" finished", nil)
+		return
+	}
 	var reason, cls string
 	switch {
 	case classes.endposReached || (d.State == DDraining && d.EndPos != "" && classes.errors == 0 && st.ExitCode != nil && *st.ExitCode == 0):
@@ -403,7 +421,9 @@ func (o *Orchestrator) schedule(ctx context.Context, m Migration, limit int) {
 	if limit < 1 {
 		limit = 4
 	}
-	if m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0 {
+	// No launches during a cutover, except an offline migration's copy step
+	// (D65), whose run is kept in the cutover state.
+	if c := m.Flags.Cutover; c != nil && c.EndedAt == 0 && c.Phase != "copy" {
 		return
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
@@ -499,7 +519,11 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 	ms, _ := o.ListMigrations(ctx)
 	g := o.globalSettings(ctx)
 	for _, m := range ms {
-		if !m.Fixture && m.Flags.Freeze.Active() && m.Flags.Verdict != "GO" {
+		if !m.Fixture && o.IsOffline(ctx, m) && m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0 && m.Flags.Cutover.Phase != "writers" && m.Flags.Cutover.Phase != "" {
+			// The copy runs on in its units: continue the run, keeping the
+			// freeze; the writes check at verification still decides.
+			o.resumeOffline(ctx, m)
+		} else if !m.Fixture && m.Flags.Freeze.Active() && m.Flags.Verdict != "GO" {
 			// No cutover survives a restart: give the source its writes back.
 			// Continuing the cutover re-checks that writes stopped (D48).
 			if err := o.undoFreeze(ctx, m.ID, "Upwell", "Upwell restarted during the cutover"); err != nil {

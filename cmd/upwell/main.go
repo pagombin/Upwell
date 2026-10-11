@@ -135,6 +135,7 @@ func open(cfg config.Config, createKey bool, stderrLogs bool) (*app, error) {
 		return nil, err
 	}
 	a := &app{cfg: cfg, st: st, vault: &secrets.Vault{Box: box, Store: st}, log: lg, bus: b, audit: &audit.Log{Store: st}, auth: auth.NewService(st), set: &settings.Service{Store: st}}
+	a.auth.Vault = a.vault
 	r, err := runner.New(cfg.Engine.Runner, filepath.Join(cfg.DataDir, "units"))
 	if err != nil {
 		return nil, err
@@ -366,8 +367,11 @@ func selftest(args []string) error {
 }
 
 func userCmd(args []string) error {
+	if len(args) > 0 && args[0] == "reset-totp" {
+		return resetTOTPCmd(args[1:])
+	}
 	if len(args) == 0 || args[0] != "create" {
-		return errors.New("usage: upwell user create --username NAME --role viewer|operator|admin (password from UPWELL_PASSWORD or stdin)")
+		return errors.New("usage: upwell user create --username NAME --role viewer|operator|admin (password from UPWELL_PASSWORD or stdin)\n       upwell user reset-totp --username NAME (turns off a user's second factor, for a lost device)")
 	}
 	fs := flag.NewFlagSet("user create", flag.ExitOnError)
 	name := fs.String("username", "", "username")
@@ -394,6 +398,33 @@ func userCmd(args []string) error {
 	}
 	(&audit.Log{Store: st}).Append(context.Background(), audit.Actor{Username: "cli"}, "user.create", u.ID, nil, map[string]any{"username": u.Username, "role": u.Role, "via": "cli"})
 	fmt.Printf("created %s (%s)\n", u.Username, u.Role)
+	return nil
+}
+
+// resetTOTPCmd turns off a user's second factor from the droplet's shell:
+// the way back in for an Admin who lost the device and has no recovery code.
+func resetTOTPCmd(args []string) error {
+	fs := flag.NewFlagSet("user reset-totp", flag.ExitOnError)
+	name := fs.String("username", "", "username")
+	cfg, err := loadConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.StorePath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	svc := auth.NewService(st)
+	id, err := svc.UserIDByName(context.Background(), strings.ToLower(strings.TrimSpace(*name)))
+	if err != nil || id == "" {
+		return fmt.Errorf("no user %q", *name)
+	}
+	if err := svc.TOTPDisable(context.Background(), id); err != nil {
+		return err
+	}
+	(&audit.Log{Store: st}).Append(context.Background(), audit.Actor{Username: "cli"}, "auth.totp_reset", id, nil, map[string]any{"username": *name, "via": "cli"})
+	fmt.Printf("second factor turned off for %s; they set it up again at their next sign-in\n", *name)
 	return nil
 }
 

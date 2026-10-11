@@ -1,5 +1,5 @@
 export type Role = "viewer" | "operator" | "admin";
-export interface User { id: string; username: string; role: Role; disabled: boolean; last_login_at?: number; created_at: number }
+export interface User { id: string; username: string; role: Role; disabled: boolean; last_login_at?: number; created_at: number; totp_enabled?: boolean }
 export interface Flags {
   started?: boolean; paused?: boolean; aborted?: boolean; cleaned_up?: boolean; apps_switched?: boolean;
   preflight_running?: boolean; preflight_ok?: boolean; preflight_run_id?: string; verdict?: string; verdict_at?: number;
