@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/pagombin/upwell/internal/audit"
 	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/pg"
@@ -547,6 +549,10 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		done("failed: " + err.Error())
 		return o.dbFailed(ctx, m, d, engine.FailPermanent, err.Error())
 	}
+	// A restart from zero: the reset keeps the target's own objects, so the
+	// earlier attempt's other objects (types, functions, the publication
+	// pgcopydb copies from the source) may still be there.
+	spec.DropIfExists = o.attemptNumber(ctx, d.ID) > 0
 	v := o.Settings(ctx, m)
 	src, dst := spec.SourceConn, spec.TargetConn
 	// Roles once per migration, best effort.
@@ -907,11 +913,25 @@ func resetTargetDB(ctx context.Context, spec engine.DatabaseSpec) error {
 	if err != nil {
 		return fmt.Errorf("listing the source's relations: %w", err)
 	}
-	dst, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), time.Minute)
+	// No statement timeout: dropping a large table can take a while. A lock
+	// timeout instead, so a lock that is never released names its holder.
+	dst, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") {
 			return nil
 		}
+		return err
+	}
+	// The engine's server sessions outlive it: an index build or a COPY keeps
+	// running on the target after pgcopydb dies and holds its locks, so the
+	// drops below would wait behind it. End them first (they run as the same
+	// user, so no extra privilege is needed).
+	if _, err := endEngineSessions(ctx, dst); err != nil {
+		dst.Close(ctx)
+		return fmt.Errorf("ending the engine's leftover sessions on the target: %w", err)
+	}
+	if _, err := dst.Exec(ctx, `SET lock_timeout = '2min'`); err != nil {
+		dst.Close(ctx)
 		return err
 	}
 	// relkind first, so each object is dropped with the right command.
@@ -938,7 +958,11 @@ func resetTargetDB(ctx context.Context, spec engine.DatabaseSpec) error {
 				continue
 			}
 			if _, err := dst.Exec(ctx, `DROP `+cmd[k]+` IF EXISTS `+r+` CASCADE`); err != nil {
+				holders := lockHolders(ctx, spec, r)
 				dst.Close(ctx)
+				if holders != "" {
+					return fmt.Errorf("dropping %s on the target: %w; the lock is held by %s", r, err, holders)
+				}
 				return fmt.Errorf("dropping %s on the target: %w", r, err)
 			}
 		}
@@ -1206,4 +1230,41 @@ func firstErr(errs ...error) error {
 		}
 	}
 	return nil
+}
+
+// endEngineSessions terminates the engine's leftover sessions in c's
+// database: pgcopydb names its sessions "pgcopydb[pid] ...", and pg_dump and
+// pg_restore inherit that name; Upwell starts the engine as "upwell-engine".
+// Only sessions of the same user are ended. It waits up to 15 s for them to go.
+func endEngineSessions(ctx context.Context, c *pgx.Conn) (int, error) {
+	const which = `datname = current_database() AND pid <> pg_backend_pid() AND usename = current_user
+		AND (application_name LIKE 'pgcopydb%' OR application_name LIKE 'upwell-engine%')`
+	var n int
+	if err := c.QueryRow(ctx, `SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE `+which+`) t`).Scan(&n); err != nil {
+		return 0, err
+	}
+	for i := 0; i < 30 && n > 0; i++ {
+		var left int
+		if err := c.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE `+which).Scan(&left); err != nil {
+			return n, err
+		}
+		if left == 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return n, nil
+}
+
+// lockHolders describes the sessions holding a lock on rel, for an error
+// message (best effort, on a fresh connection).
+func lockHolders(ctx context.Context, spec engine.DatabaseSpec, rel string) string {
+	c, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), 15*time.Second)
+	if err != nil {
+		return ""
+	}
+	defer c.Close(ctx)
+	h, _ := pg.QueryStrings(ctx, c, `SELECT 'pid '||a.pid||' ('||a.usename||', '||COALESCE(NULLIF(a.application_name,''),'no application name')||', '||a.state||', '||left(regexp_replace(a.query, '\s+', ' ', 'g'), 80)||')'
+		FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.relation = $1::regclass AND l.granted AND a.pid <> pg_backend_pid() LIMIT 5`, rel)
+	return strings.Join(h, "; ")
 }

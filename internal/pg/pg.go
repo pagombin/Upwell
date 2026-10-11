@@ -79,10 +79,19 @@ func Connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn,
 	if err != nil {
 		return nil, Explain(err)
 	}
-	pinned, _, perr := sessionPinned(ctx, conn, c)
-	if perr != nil {
-		conn.Close(ctx)
-		return nil, Explain(perr)
+	// Probing costs a second connection and several round trips, and a busy
+	// proxy can be slow to accept connections: probe an endpoint once every
+	// 10 minutes, not on every connection. The connection test and preflight
+	// always probe (ProbeSession).
+	pinned, cached := pinnedCached(key)
+	if !cached {
+		var perr error
+		pinned, _, perr = sessionPinned(ctx, conn, c)
+		if perr != nil {
+			conn.Close(ctx)
+			return nil, Explain(perr)
+		}
+		pinnedCache.Store(key, pinnedEntry{pinned, time.Now()})
 	}
 	if pinned {
 		if _, err := conn.Exec(ctx, "SET statement_timeout = "+strconv.Itoa(int(stmtTimeout/time.Millisecond)), pgx.QueryExecModeSimpleProtocol); err != nil {
@@ -91,6 +100,27 @@ func Connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn,
 		}
 	}
 	return conn, nil
+}
+
+type pinnedEntry struct {
+	pinned bool
+	at     time.Time
+}
+
+// pinnedCache remembers, per endpoint, whether sessions behind its pooler
+// keep their settings.
+var pinnedCache sync.Map
+
+func pinnedCached(key string) (pinned, ok bool) {
+	v, found := pinnedCache.Load(key)
+	if !found {
+		return false, false
+	}
+	e := v.(pinnedEntry)
+	if time.Since(e.at) > 10*time.Minute {
+		return false, false
+	}
+	return e.pinned, true
 }
 
 // refusesStartupParams remembers endpoints (host:port) that refused a
