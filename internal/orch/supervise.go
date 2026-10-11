@@ -55,16 +55,34 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 			o.logf("error", "orchestrator", "", "", "", "supervision panicked: %v", r)
 		}
 	}()
-	ms, err := o.ListMigrations(ctx)
+	// A deadline per tick: a cluster that is slow to answer (a busy proxy in
+	// front of the target, on the droplet) must not stall supervision, whose
+	// heartbeat feeds the systemd watchdog.
+	tctx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	defer cancel()
+	start := time.Now()
+	slowest, slowestFor := "", time.Duration(0)
+	ms, err := o.ListMigrations(tctx)
 	if err == nil {
 		for _, m := range ms {
 			if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp || m.Flags.CleanupRunning {
 				continue
 			}
-			o.superviseMigration(ctx, m)
+			t0 := time.Now()
+			o.superviseMigration(tctx, m)
+			if d := time.Since(t0); d > slowestFor {
+				slowest, slowestFor = "migration "+m.Name, d
+			}
 		}
 	}
-	o.metrics.hostSample(ctx)
+	t0 := time.Now()
+	o.metrics.hostSample(tctx)
+	if d := time.Since(t0); d > slowestFor {
+		slowest, slowestFor = "host metrics", d
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		o.logf("warn", "orchestrator", "", "", "", "a supervision tick took %s (slowest: %s, %s); a cluster may be slow to answer", d.Round(time.Second), slowest, slowestFor.Round(time.Second))
+	}
 	o.loopMu.Lock()
 	o.lastLoop = time.Now()
 	o.loopMu.Unlock()
@@ -91,19 +109,32 @@ func (o *Orchestrator) superviseMigration(ctx context.Context, m Migration) {
 		return
 	}
 	v := o.Settings(ctx, m)
+	steps := map[string]time.Duration{}
+	timed := func(name string, f func()) {
+		t0 := time.Now()
+		f()
+		steps[name] += time.Since(t0)
+	}
 	for _, d := range included(dbs) {
 		if m.Flags.Aborted {
 			break
 		}
-		o.superviseDB(ctx, m, d)
+		timed("engine status of "+d.SourceName, func() { o.superviseDB(ctx, m, d) })
 	}
 	if !m.Flags.Aborted && !m.Flags.Paused {
-		o.schedule(ctx, m, v.Int("max_concurrent_base_copies"))
-		o.retries(ctx, m)
+		timed("scheduling", func() {
+			o.schedule(ctx, m, v.Int("max_concurrent_base_copies"))
+			o.retries(ctx, m)
+		})
 	}
 	dbs, _ = o.ListDatabases(ctx, m.ID)
-	o.metrics.sample(ctx, m, included(dbs))
-	o.alerts.evaluate(ctx, m, included(dbs))
+	timed("cluster metrics", func() { o.metrics.sample(ctx, m, included(dbs)) })
+	timed("alerts", func() { o.alerts.evaluate(ctx, m, included(dbs)) })
+	for name, d := range steps {
+		if d > 10*time.Second {
+			o.logf("warn", "orchestrator", m.ID, "", "", "supervising %s: %s took %s", m.Name, name, d.Round(time.Second))
+		}
+	}
 	o.refreshState(ctx, m.ID)
 	o.bus.Publish("migration", "progress", m.ID, map[string]any{"databases": included(dbs)})
 }
@@ -222,14 +253,14 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	case classes.slotLost:
 		cls, reason = engine.FailSlotLost, classes.lastError
 	case !d.BaseCopyDone:
-		cls, reason = engine.FailBaseCopy, firstNonEmpty(classes.lastError, "the engine exited during the base copy")
+		cls, reason = engine.FailBaseCopy, firstNonEmpty(classes.rootCause(), "the engine exited during the base copy")
 		if classes.engineLock {
 			reason = engineLockReason + " (" + reason + ")"
 		}
 	case classes.permanent:
 		cls, reason = engine.FailPermanent, classes.lastError
 	default:
-		cls, reason = engine.FailTransient, firstNonEmpty(classes.lastError, "the engine exited unexpectedly")
+		cls, reason = engine.FailTransient, firstNonEmpty(classes.rootCause(), "the engine exited unexpectedly")
 	}
 	if classes.lastError == "" && st.Detail != "" {
 		reason += " (" + st.Detail + ")"

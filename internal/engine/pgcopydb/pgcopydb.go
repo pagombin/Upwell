@@ -100,6 +100,11 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	} else if d.Plugin != "" {
 		args = append(args, "--plugin", d.Plugin)
 	}
+	if !resume && d.DropIfExists {
+		// pg_restore --clean --if-exists: drops only objects in the source's
+		// schema dump, so the target's own objects are kept.
+		args = append(args, "--drop-if-exists")
+	}
 	args = append(args, d.ExtraArgs...)
 	for _, a := range args {
 		if strings.Contains(a, "--host") || a == "--port" {
@@ -469,7 +474,7 @@ func (e *Engine) CopyRoles(ctx context.Context, src, dst pg.Conn, runDir string)
 	// passwords (pg_roles is readable) and apply what a non-superuser may.
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "pg_dumpall", "--roles-only", "--no-role-passwords", "--dbname", src.URI())
+	cmd := exec.CommandContext(cctx, "pg_dumpall", rolesDumpArgs(src)...)
 	cmd.Env = append(os.Environ(), "PGPASSFILE="+pass)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -601,4 +606,16 @@ func limitStrings(s []string, n int) []string {
 		return append(s[:n:n], fmt.Sprintf("and %d more", len(s)-n))
 	}
 	return s
+}
+
+// rolesDumpArgs are pg_dumpall's arguments for the role copy. pg_dumpall
+// ignores the database named in --dbname and connects to "postgres", then
+// "template1"; managed clusters (DigitalOcean) refuse both in pg_hba, so the
+// maintenance database is named with --database.
+func rolesDumpArgs(src pg.Conn) []string {
+	db := src.DBName
+	if db == "" {
+		db = "defaultdb"
+	}
+	return []string{"--roles-only", "--no-role-passwords", "--dbname", src.URI(), "--database", db}
 }

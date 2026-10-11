@@ -127,3 +127,11 @@ GRANT pg_read_all_data TO reporting GRANTED BY postgres;
 		t.Errorf("existing %d new %v", p.Existing, p.New)
 	}
 }
+
+func TestRolesDumpNamesTheMaintenanceDatabase(t *testing.T) {
+	args := rolesDumpArgs(pg.Conn{Host: "h", Port: 25060, User: "doadmin", DBName: "defaultdb", SSLMode: "require"})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--database defaultdb") {
+		t.Fatalf("pg_dumpall would connect to postgres or template1, which DigitalOcean refuses: %v", args)
+	}
+}
