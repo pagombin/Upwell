@@ -879,16 +879,24 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	for _, n := range p.strings(r.dst, `SELECT name FROM pg_available_extensions`) {
 		avail[n] = true
 	}
-	var missingExt []string
+	var missingExt, providerExt []string
 	for _, x := range srcExt {
-		if !avail[x] {
+		if _, ok := ProviderExtensions[x]; ok {
+			// Left out of the copy at launch (D76); the launch refuses it
+			// if its schema also holds the customer's objects.
+			providerExt = append(providerExt, x)
+		} else if !avail[x] {
 			missingExt = append(missingExt, x)
 		}
 	}
+	left := ""
+	if len(providerExt) > 0 {
+		left = " " + strings.Join(providerExt, ", ") + " is the source provider's own management extension and will be left out of the copy."
+	}
 	if len(missingExt) > 0 {
-		p.emit(check.Blocker, true, "These source extensions are not available on the target: "+strings.Join(missingExt, ", ")+".", "Ask for them to be enabled on the Advanced cluster, or remove them from the source.", map[string]any{"missing": missingExt, "source": srcExt})
+		p.emit(check.Blocker, true, "These source extensions are not available on the target: "+strings.Join(missingExt, ", ")+"."+left, "Ask for them to be enabled on the Advanced cluster, or remove them from the source.", map[string]any{"missing": missingExt, "source": srcExt, "left_out": providerExt})
 	} else {
-		p.ok(fmt.Sprintf("All %d source extension(s) are available on the target.", len(srcExt)), map[string]any{"source": srcExt})
+		p.ok(fmt.Sprintf("All %d source extension(s) are available on the target.%s", len(srcExt)-len(providerExt), left), map[string]any{"source": srcExt, "left_out": providerExt})
 	}
 
 	for _, x := range []struct {

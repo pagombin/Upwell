@@ -1,6 +1,8 @@
 package pgcopydb
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -133,5 +135,47 @@ func TestRolesDumpNamesTheMaintenanceDatabase(t *testing.T) {
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--database defaultdb") {
 		t.Fatalf("pg_dumpall would connect to postgres or template1, which DigitalOcean refuses: %v", args)
+	}
+}
+
+// D76: a provider's management extension is left out with pgcopydb's filters
+// file, and a resume passes the same file again (pgcopydb keeps its filters
+// in its catalog).
+func TestPlanExcludeSchemas(t *testing.T) {
+	r, err := runner.New("local", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{Binary: "pgcopydb", Runner: r}
+	d := spec()
+	d.RunDir = t.TempDir()
+	if p, _ := e.Plan(d, false); strings.Contains(strings.Join(p.Args, " "), "--filters") {
+		t.Fatal("--filters without schemas to leave out")
+	}
+	d.ExcludeSchemas = []string{"aiven_extras"}
+	p, err := e.Plan(d, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filters := filepath.Join(d.RunDir, "filters.ini")
+	if !strings.Contains(strings.Join(p.Args, " "), "--filters "+filters) {
+		t.Fatalf("no --filters: %v", p.Args)
+	}
+	if err := writeFilters(d.RunDir, d.ExcludeSchemas); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filters)
+	if err != nil || string(b) != "[exclude-schema]\naiven_extras\n" {
+		t.Fatalf("filters file %q (%v)", b, err)
+	}
+	// A resume rebuilds the spec without the list; the file decides.
+	d.ExcludeSchemas = nil
+	rp, _ := e.Plan(d, true)
+	if !strings.Contains(strings.Join(rp.Args, " "), "--filters "+filters) {
+		t.Fatalf("resume lost the filters: %v", rp.Args)
+	}
+	d.ExcludeSchemas = []string{`bad"name`}
+	if _, err := e.Plan(d, false); err == nil {
+		t.Fatal("a schema name that is not plain was accepted")
 	}
 }

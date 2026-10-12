@@ -380,54 +380,127 @@ func SortDiscovered(ds []DiscoveredDB) {
 	})
 }
 
-// EnsureExtensions creates, in the target database, every extension installed
-// in the source database (the engine runs with --skip-extensions, because a
-// non-superuser cannot restore extension objects). Each is created in the same
-// schema when that schema exists on the target; extensions whose schema does
-// not exist yet are reported, not guessed. It returns what it created.
-func EnsureExtensions(ctx context.Context, src, dst pg.Conn) (created, skipped []string, err error) {
+// ProviderExtensions are a hosting provider's own management extensions:
+// platform plumbing installed and owned by the provider's superuser, with
+// grants to the provider's own roles. They are never copied: the target's
+// platform manages its own, and a non-superuser could not restore their
+// grants anyway (D76).
+var ProviderExtensions = map[string]string{
+	"aiven_extras": "the management functions of Aiven-based clusters, such as DigitalOcean's Standard PostgreSQL",
+}
+
+// LeftOutExtension is a provider extension whose schema is left out of the copy.
+type LeftOutExtension struct {
+	Name   string `json:"name"`
+	Schema string `json:"schema"`
+	What   string `json:"what"`
+}
+
+// Extensions is what EnsureExtensions did.
+type Extensions struct {
+	Created []string           `json:"created"`
+	LeftOut []LeftOutExtension `json:"left_out"`
+	// ExcludeSchemas are the left-out extensions' schemas: the engine skips
+	// them entirely (the schema, its grants and comments).
+	ExcludeSchemas []string `json:"exclude_schemas"`
+}
+
+// ErrExtensionsUnavailable says which source extensions the target cannot
+// provide; the engine is not started.
+type ErrExtensionsUnavailable struct{ Names []string }
+
+func (e *ErrExtensionsUnavailable) Error() string {
+	return "these extensions are installed in the source database but not available on the target: " + strings.Join(e.Names, ", ")
+}
+
+// EnsureExtensions prepares, in the target database, every extension
+// installed in the source database (the engine runs with --skip-extensions,
+// because a non-superuser cannot restore extension objects):
+//   - a provider's management extension (ProviderExtensions) whose schema
+//     holds nothing but its own objects is left out, schema and all;
+//   - an extension already on the target is kept;
+//   - one the target cannot provide is an error naming it, checked at every
+//     launch (preflight checks it only at the start, and the source can gain
+//     an extension later);
+//   - any other is created in the same schema, creating the schema first
+//     when it does not exist yet (the engine leaves an existing schema alone).
+func EnsureExtensions(ctx context.Context, src, dst pg.Conn) (Extensions, error) {
+	var res Extensions
 	sc, err := pg.Connect(ctx, src, 30*time.Second)
 	if err != nil {
-		return nil, nil, fmt.Errorf("source: %w", err)
+		return res, fmt.Errorf("source: %w", err)
 	}
 	defer sc.Close(ctx)
-	rows, err := pg.Query(ctx, sc, `SELECT e.extname, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql' ORDER BY e.oid`)
+	// For each extension: whether its schema holds anything that is not one
+	// of its own members (a relation, function or type; array and row types
+	// follow their element and relation).
+	rows, err := pg.Query(ctx, sc, `SELECT e.extname, n.nspname, n.nspname IN ('public','pg_catalog') OR EXISTS (
+			SELECT 1 FROM (
+				SELECT 'pg_class'::regclass AS cls, c.oid FROM pg_class c WHERE c.relnamespace = n.oid AND c.relkind IN ('r','p','v','m','f','S')
+				UNION ALL SELECT 'pg_proc'::regclass, p.oid FROM pg_proc p WHERE p.pronamespace = n.oid
+				UNION ALL SELECT 'pg_type'::regclass, t.oid FROM pg_type t WHERE t.typnamespace = n.oid AND t.typrelid = 0 AND t.typcategory <> 'A'
+			) o WHERE NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = o.cls AND d.objid = o.oid
+				AND d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e'))
+		FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql' ORDER BY e.oid`)
 	if err != nil {
-		return nil, nil, err
+		return res, err
 	}
-	type ext struct{ name, schema string }
+	type ext struct {
+		name, schema string
+		shared       bool
+	}
 	var exts []ext
 	for rows.Next() {
 		var x ext
-		if rows.Scan(&x.name, &x.schema) == nil {
-			exts = append(exts, x)
+		if err := rows.Scan(&x.name, &x.schema, &x.shared); err != nil {
+			rows.Close()
+			return res, err
 		}
+		exts = append(exts, x)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, err
+	}
 	if len(exts) == 0 {
-		return nil, nil, nil
+		return res, nil
 	}
 	dc, err := pg.Connect(ctx, dst, 30*time.Second)
 	if err != nil {
-		return nil, nil, fmt.Errorf("target: %w", err)
+		return res, fmt.Errorf("target: %w", err)
 	}
 	defer dc.Close(ctx)
+	var unavailable []string
+	var create []ext
 	for _, x := range exts {
-		var present, schemaOK bool
-		if err := pg.QueryRow(ctx, dc, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1), EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $2)`, x.name, x.schema).Scan(&present, &schemaOK); err != nil {
-			return created, skipped, fmt.Errorf("checking extension %s on the target: %w", x.name, err)
-		}
-		if present {
+		if what, ok := ProviderExtensions[x.name]; ok && !x.shared {
+			res.LeftOut = append(res.LeftOut, LeftOutExtension{Name: x.name, Schema: x.schema, What: what})
+			res.ExcludeSchemas = append(res.ExcludeSchemas, x.schema)
 			continue
 		}
-		if !schemaOK {
-			skipped = append(skipped, fmt.Sprintf("%s (schema %s does not exist on the target yet)", x.name, x.schema))
-			continue
+		var present, available bool
+		if err := pg.QueryRow(ctx, dc, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1), EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = $1)`, x.name).Scan(&present, &available); err != nil {
+			return res, fmt.Errorf("checking extension %s on the target: %w", x.name, err)
+		}
+		switch {
+		case present:
+		case !available:
+			unavailable = append(unavailable, fmt.Sprintf("%s (schema %s)", x.name, x.schema))
+		default:
+			create = append(create, x)
+		}
+	}
+	if len(unavailable) > 0 {
+		return res, &ErrExtensionsUnavailable{Names: unavailable}
+	}
+	for _, x := range create {
+		if _, err := dc.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pg.QuoteIdent(x.schema)); err != nil {
+			return res, fmt.Errorf("creating schema %s for extension %s on the target: %w", x.schema, x.name, err)
 		}
 		if _, err := dc.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS "+pg.QuoteIdent(x.name)+" SCHEMA "+pg.QuoteIdent(x.schema)); err != nil {
-			return created, skipped, fmt.Errorf("creating extension %s on the target: %w", x.name, err)
+			return res, fmt.Errorf("creating extension %s on the target: %w", x.name, err)
 		}
-		created = append(created, x.name)
+		res.Created = append(res.Created, x.name)
 	}
-	return created, skipped, nil
+	return res, nil
 }
