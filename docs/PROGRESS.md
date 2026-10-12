@@ -1,5 +1,15 @@
 # Upwell overnight build: progress
 
+## Base copy display and architecture (2026-10-12), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Per-table base copy progress bars were empty | done (D77) | `TestCopyProgressHasAFraction` (bytes_total 0 for COPY FROM STDIN; fraction from the source's reltuples); browser "database page during a base copy" |
+| Charts had no visible titles; empty charts did not say what or when | done (D77) | every `TimeChart` shows its title; database and Replication charts explain when they start; new "Copied to the target" chart |
+| Architecture diagram in the README | done | `docs/architecture.png` from `docs/architecture/architecture.html` (`dev/render-architecture.sh`) |
+| Where data is staged on the droplet | answered in the README | measured locally with pgcopydb 0.18: the base copy writes only the schema dump; changes are staged in `clone/cdc/*-output.db` and `*-replay.db` (274 MB for 120 MB of new rows) and kept until Clean up |
+| README review | done | removed the `overnight-build` checkout, F1 wording updated with the droplet result, disk guard numbers, integration timeout, version matrix clusters, architecture section |
+
 ## Droplet restart failure (2026-10-12), branch `claude/new-session-agkd2d`
 
 Restart from zero of `migration_db` failed in pg_restore: the source database gained DigitalOcean Standard's `aiven_extras` extension after the first launch, and the grants on its functions could not be restored on the target. Fixed by D76: a provider's management extension is left out of the copy (pgcopydb filters, kept for resume), an extension the target cannot provide stops the launch with its name, and one it can provide is created (schema first). **Status: done.**
