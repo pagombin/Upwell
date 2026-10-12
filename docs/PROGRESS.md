@@ -8,6 +8,7 @@
 | Whether the target restarted was unknown | done (D78) | `TestBaseCopyTargetRestarted`, `TestBaseCopyTargetConnectionClosed` |
 | `split_tables_larger_than = auto` documented but never applied | done (D78) | `TestAutoSplit`, `TestPlanSplitResume`, `TestSplitTablesGO`, `TestCopyProgressSplitTable` |
 | A concurrent freeze undo (abort and the cancelled cutover) left the freeze recorded as applied | done (D79) | `TestWriteFreezeAbortAndRestart`: 2 of 4 runs failed before ("tuple concurrently deleted"), 6 of 6 pass after |
+| Full integration suite (PG14, 15, 16, 18) | pass | clean run: 64 passed, 2 skipped (`TestApplyThroughput`, an opt-in measurement; `TestCollationFallbackWarned`, whose PostgreSQL 18 cluster had stopped), and 1 failure, a timing problem in the new `TestBaseCopyTargetConnectionClosed` (it waited for one table's COPY); fixed, and both connection tests then passed on their own; `TestVersionMatrix` (14, 15, 16, 18) and `TestCollationFallbackWarned` passed after the stopped clusters were restarted. The diagnosis now retries the connection for 30 s, because the failure is often seen while the cluster is still coming back |
 | Why the Advanced target closed the connection on the droplet | needs the target's logs | the cluster's metrics and logs around 2026-10-12 18:09:17 UTC and 2026-10-11 00:51:16 UTC |
 
 ## Base copy display and architecture (2026-10-12), branch `claude/new-session-agkd2d`

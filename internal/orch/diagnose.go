@@ -22,7 +22,7 @@ func (o *Orchestrator) failureReason(ctx context.Context, m Migration, d Databas
 	if err != nil {
 		return c.rootCause()
 	}
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 40*time.Second)
 	defer cancel()
 	table := ""
 	if c.failedOID != "" {
@@ -40,9 +40,15 @@ func (o *Orchestrator) failureReason(ctx context.Context, m Migration, d Databas
 	}
 	var started int64
 	o.st.DB.QueryRowContext(ctx, `SELECT started_at FROM attempts WHERE database_id=? ORDER BY number DESC LIMIT 1`, d.ID).Scan(&started)
+	// The failure is often seen while the cluster is still coming back
+	// (a restart or failover takes seconds): keep trying for up to 30 s.
 	conn, err := pg.Connect(cctx, side, 10*time.Second)
+	for wait := time.Now().Add(30 * time.Second); err != nil && time.Now().Before(wait) && cctx.Err() == nil; {
+		time.Sleep(2 * time.Second)
+		conn, err = pg.Connect(cctx, side, 5*time.Second)
+	}
 	if err != nil {
-		return fmt.Sprintf("%s. Upwell could not connect to the %s right afterwards (%v): it may be restarting or failing over; check the cluster's status, metrics and logs. pgcopydb does not retry a table, so the copy must restart", c.connLostSummary(table), c.connLost, err)
+		return fmt.Sprintf("%s. Upwell could not connect to the %s for 30 seconds afterwards (%v): it may be restarting or failing over; check the cluster's status, metrics and logs. pgcopydb does not retry a table, so the copy must restart", c.connLostSummary(table), c.connLost, err)
 	}
 	defer conn.Close(cctx)
 	var up time.Time
