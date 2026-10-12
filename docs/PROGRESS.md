@@ -1,5 +1,18 @@
 # Upwell overnight build: progress
 
+## Droplet restart failure (2026-10-12), branch `claude/new-session-agkd2d`
+
+Restart from zero of `migration_db` failed in pg_restore: the source database gained DigitalOcean Standard's `aiven_extras` extension after the first launch, and the grants on its functions could not be restored on the target. Fixed by D76: a provider's management extension is left out of the copy (pgcopydb filters, kept for resume), an extension the target cannot provide stops the launch with its name, and one it can provide is created (schema first). **Status: done.**
+
+| Evidence | Result |
+| --- | --- |
+| Local reproduction (stand-in extension shaped like aiven_extras) | the droplet's exact pg_restore errors before; clone succeeds with the schema left out |
+| `TestProviderExtensionLeftOut` | failed before ("The base copy failed: Terminating all processes in our process group"); passes: In sync, no schema on the target, event, stop and resume, cutover GO |
+| `TestUnavailableExtensionRefusedAtLaunch` | failed before (reached In sync with the extension silently missing); passes with a reason naming it |
+| `TestExtensionInOwnSchemaCreated`, `TestPlanExcludeSchemas` | pass |
+| Full integration suite (PG14, 15, 16, 18) | pass: 61 tests, 0 failures, 1 skipped (`TestApplyThroughput`, opt-in measurement), 79 min |
+| go vet, staticcheck, golangci-lint, `go test -race ./...` | clean |
+
 ## Final regression (bug bash 12), 2026-10-11
 
 Run from a fresh clone of `origin/overnight-build-2` at `ed3470b` (the only later commit changes one README line), by `regress.sh`: every step must pass, and the clusters are checked for leftovers afterwards. **Overall: pass (exit 0).**
