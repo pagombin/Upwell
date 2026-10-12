@@ -626,17 +626,28 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		}
 	}
 	// Extensions first: tables may use their types, functions and operators.
-	if made, skipped, err := pgpack.EnsureExtensions(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName)); err != nil {
+	exts, err := pgpack.EnsureExtensions(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
+	var unavailable *pgpack.ErrExtensionsUnavailable
+	switch {
+	case errors.As(err, &unavailable):
+		// Checked at every launch: the source can gain an extension after
+		// preflight (D76). Without it the copy would fail inside pg_restore,
+		// or leave the extension out without a word.
+		done("failed: extensions not available on the target")
+		return o.dbFailed(ctx, m, d, engine.FailPermanent, "Source database "+d.SourceName+" has extensions that are not available on the target: "+strings.Join(unavailable.Names, ", ")+
+			". Upwell did not start the engine. Have them enabled on the target cluster, or drop them from the source database if nothing uses them, then restart it from zero.")
+	case err != nil:
 		done("failed: " + err.Error())
 		return o.dbFailed(ctx, m, d, engine.FailPermanent, err.Error())
-	} else {
-		if len(made) > 0 {
-			o.Event(ctx, m.ID, d.SourceName, "extensions", "info", "Created extensions on the target: "+strings.Join(made, ", "), nil)
-		}
-		if len(skipped) > 0 {
-			o.Event(ctx, m.ID, d.SourceName, "extensions", "warning", "Extensions not created on the target: "+strings.Join(skipped, "; "), nil)
-		}
 	}
+	if len(exts.Created) > 0 {
+		o.Event(ctx, m.ID, d.SourceName, "extensions", "info", "Created extensions on the target: "+strings.Join(exts.Created, ", "), nil)
+	}
+	for _, x := range exts.LeftOut {
+		o.Event(ctx, m.ID, d.SourceName, "extensions", "warning", fmt.Sprintf("Extension %s (%s) is the source provider's own and was left out of the copy, with its schema %s and the grants on it; the target's platform provides its own management functions.", x.Name, x.What, x.Schema),
+			map[string]any{"extension": x.Name, "schema": x.Schema})
+	}
+	spec.ExcludeSchemas = exts.ExcludeSchemas
 	// Streaming only: an offline copy applies no changes (pgcopydb sets
 	// session_replication_role only in its apply), needs no heartbeat and
 	// decodes nothing (D65).

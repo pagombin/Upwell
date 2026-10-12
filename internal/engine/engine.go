@@ -46,7 +46,11 @@ type DatabaseSpec struct {
 	// SkipDBProperties: Upwell copies the database's ALTER DATABASE SET
 	// properties itself (during a write freeze, D65).
 	SkipDBProperties bool
-	ExtraArgs        []string // test hook only; never set from the API
+	// ExcludeSchemas are left out of the copy entirely (a source provider's
+	// management extension, D76). Written to the run directory's filters
+	// file at the start, and reused from it on resume.
+	ExcludeSchemas []string
+	ExtraArgs      []string // test hook only; never set from the API
 }
 
 // RunPlan is the exact command for one database: what the dry run shows.

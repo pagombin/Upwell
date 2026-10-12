@@ -72,6 +72,19 @@ func (e *Engine) Capabilities() engine.Capabilities {
 		CopiesRoles: true, CopiesExtensions: true}
 }
 
+const filtersFile = "filters.ini"
+
+var plainName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$]*$`)
+
+// writeFilters writes pgcopydb's --filters file leaving out whole schemas.
+// With none it leaves an existing file alone: a resume reuses it.
+func writeFilters(runDir string, schemas []string) error {
+	if len(schemas) == 0 {
+		return nil
+	}
+	return os.WriteFile(filepath.Join(runDir, filtersFile), []byte("[exclude-schema]\n"+strings.Join(schemas, "\n")+"\n"), 0o640)
+}
+
 // Plan builds the exact command. It never uses --host/--port (PC12).
 func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error) {
 	if !pg.ValidDBName(d.Source) || !pg.ValidDBName(d.Target) {
@@ -104,6 +117,19 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	}
 	if d.SkipDBProperties {
 		args = append(args, "--skip-db-properties")
+	}
+	// Schemas left out of the copy (D76). pgcopydb keeps its filters in its
+	// catalog, so a resume passes the same file again.
+	filters := filepath.Join(d.RunDir, filtersFile)
+	if len(d.ExcludeSchemas) > 0 {
+		for _, n := range d.ExcludeSchemas {
+			if !plainName.MatchString(n) {
+				return engine.RunPlan{}, fmt.Errorf("schema %q cannot be left out of the copy: only plain names are supported", n)
+			}
+		}
+		args = append(args, "--filters", filters)
+	} else if _, err := os.Stat(filters); err == nil && resume {
+		args = append(args, "--filters", filters)
 	}
 	if d.SplitLarger != "" && d.SplitLarger != "off" && d.SplitLarger != "auto" {
 		args = append(args, "--split-tables-larger-than", d.SplitLarger)
@@ -144,6 +170,9 @@ func (e *Engine) Start(ctx context.Context, p engine.RunPlan, d engine.DatabaseS
 		return err
 	}
 	if err := pg.WritePassFile(p.PassFile, d.SourceConn, d.TargetConn); err != nil {
+		return err
+	}
+	if err := writeFilters(p.RunDir, d.ExcludeSchemas); err != nil {
 		return err
 	}
 	return e.Runner.Start(ctx, runner.Spec{Instance: p.Instance, Binary: p.Binary, Args: p.Args, Env: p.Env, RunDir: p.RunDir, LogFile: p.LogFile})
