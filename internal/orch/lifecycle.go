@@ -1197,6 +1197,7 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 		return m, uerr("cutover_running", "End positions are already set; the cutover cannot be aborted now.", "Wait for the verdict.")
 	}
 	if cancel, ok := cutoverCancels.Load(cutOp); ok && cutOp != "" {
+		cutoverCancelReasons.Store(cutOp, "the migration was aborted")
 		cancel.(context.CancelFunc)()
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)

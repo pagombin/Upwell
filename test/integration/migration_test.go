@@ -111,6 +111,15 @@ func TestS02MissingSetPrivilege(t *testing.T) {
 	}
 	// Forced past preflight (test hook): the engine is never started without the privilege.
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	defer func() {
+		if t.Failed() {
+			// What the launch's check saw (once failed in a full suite run and
+			// never alone): the parameter's ACL and the check inside the target
+			// database.
+			t.Logf("parameter ACL: %s", superSQL(t, dstPort, "postgres", `SELECT COALESCE(string_agg(parname||' '||paracl::text, '; '), 'none') FROM pg_parameter_acl`))
+			t.Logf("in %s as doadmin: %s", name, q(t, dstConn, name, `SELECT has_parameter_privilege('session_replication_role','SET')::text`))
+		}
+	}()
 	d := e.waitDBState(id, name, 2*time.Minute, orch.DFailed, orch.DRestartRequired)
 	if !strings.Contains(d.LastError, "session_replication_role") {
 		t.Fatalf("unexpected error: %s", d.LastError)
