@@ -7,6 +7,7 @@
 | The failure showed pgcopydb's last error ("Failed to close snapshot") instead of the lost target connection | done (D78) | `TestBaseCopyTargetConnectionClosed` failed before ("Sub-process ... exited with code 12") and passes |
 | Whether the target restarted was unknown | done (D78) | `TestBaseCopyTargetRestarted`, `TestBaseCopyTargetConnectionClosed` |
 | `split_tables_larger_than = auto` documented but never applied | done (D78) | `TestAutoSplit`, `TestPlanSplitResume`, `TestSplitTablesGO`, `TestCopyProgressSplitTable` |
+| A concurrent freeze undo (abort and the cancelled cutover) left the freeze recorded as applied | done (D79) | `TestWriteFreezeAbortAndRestart`: 2 of 4 runs failed before ("tuple concurrently deleted"), 6 of 6 pass after |
 | Why the Advanced target closed the connection on the droplet | needs the target's logs | the cluster's metrics and logs around 2026-10-12 18:09:17 UTC and 2026-10-11 00:51:16 UTC |
 
 ## Base copy display and architecture (2026-10-12), branch `claude/new-session-agkd2d`
