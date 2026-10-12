@@ -25,7 +25,7 @@ function useRange(def = 30) {
 }
 
 interface Attempt { number: number; kind: string; unit: string; command: string; started_at: number; ended_at?: number; exit_code?: number; end_reason: string }
-interface DBDetail { migration: Migration; database: Database; attempts: Attempt[]; live: Record<string, number>; unit: { active: boolean; main_pid?: number; main_live?: boolean; exit_code?: number } | null; unit_name: string; now: number; copy_progress?: { copies: { table: string; bytes: number; bytes_total: number; tuples: number; rows_estimate?: number; fraction?: number; source_bytes?: number }[]; indexes: { index: string; phase: string; percent: number }[] } }
+interface DBDetail { migration: Migration; database: Database; attempts: Attempt[]; live: Record<string, number>; unit: { active: boolean; main_pid?: number; main_live?: boolean; exit_code?: number } | null; unit_name: string; now: number; copy_progress?: { copies: { table: string; bytes: number; bytes_total: number; tuples: number; rows_estimate?: number; fraction?: number; source_bytes?: number; parts?: number; target_bytes?: number }[]; indexes: { index: string; phase: string; percent: number }[] } }
 
 export function DatabaseScreen() {
   const { db = "" } = useParams();
@@ -78,14 +78,14 @@ export function DatabaseScreen() {
       </Card>
       {d.data.copy_progress && (
         <Card title="Base copy in progress">
-          <p className="small muted">Tables being copied right now, with indexes being built. Each bar compares the rows copied with the source's estimated row count, so it can stop short of or run past the end by a little; finished tables leave the list.</p>
+          <p className="small muted">Tables being copied right now, with indexes being built. Each bar compares the rows copied with the source's estimated row count, so it can stop short of or run past the end by a little; a large table copied in parts compares its size on the target with its size on the source. Finished tables leave the list.</p>
           {d.data.copy_progress.copies.length === 0 && d.data.copy_progress.indexes.length === 0 ? <p className="muted">No COPY or index build is running at this moment.</p> : (
             <div className="stack">
               {d.data.copy_progress.copies.map((c) => (
                 <div key={c.table} className="row" style={{ flexWrap: "nowrap" }}>
-                  <span className="mono" style={{ width: 300, minWidth: 0 }}><Trunc>{c.table}</Trunc></span>
+                  <span className="mono" style={{ width: 300, minWidth: 0 }}><Trunc>{c.parts && c.parts > 1 ? `${c.table} (${c.parts} parts)` : c.table}</Trunc></span>
                   <span style={{ flex: 1 }}>{c.fraction !== undefined ? <ProgressBar value={c.fraction} label={`${c.table} copy`} /> : <span className="small muted">No row estimate on the source (the table was never analyzed)</span>}</span>
-                  <span className="small muted" style={{ width: 280, textAlign: "right" }} title="Rows copied of the source's estimated row count (pg_class.reltuples), and bytes sent so far">{count(c.tuples)}{c.rows_estimate ? ` of about ${count(c.rows_estimate)}` : ""} rows{c.fraction !== undefined ? ` · ${Math.round(c.fraction * 100)}%` : ""} · {bytes(c.bytes)}</span>
+                  <span className="small muted" style={{ width: 280, textAlign: "right" }} title="Rows copied of the source's estimated row count (pg_class.reltuples), and bytes sent so far; for a table copied in parts, the rows of the parts in progress">{count(c.tuples)}{c.rows_estimate && !(c.parts && c.parts > 1) ? ` of about ${count(c.rows_estimate)}` : ""} rows{c.fraction !== undefined ? ` · ${Math.round(c.fraction * 100)}%` : ""} · {bytes(c.bytes)}</span>
                 </div>
               ))}
               {d.data.copy_progress.indexes.map((c) => (

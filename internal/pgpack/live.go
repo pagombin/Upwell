@@ -24,13 +24,18 @@ func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 	defer conn.Close(ctx)
 	copies := []map[string]any{}
 	var names []string
-	rows, err := pg.Query(ctx, conn, `SELECT COALESCE(p.relid::regclass::text, '?'), p.bytes_processed, p.bytes_total, p.tuples_processed FROM pg_stat_progress_copy p WHERE p.datname=current_database()`)
+	// One row per table: a split table (D78) is copied by several COPYs at
+	// once, each a part of it, so their rows and bytes are summed; parts that
+	// already finished are no longer listed, so a split table's fraction comes
+	// from its size on the target against its size on the source instead.
+	rows, err := pg.Query(ctx, conn, `SELECT COALESCE(p.relid::regclass::text, '?'), sum(p.bytes_processed)::bigint, sum(p.bytes_total)::bigint, sum(p.tuples_processed)::bigint, count(*), COALESCE(max(pg_table_size(p.relid)), 0)
+		FROM pg_stat_progress_copy p WHERE p.datname=current_database() GROUP BY 1 ORDER BY 1`)
 	if err == nil {
 		for rows.Next() {
 			var rel string
-			var done, total, tuples int64
-			_ = rows.Scan(&rel, &done, &total, &tuples)
-			copies = append(copies, map[string]any{"table": rel, "bytes": done, "bytes_total": total, "tuples": tuples})
+			var done, total, tuples, parts, tsize int64
+			_ = rows.Scan(&rel, &done, &total, &tuples, &parts, &tsize)
+			copies = append(copies, map[string]any{"table": rel, "bytes": done, "bytes_total": total, "tuples": tuples, "parts": parts, "target_bytes": tsize})
 			names = append(names, rel)
 		}
 		rows.Close()
@@ -55,6 +60,15 @@ func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 					continue
 				}
 				cp["source_bytes"] = e[1]
+				if cp["parts"].(int64) > 1 {
+					if e[1] > 0 {
+						cp["fraction"] = min(float64(cp["target_bytes"].(int64))/float64(e[1]), 0.99)
+					}
+					if e[0] > 0 {
+						cp["rows_estimate"] = e[0]
+					}
+					continue
+				}
 				if e[0] > 0 { // -1: never analyzed
 					cp["rows_estimate"] = e[0]
 					cp["fraction"] = min(float64(cp["tuples"].(int64))/float64(e[0]), 0.99)

@@ -62,8 +62,11 @@ func TestBaseCopyTargetRestarted(t *testing.T) {
 	}
 	d := baseCopyWithLostTarget(t, "Target restarted", func(t *testing.T, db string) {
 		time.Sleep(2 * time.Second)
-		if out, err := exec.Command("runuser", "-u", "postgres", "--", ctl, "-D", data, "restart", "-m", "fast", "-w").CombinedOutput(); err != nil {
-			t.Fatalf("restarting the target: %v: %s", err, out)
+		// A log file and no pipe: the restarted server would otherwise keep
+		// this process's output open.
+		cmd := exec.Command("runuser", "-u", "postgres", "--", ctl, "-D", data, "-l", data+".log", "restart", "-m", "fast", "-w")
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("restarting the target: %v", err)
 		}
 	})
 	if !strings.Contains(d.LastError, "restarted") || strings.Contains(d.LastError, "did not restart") {

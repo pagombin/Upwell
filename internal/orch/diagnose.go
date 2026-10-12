@@ -51,8 +51,12 @@ func (o *Orchestrator) failureReason(ctx context.Context, m Migration, d Databas
 	}
 	att := time.UnixMilli(started).UTC()
 	if up.After(att) {
+		into := up.Sub(att).Round(time.Minute)
+		if into < time.Minute {
+			into = up.Sub(att).Round(time.Second)
+		}
 		return fmt.Sprintf("%s. The %s's PostgreSQL server restarted at %s UTC, %s into this attempt, which ended every connection: a server restarts like this when it runs out of memory or disk, crashes, or fails over. Check the %s cluster's memory and disk metrics and its logs around that time before restarting the copy; fewer table and index jobs reduce the load on it",
-			c.connLostSummary(table), c.connLost, up.UTC().Format("2006-01-02 15:04:05"), up.Sub(att).Round(time.Minute), c.connLost)
+			c.connLostSummary(table), c.connLost, up.UTC().Format("2006-01-02 15:04:05"), into, c.connLost)
 	}
 	return fmt.Sprintf("%s. The %s's PostgreSQL server did not restart (up since %s UTC), so this one connection was closed by something between this droplet and the %s, such as a proxy, a load balancer or a connection limit, or the server ended that one session. pgcopydb does not retry a table, so the copy must restart",
 		c.connLostSummary(table), c.connLost, up.UTC().Format("2006-01-02 15:04:05"), c.connLost)

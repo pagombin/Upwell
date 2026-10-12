@@ -1,5 +1,14 @@
 # Upwell overnight build: progress
 
+## Base copy lost its target connection again (2026-10-12), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| The failure showed pgcopydb's last error ("Failed to close snapshot") instead of the lost target connection | done (D78) | `TestBaseCopyTargetConnectionClosed` failed before ("Sub-process ... exited with code 12") and passes |
+| Whether the target restarted was unknown | done (D78) | `TestBaseCopyTargetRestarted`, `TestBaseCopyTargetConnectionClosed` |
+| `split_tables_larger_than = auto` documented but never applied | done (D78) | `TestAutoSplit`, `TestPlanSplitResume`, `TestSplitTablesGO`, `TestCopyProgressSplitTable` |
+| Why the Advanced target closed the connection on the droplet | needs the target's logs | the cluster's metrics and logs around 2026-10-12 18:09:17 UTC and 2026-10-11 00:51:16 UTC |
+
 ## Base copy display and architecture (2026-10-12), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |

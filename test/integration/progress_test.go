@@ -87,3 +87,55 @@ func TestCopyProgressHasAFraction(t *testing.T) {
 	}
 	fmt.Printf("fraction %.3f\n", f)
 }
+
+// D78: a table copied in parts (two COPYs into it at once) is one row, with
+// its fraction from the target's table size against the source's.
+func TestCopyProgressSplitTable(t *testing.T) {
+	db := uniq("it_progsplit")
+	exec1(t, srcConn, "defaultdb", "CREATE DATABASE "+db)
+	exec1(t, dstConn, "defaultdb", "CREATE DATABASE "+db)
+	defer dropDB(t, db)
+	exec1(t, srcConn, db, `CREATE TABLE big(id bigint PRIMARY KEY, v text); INSERT INTO big SELECT g, repeat('x', 200) FROM generate_series(1,40000) g; ANALYZE big`)
+	exec1(t, dstConn, db, `CREATE TABLE big(id bigint, v text)`)
+	ctx, cancel := context.WithCancel(context.Background())
+	var dones []chan struct{}
+	defer func() {
+		cancel()
+		for _, d := range dones {
+			<-d
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		conn, err := pg.Connect(context.Background(), dstConn.WithDB(db), 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		dones = append(dones, done)
+		go func() {
+			defer close(done)
+			defer conn.Close(context.Background())
+			_, _ = conn.PgConn().CopyFrom(ctx, &slowText{max: 20000, pause: 5 * time.Millisecond}, "COPY big(id, v) FROM STDIN")
+		}()
+	}
+	var got map[string]any
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && got == nil {
+		p := pgpack.CopyProgress(context.Background(), srcConn.WithDB(db), dstConn.WithDB(db))
+		if cs, _ := p["copies"].([]map[string]any); len(cs) == 1 {
+			if n, _ := cs[0]["parts"].(int64); n == 2 {
+				if f, _ := cs[0]["fraction"].(float64); f > 0 {
+					got = cs[0]
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if got == nil {
+		t.Fatal("no single row with 2 parts and a size-based fraction")
+	}
+	t.Logf("split progress row: %v", got)
+	if f := got["fraction"].(float64); f >= 1 {
+		t.Fatalf("fraction %v", f)
+	}
+}
