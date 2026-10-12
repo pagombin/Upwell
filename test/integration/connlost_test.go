@@ -27,16 +27,20 @@ func baseCopyWithLostTarget(t *testing.T, name string, cut func(t *testing.T, db
 	e.preflight(id)
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
 	e.waitDBState(id, db, time.Minute, orch.DBaseCopy)
-	e.waitFor(time.Minute, "a COPY into public.orders on the target", func() bool {
-		return q(t, dstConn, db, `SELECT count(*) FROM pg_stat_progress_copy WHERE relid::regclass::text IN ('orders', 'public.orders')`) != "0"
+	// Whichever table is being copied (under load the orders COPY can start
+	// or end between two samples).
+	var table string
+	e.waitFor(3*time.Minute, "a COPY on the target", func() bool {
+		table = q(t, dstConn, db, `SELECT COALESCE((SELECT format('%I.%I', n.nspname, c.relname) FROM pg_stat_progress_copy p JOIN pg_class c ON c.oid = p.relid JOIN pg_namespace n ON n.oid = c.relnamespace ORDER BY p.tuples_processed LIMIT 1), '')`)
+		return table != ""
 	})
 	cut(t, db)
 	d := e.waitDBState(id, db, 3*time.Minute, orch.DRestartRequired, orch.DFailed)
-	t.Logf("%s: %s", d.State, d.LastError)
+	t.Logf("%s (copying %s when cut): %s", d.State, table, d.LastError)
 	if strings.Contains(d.LastError, "Failed to close snapshot") && !strings.Contains(d.LastError, "connection to the target") {
 		t.Fatalf("the reason is pgcopydb's last error, not the lost connection: %s", d.LastError)
 	}
-	for _, want := range []string{"connection to the target was closed", "public.orders"} {
+	for _, want := range []string{"connection to the target was closed", "while copying public."} {
 		if !strings.Contains(d.LastError, want) {
 			t.Fatalf("the reason lacks %q: %s", want, d.LastError)
 		}
@@ -47,7 +51,7 @@ func baseCopyWithLostTarget(t *testing.T, name string, cut func(t *testing.T, db
 
 func TestBaseCopyTargetConnectionClosed(t *testing.T) {
 	d := baseCopyWithLostTarget(t, "Target connection closed", func(t *testing.T, db string) {
-		superSQL(t, dstPort, db, `SELECT pg_terminate_backend(pid) FROM pg_stat_progress_copy WHERE relid::regclass::text IN ('orders', 'public.orders')`)
+		superSQL(t, dstPort, db, `SELECT pg_terminate_backend(pid) FROM pg_stat_progress_copy`)
 	})
 	if !strings.Contains(d.LastError, "did not restart") {
 		t.Fatalf("the reason does not say the target kept running: %s", d.LastError)
