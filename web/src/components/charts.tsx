@@ -75,6 +75,7 @@ export function TimeChart({ series, height = 180, fmt, title, from, to, empty, t
   const tipLeft = inRange ? Math.min(width - 200, Math.max(0, x(ts!) + 12)) : 0;
   return (
     <div className="stack" style={{ gap: 6 }}>
+      <h4 className="charttitle">{title}</h4>
       <div className="legend" aria-hidden={series.length === 0}>
         {series.map((s, i) => <span key={s.name} title={s.name}><i style={{ background: color(i) }} /><span className="trunc">{s.name}</span></span>)}
         {threshold && <span><i style={{ background: "var(--crit)" }} />{threshold.label}</span>}

@@ -1,4 +1,4 @@
-import { expect, test, totp } from "./helpers";
+import { expect, ids, test, totp } from "./helpers";
 
 // The overnight items, each driven through the browser end to end. dev/e2e.sh
 // runs these after the walkthrough, against migrations it prepared.
@@ -233,4 +233,33 @@ test("TLS: check, install and roll back an uploaded certificate", async ({ page 
   await page.getByRole("button", { name: "Roll back to the previous certificate" }).click();
   await page.getByRole("dialog", { name: "Roll back the certificate" }).getByRole("button", { name: "Roll back" }).click();
   await expect(page.locator("dl.kv")).not.toContainText("upwell-e2e.local");
+});
+
+test("database page during a base copy: per-table progress and named charts", async ({ page }) => {
+  // The droplet (2026-10-12): the bars stayed empty (COPY FROM STDIN reports
+  // no total) and the charts had no titles, so "No data yet" said nothing.
+  const I = await ids(page.request);
+  const db = I.db;
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}/databases/${db}`, async (r) => {
+    const real = await (await r.fetch()).json();
+    real.database.state = "base_copy";
+    real.copy_progress = {
+      copies: [
+        { table: "stock3", bytes: 7.1 * 2 ** 30, bytes_total: 0, tuples: 24_900_000, rows_estimate: 47_000_000, fraction: 24.9 / 47, source_bytes: 14 * 2 ** 30 },
+        { table: "history1", bytes: 1024, bytes_total: 0, tuples: 10 },
+      ],
+      indexes: [],
+    };
+    await r.fulfill({ json: real });
+  });
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}/metrics`, (r) => r.fulfill({ json: [] }));
+  await page.goto(`/migrations/${I.mig}/databases/${db}`);
+  const card = page.locator(".card", { has: page.getByRole("heading", { name: "Base copy in progress" }) });
+  await expect(card.getByRole("progressbar", { name: "stock3 copy" })).toHaveAttribute("aria-valuenow", "53");
+  await expect(card.getByText("of about 47.0 M rows · 53%", { exact: false })).toBeVisible();
+  await expect(card.getByText("No row estimate on the source")).toBeVisible();
+  for (const name of ["Copied to the target", "Slot retained WAL", "Backlog", "Replay rate", "Heartbeat latency"]) {
+    await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  }
+  await expect(page.getByText("Measured once the base copy has finished and the engine applies changes.").first()).toBeVisible();
 });

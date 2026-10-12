@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Upwell architecture</title>
+<!-- Source of docs/architecture.png. Render with: dev/render-architecture.sh -->
+<style>
+  :root { --ink:#1b2430; --muted:#5b6675; --line:#c9d1dc; --panel:#f5f7fa; --panel2:#eef2f7; --blue:#2f6fde; --orange:#d9771e; --grey:#7a8594; --green:#2e8b57; }
+  html, body { margin:0; background:#ffffff; }
+  body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  svg text { font-family: inherit; }
+  .t  { font-size:15px; font-weight:600; fill:var(--ink); }
+  .h  { font-size:19px; font-weight:700; fill:var(--ink); }
+  .s  { font-size:13px; fill:var(--muted); }
+  .m  { font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace; font-size:12.5px; fill:var(--ink); }
+  .box { fill:#fff; stroke:var(--line); stroke-width:1.4; }
+  .panel { fill:var(--panel); stroke:var(--line); stroke-width:1.4; }
+  .panel2 { fill:var(--panel2); stroke:var(--line); stroke-width:1.2; }
+  .cluster { fill:#fff; stroke:var(--ink); stroke-width:1.6; }
+  .blue { stroke:var(--blue); fill:none; stroke-width:3; }
+  .orange { stroke:var(--orange); fill:none; stroke-width:3; }
+  .ctl { stroke:var(--grey); fill:none; stroke-width:1.6; stroke-dasharray:6 5; }
+  .user { stroke:var(--ink); fill:none; stroke-width:1.8; }
+  .lb { font-size:13px; font-weight:600; }
+</style>
+</head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" width="1640" height="1230" viewBox="0 0 1640 1230">
+  <defs>
+    <marker id="aBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fde"/></marker>
+    <marker id="aOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d9771e"/></marker>
+    <marker id="aGrey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7a8594"/></marker>
+    <marker id="aInk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1b2430"/></marker>
+  </defs>
+  <text x="30" y="44" class="h" style="font-size:24px">Upwell architecture</text>
+  <text x="30" y="70" class="s">One droplet runs pgcopydb for each database, watches it, and decides GO or NO-GO from its own comparison of the data.</text>
+<rect x="400" y="100" width="300" height="74" rx="8" class="box"/>
+<text x="414" y="124" class="t">Operator's browser</text>
+<text x="414" y="146" class="s">Wizard, progress, logs, cutover, reports</text>
+<rect x="940" y="100" width="300" height="74" rx="8" class="box"/>
+<text x="954" y="124" class="t">Prometheus (optional)</text>
+<text x="954" y="146" class="s">Scrapes /metrics with an API token</text>
+<rect x="380" y="214" width="880" height="996" rx="16" class="panel"/>
+<text x="404" y="246" class="h">Upwell droplet</text>
+<text x="680" y="246" class="s">Ubuntu 24.04, installed by deploy/install.sh; ufw allows SSH and HTTPS only</text>
+<rect x="400" y="262" width="840" height="392" rx="12" class="box"/>
+<text x="418" y="290" class="t">upwell.service</text>
+<text x="680" y="290" class="s">one Go binary, systemd watchdog, runs as the upwell user</text>
+<rect x="412" y="304" width="256" height="86" rx="8" class="panel2"/>
+<text x="426" y="328" class="t">HTTPS API and UI</text>
+<text x="426" y="350" class="s">React UI embedded, port 443,</text>
+<text x="426" y="369" class="s">live updates over SSE</text>
+<rect x="692" y="304" width="256" height="86" rx="8" class="panel2"/>
+<text x="706" y="328" class="t">Access</text>
+<text x="706" y="350" class="s">Viewer, Operator and Admin;</text>
+<text x="706" y="369" class="s">TOTP, API tokens, audit log</text>
+<rect x="972" y="304" width="256" height="86" rx="8" class="panel2"/>
+<text x="986" y="328" class="t">Preflight</text>
+<text x="986" y="350" class="s">50+ checks before the start;</text>
+<text x="986" y="369" class="s">a check that cannot run blocks</text>
+<rect x="412" y="402" width="256" height="124" rx="8" class="panel2"/>
+<text x="426" y="426" class="t">Orchestrator</text>
+<text x="426" y="448" class="s">Scheduler; supervisor every 10 s;</text>
+<text x="426" y="467" class="s">automatic resume and restart;</text>
+<text x="426" y="486" class="s">run lock and queue; extensions</text>
+<text x="426" y="505" class="s">settled at every launch</text>
+<rect x="692" y="402" width="256" height="124" rx="8" class="panel2"/>
+<text x="706" y="426" class="t">Cutover</text>
+<text x="706" y="448" class="s">Writers stopped or write freeze,</text>
+<text x="706" y="467" class="s">final heartbeat, end positions,</text>
+<text x="706" y="486" class="s">drain, sequence sync; offline</text>
+<text x="706" y="505" class="s">mode's one-time copy</text>
+<rect x="972" y="402" width="256" height="124" rx="8" class="panel2"/>
+<text x="986" y="426" class="t">Verification</text>
+<text x="986" y="448" class="s">Schema, exact counts, checksums,</text>
+<text x="986" y="467" class="s">sequences, origin position,</text>
+<text x="986" y="486" class="s">writes stopped: GO or NO-GO;</text>
+<text x="986" y="505" class="s">never trusts the engine's success</text>
+<rect x="412" y="538" width="256" height="104" rx="8" class="panel2"/>
+<text x="426" y="562" class="t">Collector and alerts</text>
+<text x="426" y="584" class="s">Sizes, slot WAL, backlog, replay,</text>
+<text x="426" y="603" class="s">heartbeat, apply watchdog,</text>
+<text x="426" y="622" class="s">disk guard, host metrics</text>
+<rect x="692" y="538" width="256" height="104" rx="8" class="panel2"/>
+<text x="706" y="562" class="t">Store and secrets</text>
+<text x="706" y="584" class="s">SQLite store.db: migrations,</text>
+<text x="706" y="603" class="s">metrics, events; master.key</text>
+<text x="706" y="622" class="s">encrypts stored passwords</text>
+<rect x="972" y="538" width="256" height="104" rx="8" class="panel2"/>
+<text x="986" y="562" class="t">Reports</text>
+<text x="986" y="584" class="s">HTML, Markdown and PDF,</text>
+<text x="986" y="603" class="s">with the verification evidence</text>
+<text x="986" y="622" class="s">and a post-cutover checklist</text>
+<rect x="400" y="706" width="840" height="300" rx="12" class="box"/>
+<text x="418" y="734" class="t">upwell-eng@&lt;migration&gt;-&lt;database&gt;.service</text>
+<text x="818" y="734" class="s">one unit per database: pgcopydb 0.18 clone --follow</text>
+<rect x="420" y="750" width="800" height="76" rx="8" class="panel2" style="stroke:#2f6fde"/>
+<text x="434" y="774" class="t" style="fill:#2f6fde">Base copy</text>
+<text x="434" y="796" class="s">COPY workers stream every table from the source to the target through memory, from one consistent snapshot;</text>
+<text x="434" y="815" class="s">CREATE INDEX workers build indexes and constraints afterwards. No table rows are written to the droplet's disk.</text>
+<rect x="420" y="840" width="800" height="152" rx="8" class="panel2" style="stroke:#d9771e"/>
+<text x="434" y="864" class="t" style="fill:#d9771e">Change streaming (CDC)</text>
+<rect x="450" y="878" width="140" height="40" rx="6" class="box"/>
+<text x="520" y="903" class="m" text-anchor="middle">receive</text>
+<rect x="640" y="878" width="140" height="40" rx="6" class="box"/>
+<text x="710" y="903" class="m" text-anchor="middle">transform</text>
+<rect x="830" y="878" width="140" height="40" rx="6" class="box"/>
+<text x="900" y="903" class="m" text-anchor="middle">apply</text>
+<path d="M590,898 L636,898" class="orange" marker-end="url(#aOrange)"/>
+<path d="M780,898 L826,898" class="orange" marker-end="url(#aOrange)"/>
+<text x="482" y="942" class="s">receive decodes the slot's changes from the snapshot onward,</text>
+<text x="482" y="961" class="s">for the whole base copy. apply waits for the base copy to end,</text>
+<text x="482" y="980" class="s">then replays them in commit order and moves the target's origin.</text>
+<rect x="400" y="1022" width="840" height="172" rx="12" class="box" style="stroke:#d9771e;stroke-dasharray:5 4"/>
+<text x="418" y="1050" class="t">Work directory on the droplet's disk</text>
+<text x="700" y="1050" class="m">/var/lib/upwell/runs/&lt;instance&gt;/</text>
+<text x="418" y="1078" class="m">clone/cdc/*-output.db</text><text x="660" y="1078" class="s">decoded changes, written from the start of the base copy</text>
+<text x="418" y="1102" class="m">clone/cdc/*-replay.db</text><text x="660" y="1102" class="s">the same changes as SQL to apply (both together: about 2x the change volume)</text>
+<text x="418" y="1126" class="m">clone/schema/schema.dump</text><text x="660" y="1126" class="s">the schema only</text>
+<text x="418" y="1150" class="m">engine.log, filters.ini</text><text x="660" y="1150" class="s">engine log and the schemas left out of the copy</text>
+<text x="418" y="1176" class="s">Everything here stays until Clean up. Preflight estimates its size; an alert fires at 85% use and the disk guard stops the largest copy at 95%.</text>
+<rect x="30" y="262" width="310" height="440" rx="14" class="cluster"/>
+<text x="50" y="294" class="h">Source cluster</text>
+<text x="50" y="316" class="s">DigitalOcean Standard PostgreSQL</text>
+<text x="50" y="360" class="t">Databases being migrated</text>
+<text x="50" y="382" class="s">online and writable until cutover</text>
+<text x="50" y="420" class="t">Publication and logical slot</text>
+<text x="50" y="442" class="m">upwell_&lt;id&gt;_&lt;database&gt;</text>
+<text x="50" y="462" class="s">keeps WAL until the engine confirms it</text>
+<text x="50" y="500" class="t">upwell.heartbeat</text>
+<text x="50" y="522" class="s">rows that prove changes arrive</text>
+<text x="50" y="560" class="t">Not copied</text>
+<text x="50" y="582" class="s">aiven_extras, the provider's own</text>
+<text x="50" y="601" class="s">management extension</text>
+<rect x="1300" y="262" width="310" height="440" rx="14" class="cluster"/>
+<text x="1320" y="294" class="h">Target cluster</text>
+<text x="1320" y="316" class="s">DigitalOcean Advanced PostgreSQL</text>
+<text x="1320" y="360" class="t">Copied databases</text>
+<text x="1320" y="382" class="s">created with the source's collation</text>
+<text x="1320" y="420" class="t">Replication origin</text>
+<text x="1320" y="442" class="m">upwell_&lt;id&gt;_&lt;database&gt;</text>
+<text x="1320" y="462" class="s">the position applied so far</text>
+<text x="1320" y="500" class="t">Apply privileges for doadmin</text>
+<text x="1320" y="522" class="s">session_replication_role and the</text>
+<text x="1320" y="541" class="s">replication origin functions</text>
+<path d="M600,174 L600,300" class="user" marker-end="url(#aInk)"/><text x="592" y="196" class="lb" text-anchor="end">HTTPS</text>
+<path d="M1090,174 L1090,200 L640,200 L640,300" class="user" marker-end="url(#aInk)"/><text x="1100" y="192" class="lb">/metrics</text>
+<path d="M400,350 L344,350" class="ctl" marker-end="url(#aGrey)"/><text x="348" y="340" class="lb" style="fill:#7a8594" text-anchor="start"></text>
+<path d="M1240,350 L1296,350" class="ctl" marker-end="url(#aGrey)"/>
+<text x="58" y="660" class="lb" style="fill:#7a8594">SQL from upwell.service: preflight,</text><text x="58" y="680" class="lb" style="fill:#7a8594">monitoring, heartbeat, verification</text>
+<text x="1320" y="660" class="lb" style="fill:#7a8594">SQL from upwell.service: preflight,</text><text x="1320" y="680" class="lb" style="fill:#7a8594">monitoring, verification</text>
+<path d="M820,654 L820,702" class="ctl" marker-end="url(#aGrey)"/><text x="830" y="684" class="lb" style="fill:#7a8594">starts, stops and observes each unit (polkit rule)</text>
+<path d="M340,371 L372,371 L372,788 L416,788" class="blue" marker-end="url(#aBlue)"/>
+<path d="M1220,788 L1272,788 L1272,371 L1296,371" class="blue" marker-end="url(#aBlue)"/>
+<path d="M340,440 L356,440 L356,898 L446,898" class="orange" marker-end="url(#aOrange)"/>
+<path d="M970,898 L1288,898 L1288,440 L1296,440" class="orange" marker-end="url(#aOrange)"/>
+<path d="M462,918 L462,1018" class="orange" marker-end="url(#aOrange)"/>
+<path d="M958,1018 L958,922" class="orange" marker-end="url(#aOrange)"/>
+<rect x="30" y="760" width="310" height="230" rx="10" class="box"/>
+<text x="48" y="790" class="t">How data moves</text>
+<path d="M48,820 L100,820" class="blue" marker-end="url(#aBlue)"/><text x="112" y="825" class="s">Base copy: rows streamed</text><text x="112" y="844" class="s">through memory, not staged</text>
+<path d="M48,870 L100,870" class="orange" marker-end="url(#aOrange)"/><text x="112" y="875" class="s">Changes: staged on disk,</text><text x="112" y="894" class="s">then applied in order</text>
+<path d="M48,920 L100,920" class="ctl" marker-end="url(#aGrey)"/><text x="112" y="925" class="s">Upwell's own SQL and its</text><text x="112" y="944" class="s">control of the engine</text>
+<path d="M48,966 L100,966" class="user" marker-end="url(#aInk)"/><text x="112" y="971" class="s">People and tools</text>
+<rect x="1300" y="760" width="310" height="230" rx="10" class="box"/>
+<text x="1318" y="790" class="t">Where the time goes</text>
+<text x="1318" y="816" class="s">The base copy runs at the speed of</text>
+<text x="1318" y="837" class="s">COPY between the clusters. Changes</text>
+<text x="1318" y="858" class="s">made meanwhile wait on the droplet</text>
+<text x="1318" y="879" class="s">and are applied after it; pgcopydb</text>
+<text x="1318" y="900" class="s">0.18 applies a few transactions a</text>
+<text x="1318" y="921" class="s">second (F11), so the backlog drains</text>
+<text x="1318" y="942" class="s">slowly after a long copy.</text>
+</svg>
+</body>
+</html>

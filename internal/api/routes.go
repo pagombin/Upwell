@@ -1257,10 +1257,9 @@ func (s *Server) getDB(w http.ResponseWriter, r *http.Request) error {
 	detail := map[string]any{"migration": m, "database": d, "attempts": attempts, "live": live, "unit": unit, "unit_name": s.Orch.Runner().UnitName(d.Instance), "now": store.Now()}
 	// Active COPY and index builds on the target (cheap, timeout-bounded).
 	if src, dst, err := s.Orch.Conns(ctx, m); err == nil && d.State == orch.DBaseCopy {
-		_ = src
-		cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 		defer cancel()
-		detail["copy_progress"] = pgpack.CopyProgress(cctx, dst.WithDB(d.TargetName))
+		detail["copy_progress"] = pgpack.CopyProgress(cctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
 	}
 	return writeJSON(w, 200, detail)
 }

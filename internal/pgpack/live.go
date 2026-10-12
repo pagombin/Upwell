@@ -8,7 +8,13 @@ import (
 )
 
 // CopyProgress lists active COPY and CREATE INDEX work on a target database.
-func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
+// pgcopydb copies with COPY FROM STDIN, for which pg_stat_progress_copy
+// reports bytes_total = 0, so each copy's fraction comes from the source
+// table's estimated row count (pg_class.reltuples, kept by ANALYZE and
+// autovacuum): rows_estimate and fraction are absent when the source has no
+// estimate. The fraction is capped below 1 while the COPY runs, because an
+// estimate can be low.
+func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 	out := map[string]any{"copies": []any{}, "indexes": []any{}}
 	conn, err := pg.Connect(ctx, c, 3*time.Second)
 	if err != nil {
@@ -17,6 +23,7 @@ func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
 	}
 	defer conn.Close(ctx)
 	copies := []map[string]any{}
+	var names []string
 	rows, err := pg.Query(ctx, conn, `SELECT COALESCE(p.relid::regclass::text, '?'), p.bytes_processed, p.bytes_total, p.tuples_processed FROM pg_stat_progress_copy p WHERE p.datname=current_database()`)
 	if err == nil {
 		for rows.Next() {
@@ -24,8 +31,36 @@ func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
 			var done, total, tuples int64
 			_ = rows.Scan(&rel, &done, &total, &tuples)
 			copies = append(copies, map[string]any{"table": rel, "bytes": done, "bytes_total": total, "tuples": tuples})
+			names = append(names, rel)
 		}
 		rows.Close()
+	}
+	if len(names) > 0 {
+		if sc, err := pg.Connect(ctx, src, 3*time.Second); err == nil {
+			est := map[string][2]int64{}
+			if r, err := pg.Query(ctx, sc, `SELECT c.oid::regclass::text, c.reltuples::bigint, pg_table_size(c.oid) FROM pg_class c WHERE c.oid::regclass::text = ANY($1)`, names); err == nil {
+				for r.Next() {
+					var n string
+					var tup, size int64
+					if r.Scan(&n, &tup, &size) == nil {
+						est[n] = [2]int64{tup, size}
+					}
+				}
+				r.Close()
+			}
+			sc.Close(ctx)
+			for _, cp := range copies {
+				e, ok := est[cp["table"].(string)]
+				if !ok {
+					continue
+				}
+				cp["source_bytes"] = e[1]
+				if e[0] > 0 { // -1: never analyzed
+					cp["rows_estimate"] = e[0]
+					cp["fraction"] = min(float64(cp["tuples"].(int64))/float64(e[0]), 0.99)
+				}
+			}
+		}
 	}
 	idx := []map[string]any{}
 	rows, err = pg.Query(ctx, conn, `SELECT COALESCE(p.index_relid::regclass::text, p.relid::regclass::text), p.phase, p.blocks_done, p.blocks_total, p.tuples_done, p.tuples_total FROM pg_stat_progress_create_index p WHERE p.datname=current_database()`)

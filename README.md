@@ -4,6 +4,17 @@ Upwell is a migration console for moving PostgreSQL databases between DigitalOce
 
 **Status: demo build, not GA.** It covers Phases 1 to 3 of [the spec](docs/spec.md) as a vertical slice, plus the Phase 4 pieces needed to install it and survive restarts. [`docs/PROGRESS.md`](docs/PROGRESS.md) has the item-by-item status; [`docs/DECISIONS.md`](docs/DECISIONS.md) records every decision made while building it.
 
+## Architecture
+
+![Upwell architecture: the operator's browser and Prometheus talk to upwell.service on the droplet; upwell.service checks both clusters with SQL and starts one pgcopydb unit per database; the base copy streams rows from the source to the target through memory, while changes are decoded from the source's slot, staged in the work directory on the droplet's disk, and applied to the target after the base copy](docs/architecture.png)
+
+Upwell is one Go binary (`upwell.service`, with the UI embedded) plus one systemd unit per database being copied (`upwell-eng@<migration>-<database>.service`, running pgcopydb). Upwell never moves data itself: it checks both clusters, starts and supervises the engine, and at cutover compares the data with its own queries to decide GO or NO-GO. The diagram's source is [`docs/architecture/architecture.html`](docs/architecture/architecture.html); `dev/render-architecture.sh` renders it.
+
+**What is stored on the droplet.**
+
+- **Base copy: nothing.** Each table is read with `COPY ... TO STDOUT` on the source and written with `COPY ... FROM STDIN` on the target by the same pgcopydb process, so rows pass through memory only. Only the schema dump (no data) is written to disk.
+- **Changes (CDC): yes, staged on disk.** From the moment the base copy starts, pgcopydb decodes the source's changes from its replication slot into `/var/lib/upwell/runs/<instance>/clone/cdc/` (`*-output.db`), converts them to SQL (`*-replay.db`), and applies them only after the base copy has finished. Both files together take about twice the volume of the changes (measured locally: 274 MB for 120 MB of new rows), they grow for the whole migration, and they are removed by Clean up, not after they are applied. Preflight's `staging_space` check estimates the room needed, the Host screen shows the staging size, a critical alert fires when the work volume reaches 85% (`alert_disk_crit_pct`), and the disk guard stops the database with the largest staging at 95% (`disk_guard_stop_pct`). A source that writes a lot during a long base copy therefore needs a large work volume, and its backlog takes a while to drain afterwards (see F11 below).
+
 ## What works and what is stubbed
 
 **Works**
@@ -15,7 +26,6 @@ Upwell is a migration console for moving PostgreSQL databases between DigitalOce
 - Automatic recovery: transient failures resume with backoff; the engine being killed, the app restarting and the droplet rebooting are reconciled; a failed base copy or a lost slot goes to Restart required with a diagnosis.
 - A cutover console with manual stop-writes or an optional **write freeze** (with a preview of exactly what it runs and ends, an audit entry, automatic undo when the cutover does not end GO, and an always-available undo button), in both cases Upwell sampling the source to confirm writes really stopped, a write-pause timer, drain, sequence sync and **verification that compares data**, ending in GO or NO-GO.
 - An HTML and Markdown report, cleanup of slots, publications, origins, the heartbeat schema, work files and stored credentials, and alerts, events, logs, host metrics and system health screens.
-
 - Offline migrations (writes stopped first, confirmed or frozen; one copy; verification), a TOTP second factor with recovery codes (required for Admins by default), read-only API tokens, a Prometheus `/metrics` endpoint, a redacted support bundle with a preview, a run lock with a queue (reorder, unqueue, optional auto-start), PDF reports rendered on the droplet, watched tables with exact counts on both sides, saved log views, network throughput on the Host screen, and TLS certificate upload with rollback.
 
 **Stubbed** (labelled "Coming soon" in the UI; nothing does nothing silently): DigitalOcean API discovery (enter connection details by hand) and notifications (Slack, email, PagerDuty). **Not in this build** (no UI at all, since each needs an external service or was out of scope): SSO, update checks, offline install bundles, and self-serve mode.
@@ -27,7 +37,6 @@ On a fresh Ubuntu 24.04 droplet (2 vCPU and 4 GB is enough for a test; give the 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/pagombin/Upwell.git && cd Upwell
-git checkout overnight-build
 sudo bash deploy/install.sh
 ```
 
@@ -52,7 +61,7 @@ Useful variants: `--check` prints what would change and changes nothing; `--bina
 
 You need a source and a target PostgreSQL cluster that this droplet can reach.
 
-**Option A: two DigitalOcean managed clusters.** Add the droplet to both clusters' trusted sources. The target's `doadmin` must be able to apply replicated changes. Phase 0 found that pgcopydb needs EXECUTE on the `pg_replication_origin_*` functions and SET on `session_replication_role` (finding F1), and whether an Advanced cluster's `doadmin` has them is not yet confirmed. Preflight checks this (`target_apply_privileges`, a hard blocker) and the connection test shows it, so you will know before anything is copied.
+**Option A: two DigitalOcean managed clusters.** Add the droplet to both clusters' trusted sources. The target's `doadmin` must be able to apply replicated changes. Phase 0 found that pgcopydb needs EXECUTE on the `pg_replication_origin_*` functions and SET on `session_replication_role` (finding F1). On the first droplet test (October 2026) the Advanced cluster's `doadmin` did not have them until the grant script was run on the target; preflight reported it as a hard blocker until then, and as passing afterwards. Preflight checks this (`target_apply_privileges`) and the connection test shows it, so you will know before anything is copied; the check's evidence has the grant script.
 
 **Option B: two local clusters on the droplet** that mimic the pair (a non-superuser `doadmin` with REPLICATION on the source; a non-superuser `doadmin` with the apply privileges on the target):
 
@@ -66,7 +75,7 @@ Then:
 
 1. **Create test data** on the source: `dev/demo-data.sh create 'postgresql://doadmin:PASSWORD@HOST:PORT/defaultdb?sslmode=require' 200000` creates a `shop` database with about 600,000 rows.
 2. **New migration** (left rail). Step 1: fill in the permission record (any test values). Steps 2 and 3: enter the source and target, press **Test connection** on each; every line should be green. Step 4: include `shop` only. Step 5: keep the defaults (heartbeat on). Step 6: **Run preflight**; it should end with no blockers. Step 7: read the engine command, tick that you reviewed the warnings, and press **Start migration**.
-3. **Watch it.** The overview shows the base copy, then Catch-up, then In sync. Open the database for its charts, attempts and logs; **Logs** shows everything live.
+3. **Watch it.** The overview shows the base copy, then Catch-up, then In sync. Open the database for its charts, attempts and logs; **Logs** shows everything live. During the base copy the database page lists each table being copied with a bar (rows copied against the source's estimated row count) and the indexes being built; its **Copied to the target** and **Slot retained WAL** charts fill from the start, while **Backlog**, **Replay rate** and **Heartbeat latency** start once the base copy has finished and changes are being applied. Slot retained WAL rises and falls while the engine works: the source keeps WAL for the slot until the engine confirms it has received it, and WAL is cluster-wide, so writes in other databases on the source count too.
 4. **Keep writing** while it streams: `dev/demo-data.sh write 'postgresql://...source.../defaultdb?sslmode=require'` inserts 200 orders a second.
 5. **Stop and resume** one database: open it and press **Stop** (it stops within about 10 seconds and keeps its slot), then **Resume**. It returns to In sync with nothing lost.
 6. **Cut over.** Stop the writer (Ctrl+C), open **Cutover**, wait until every readiness condition is green, press **Start the cutover** and confirm that writers are stopped. Upwell checks that writes really stopped, writes a final heartbeat, waits for it on the target, sets each end position, drains, checks the target's replication origin, syncs sequences and compares the data. Watch the steps and the write-pause timer.
@@ -119,6 +128,7 @@ The verdict is decided per database and the migration is GO only if every databa
 - **Logs:** in the UI under **Logs** (live, searchable, downloadable). On the droplet: `journalctl -u upwell -f`, `/var/log/upwell/app.log`, engine logs in `/var/lib/upwell/runs/<instance>/engine.log`, installer log in `/var/log/upwell/install.log`.
 - **Config and keys:** `/etc/upwell/config.yaml`, `/etc/upwell/master.key` (back it up; stored passwords cannot be decrypted without it), `/etc/upwell/tls/`.
 - **Data:** `/var/lib/upwell/store.db` (SQLite).
+- **Architecture:** [`docs/architecture.png`](docs/architecture.png), drawn from [`docs/architecture/architecture.html`](docs/architecture/architecture.html).
 - **Screenshots:** [`docs/screenshots/`](docs/screenshots/), every screen at 1440 and 1280 pixels wide in dark and light.
 - **Status and decisions:** [`docs/PROGRESS.md`](docs/PROGRESS.md), [`docs/DECISIONS.md`](docs/DECISIONS.md), [`docs/phase0/findings.md`](docs/phase0/findings.md), [`docs/spec.md`](docs/spec.md).
 
@@ -129,7 +139,8 @@ go build ./cmd/upwell                      # the UI in internal/webui/dist is em
 (cd web && npm ci && npm run build)        # rebuild the UI after changing web/src
 go test ./...                              # unit tests
 sudo bash spikes/env/local-clusters.sh up  # local source and target for the suites below
-go test -tags integration -timeout 60m ./test/integration/   # API, data-safety and fault tests
+go test -tags integration -timeout 180m ./test/integration/  # API, data-safety and fault tests (about 80 minutes)
+# TestVersionMatrix also uses PostgreSQL 14, 15 and 18 targets when they run (see spikes/env/local-clusters.sh)
 dev/e2e.sh                                 # Playwright: screenshots, layout, axe, states, keyboard, CLS
 dev/run.sh start                           # dev server on https://127.0.0.1:8443 (dev/config.dev.yaml)
 ```
