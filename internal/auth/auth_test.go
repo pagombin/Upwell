@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pagombin/upwell/internal/secrets"
 	"github.com/pagombin/upwell/internal/store"
 )
 
@@ -48,7 +49,7 @@ func TestFailedLoginCounterIsAtomic(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, err := s.Login(context.Background(), "alice", "wrong-password-xx", "", ""); !errors.Is(err, ErrBadCredentials) {
+			if _, _, err := s.Login(context.Background(), "alice", "wrong-password-xx", "", "", ""); !errors.Is(err, ErrBadCredentials) {
 				t.Errorf("login: %v", err)
 			}
 		}()
@@ -58,16 +59,16 @@ func TestFailedLoginCounterIsAtomic(t *testing.T) {
 		t.Fatalf("after 7 parallel failures: failed=%d locked=%v", n, locked)
 	}
 	for i := 0; i < 2; i++ {
-		s.Login(context.Background(), "alice", "wrong-password-xx", "", "")
+		s.Login(context.Background(), "alice", "wrong-password-xx", "", "", "")
 	}
-	if _, _, err := s.Login(context.Background(), "alice", "wrong-password-xx", "", ""); !errors.Is(err, ErrLocked) {
+	if _, _, err := s.Login(context.Background(), "alice", "wrong-password-xx", "", "", ""); !errors.Is(err, ErrLocked) {
 		t.Fatalf("10th failure: %v", err)
 	}
 	if _, locked := failedLogins(t, s, u.ID); !locked {
 		t.Fatal("not locked after 10 failures")
 	}
 	// While locked even the right password is refused.
-	if _, _, err := s.Login(context.Background(), "alice", testPW, "", ""); !errors.Is(err, ErrLocked) {
+	if _, _, err := s.Login(context.Background(), "alice", testPW, "", "", ""); !errors.Is(err, ErrLocked) {
 		t.Fatalf("right password while locked: %v", err)
 	}
 }
@@ -81,13 +82,13 @@ func TestDisabledNotRevealedWithoutPassword(t *testing.T) {
 	if err := s.UpdateUser(ctx, u.ID, UserChange{Disabled: &yes}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Login(ctx, "bob", "wrong-password-xx", "", ""); !errors.Is(err, ErrBadCredentials) {
+	if _, _, err := s.Login(ctx, "bob", "wrong-password-xx", "", "", ""); !errors.Is(err, ErrBadCredentials) {
 		t.Fatalf("wrong password on disabled user: %v", err)
 	}
-	if _, _, err := s.Login(ctx, "nobody", "wrong-password-xx", "", ""); !errors.Is(err, ErrBadCredentials) {
+	if _, _, err := s.Login(ctx, "nobody", "wrong-password-xx", "", "", ""); !errors.Is(err, ErrBadCredentials) {
 		t.Fatalf("unknown user: %v", err)
 	}
-	if _, _, err := s.Login(ctx, "bob", testPW, "", ""); !errors.Is(err, ErrDisabled) {
+	if _, _, err := s.Login(ctx, "bob", testPW, "", "", ""); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("right password on disabled user: %v", err)
 	}
 }
@@ -114,12 +115,12 @@ func TestPasswordChangeEndsOtherSessions(t *testing.T) {
 	s := newTestService(t)
 	ctx := context.Background()
 	u, _ := s.CreateUser(ctx, "carol", testPW, RoleViewer)
-	_, keep, err := s.Login(ctx, "carol", testPW, "", "")
+	_, keep, err := s.Login(ctx, "carol", testPW, "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Login(ctx, "carol", testPW, "", "")
-	s.Login(ctx, "carol", testPW, "", "")
+	s.Login(ctx, "carol", testPW, "", "", "")
+	s.Login(ctx, "carol", testPW, "", "", "")
 	if err := s.SetPassword(ctx, u.ID, "another-long-password", keep.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -207,5 +208,59 @@ func TestRateLimiter(t *testing.T) {
 	now = now.Add(6 * time.Second) // one token back
 	if !l.Allow("1.2.3.4") || l.Allow("1.2.3.4") {
 		t.Fatal("refill is not one token per 6s")
+	}
+}
+
+// TestTOTPLockout: wrong second-factor codes count towards the lockout like
+// wrong passwords, and a locked account refuses even a correct code.
+func TestTOTPLockout(t *testing.T) {
+	s := newTestService(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "dora", testPW, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := secrets.LoadOrCreateKey(filepath.Join(t.TempDir(), "key"), true)
+	box, _ := secrets.New(key)
+	s.Vault = &secrets.Vault{Box: box, Store: s.Store}
+	e, err := s.TOTPEnroll(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := TOTPCode(e.Secret, TOTPStep(time.Now()))
+	if _, err := s.TOTPConfirm(ctx, u.ID, c); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 9; i++ {
+		if _, _, err := s.Login(ctx, "dora", testPW, "000000", "", ""); !errors.Is(err, ErrBadOTP) {
+			t.Fatalf("wrong code %d: %v", i, err)
+		}
+	}
+	if _, _, err := s.Login(ctx, "dora", testPW, "000000", "", ""); !errors.Is(err, ErrLocked) {
+		t.Fatalf("tenth wrong code did not lock: %v", err)
+	}
+	next, _ := TOTPCode(e.Secret, TOTPStep(time.Now())+1)
+	if _, _, err := s.Login(ctx, "dora", testPW, next, "", ""); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a locked account accepted a correct code: %v", err)
+	}
+}
+
+// TestAPITokenExpiry: an expired token is refused like a revoked one.
+func TestAPITokenExpiry(t *testing.T) {
+	s := newTestService(t)
+	ctx := context.Background()
+	raw, tok, err := s.CreateAPIToken(ctx, "short", ScopeRead, "admin", 2*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveAPIToken(ctx, raw); err != nil {
+		t.Fatalf("a fresh token: %v", err)
+	}
+	s.Store.DB.ExecContext(ctx, `UPDATE api_tokens SET expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UnixMilli(), tok.ID)
+	if _, err := s.ResolveAPIToken(ctx, raw); !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("an expired token: %v", err)
+	}
+	if _, _, err := s.CreateAPIToken(ctx, "x", "admin", "admin", time.Hour); err == nil {
+		t.Fatal("an unknown scope was accepted")
 	}
 }

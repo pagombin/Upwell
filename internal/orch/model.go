@@ -47,6 +47,7 @@ const (
 	DDegraded        = "degraded"
 	DStopped         = "stopped"
 	DRestartRequired = "restart_required"
+	DCopied          = "copied" // offline: the one-time copy finished
 )
 
 // activeDB states have (or should have) a running engine unit.
@@ -82,6 +83,8 @@ type Flags struct {
 	VerifyRunID      string        `json:"verify_run_id,omitempty"`
 	Verifying        bool          `json:"verifying,omitempty"`
 	CleanupRunning   bool          `json:"cleanup_running,omitempty"`
+	Freeze           *FreezeState  `json:"freeze,omitempty"`
+	Queued           bool          `json:"queued,omitempty"`
 }
 
 // Migration is one migration definition.
@@ -148,40 +151,43 @@ func (p *Permission) Missing() []string {
 
 // Database is one database inside a migration.
 type Database struct {
-	ID           string  `json:"id"`
-	MigrationID  string  `json:"migration_id"`
-	SourceName   string  `json:"source_name"`
-	TargetName   string  `json:"target_name"`
-	Include      bool    `json:"include"`
-	SkipReason   string  `json:"skip_reason,omitempty"`
-	State        string  `json:"state"`
-	SlotName     string  `json:"slot_name"`
-	OriginName   string  `json:"origin_name"`
-	Plugin       string  `json:"plugin,omitempty"`
-	Instance     string  `json:"instance"`
-	SizeBytes    int64   `json:"size_bytes"`
-	RowsEstimate int64   `json:"rows_estimate"`
-	TableCount   int     `json:"table_count"`
-	LastError    string  `json:"last_error,omitempty"`
-	ErrorClass   string  `json:"error_class,omitempty"`
-	InSyncSince  *int64  `json:"in_sync_since,omitempty"`
-	BacklogBytes *int64  `json:"backlog_bytes,omitempty"`
-	ReplayLSN    string  `json:"replay_lsn,omitempty"`
-	WriteLSN     string  `json:"write_lsn,omitempty"`
-	HBBeforeLSN  string  `json:"hb_before_lsn,omitempty"`
-	HBToken      string  `json:"hb_token,omitempty"`
-	EndPos       string  `json:"endpos,omitempty"`
-	OriginLSN    string  `json:"origin_lsn,omitempty"`
-	Verdict      string  `json:"verdict,omitempty"`
-	RetryCount   int     `json:"retry_count"`
-	RetryWindow  *int64  `json:"-"`
-	NextRetryAt  *int64  `json:"next_retry_at,omitempty"`
-	BaseCopyDone bool    `json:"base_copy_done"`
-	Drained      bool    `json:"drained"`
-	AutoRestarts int     `json:"auto_restarts"`
-	CreatedAt    int64   `json:"created_at"`
-	UpdatedAt    int64   `json:"updated_at"`
-	Progress     float64 `json:"progress,omitempty"`
+	ID           string `json:"id"`
+	MigrationID  string `json:"migration_id"`
+	SourceName   string `json:"source_name"`
+	TargetName   string `json:"target_name"`
+	Include      bool   `json:"include"`
+	SkipReason   string `json:"skip_reason,omitempty"`
+	State        string `json:"state"`
+	SlotName     string `json:"slot_name"`
+	OriginName   string `json:"origin_name"`
+	Plugin       string `json:"plugin,omitempty"`
+	Instance     string `json:"instance"`
+	SizeBytes    int64  `json:"size_bytes"`
+	RowsEstimate int64  `json:"rows_estimate"`
+	TableCount   int    `json:"table_count"`
+	LastError    string `json:"last_error,omitempty"`
+	ErrorClass   string `json:"error_class,omitempty"`
+	InSyncSince  *int64 `json:"in_sync_since,omitempty"`
+	BacklogBytes *int64 `json:"backlog_bytes,omitempty"`
+	ReplayLSN    string `json:"replay_lsn,omitempty"`
+	WriteLSN     string `json:"write_lsn,omitempty"`
+	HBBeforeLSN  string `json:"hb_before_lsn,omitempty"`
+	HBToken      string `json:"hb_token,omitempty"`
+	EndPos       string `json:"endpos,omitempty"`
+	OriginLSN    string `json:"origin_lsn,omitempty"`
+	Verdict      string `json:"verdict,omitempty"`
+	RetryCount   int    `json:"retry_count"`
+	RetryWindow  *int64 `json:"-"`
+	NextRetryAt  *int64 `json:"next_retry_at,omitempty"`
+	BaseCopyDone bool   `json:"base_copy_done"`
+	Drained      bool   `json:"drained"`
+	AutoRestarts int    `json:"auto_restarts"`
+	// WritesBaseline is the source's row-change counter when the writers
+	// step confirmed writes stopped (nil until then).
+	WritesBaseline *int64  `json:"writes_baseline,omitempty"`
+	CreatedAt      int64   `json:"created_at"`
+	UpdatedAt      int64   `json:"updated_at"`
+	Progress       float64 `json:"progress,omitempty"`
 }
 
 var shortSafe = regexp.MustCompile(`[^a-z0-9_]`)
@@ -299,7 +305,7 @@ func (o *Orchestrator) updateFlags(ctx context.Context, id string, fn func(*Flag
 const dbCols = `id, migration_id, source_name, target_name, include, COALESCE(skip_reason,''), state, slot_name, origin_name, COALESCE(plugin,''), instance,
 	COALESCE(size_bytes,0), COALESCE(rows_estimate,0), COALESCE(table_count,0), COALESCE(last_error,''), COALESCE(error_class,''), in_sync_since, backlog_bytes,
 	COALESCE(replay_lsn,''), COALESCE(write_lsn,''), COALESCE(hb_before_lsn,''), COALESCE(hb_token,''), COALESCE(endpos,''), COALESCE(origin_lsn,''), COALESCE(verdict,''),
-	retry_count, retry_window_start, next_retry_at, base_copy_done, created_at, updated_at, drained, auto_restarts`
+	retry_count, retry_window_start, next_retry_at, base_copy_done, created_at, updated_at, drained, auto_restarts, writes_baseline`
 
 func scanDB(row interface{ Scan(...any) error }) (Database, error) {
 	var d Database
@@ -307,7 +313,7 @@ func scanDB(row interface{ Scan(...any) error }) (Database, error) {
 	err := row.Scan(&d.ID, &d.MigrationID, &d.SourceName, &d.TargetName, &d.Include, &d.SkipReason, &d.State, &d.SlotName, &d.OriginName, &d.Plugin, &d.Instance,
 		&d.SizeBytes, &d.RowsEstimate, &d.TableCount, &d.LastError, &d.ErrorClass, &inSync, &backlog,
 		&d.ReplayLSN, &d.WriteLSN, &d.HBBeforeLSN, &d.HBToken, &d.EndPos, &d.OriginLSN, &d.Verdict,
-		&d.RetryCount, &rw, &next, &d.BaseCopyDone, &d.CreatedAt, &d.UpdatedAt, &d.Drained, &d.AutoRestarts)
+		&d.RetryCount, &rw, &next, &d.BaseCopyDone, &d.CreatedAt, &d.UpdatedAt, &d.Drained, &d.AutoRestarts, &d.WritesBaseline)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, store.ErrNotFound
 	}

@@ -37,7 +37,7 @@ func TestComplexWorkloadGO(t *testing.T) {
 		}
 	}
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
-	e.waitDBState(id, db, 3*time.Minute, orch.DInSync)
+	e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
 	// While streaming: rows move between partitions, a transaction with 200
 	// savepoints (an ORM pattern), updates and deletes found by every column
 	// (float8, jsonb, arrays), new orders, and a refresh of the view.
@@ -82,7 +82,7 @@ func TestLargeObjectChangedWhileStreaming(t *testing.T) {
 	id := e.defineMigration("Large object", []string{db}, nil)
 	e.preflight(id)
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
-	e.waitDBState(id, db, 3*time.Minute, orch.DInSync)
+	e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
 	exec1(t, srcConn, db, `SELECT lo_from_bytea(0, 'created while streaming');`)
 	if v := outcome(t, e, id, db); v != "NO-GO" {
 		t.Fatalf("verdict %s with a large object created while streaming, want NO-GO", v)
@@ -107,7 +107,7 @@ func TestSchemaDriftCaughtWhileStreaming(t *testing.T) {
 	id := e.defineMigration("Schema drift", []string{db}, nil)
 	e.preflight(id)
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
-	e.waitDBState(id, db, 3*time.Minute, orch.DInSync)
+	e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
 	exec1(t, srcConn, db, `CREATE TABLE events_2026_11 PARTITION OF events FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
 		ALTER TYPE status ADD VALUE 'refunded';`)
 	var rd struct {

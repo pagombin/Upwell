@@ -95,7 +95,11 @@ SQL
         TO doadmin"
     done
     # The apply step also SETs session_replication_role = replica (finding F-SRR).
-    psql_super $DST_PORT -d postgres -c "GRANT SET ON PARAMETER session_replication_role TO doadmin"
+    # Parameter grants exist from PostgreSQL 15; before that only a superuser
+    # can set it, which is what preflight reports for such a target.
+    if [[ $(psql_super $DST_PORT -d postgres -Atc "SHOW server_version_num") -ge 150000 ]]; then
+      psql_super $DST_PORT -d postgres -c "GRANT SET ON PARAMETER session_replication_role TO doadmin"
+    fi
   fi
 }
 

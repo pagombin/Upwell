@@ -41,6 +41,7 @@ type Report struct {
 	Accepted      []map[string]any       `json:"accepted_risks"`
 	Verification  []orch.VerificationRow `json:"verification"`
 	Events        []map[string]any       `json:"events"`
+	Checklist     []ChecklistItem        `json:"post_cutover_checklist"`
 	EngineVersion string                 `json:"engine_version"`
 	AppVersion    string                 `json:"app_version"`
 }
@@ -90,6 +91,7 @@ func Build(ctx context.Context, o *orch.Orchestrator, st *store.Store, id, appVe
 		ev.Close()
 	}
 	r.EngineVersion, _ = o.Engine().Version(ctx)
+	r.Checklist = Checklist(r)
 	return r, nil
 }
 
@@ -164,6 +166,8 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute
 <table><tr><th>Source</th><th>Target</th><th>Size</th><th>State</th><th>Verdict</th><th>Plugin</th><th>Final heartbeat after</th><th>Target origin</th></tr>
 {{range .Databases}}{{if .Include}}<tr><td>{{.SourceName}}</td><td>{{.TargetName}}</td><td>{{bytes .SizeBytes}}</td><td>{{label .State}}</td>
 <td>{{if eq .Verdict "GO"}}<span class="badge go">GO</span>{{else if eq .Verdict "NO-GO"}}<span class="badge nogo">NO-GO</span>{{else}}—{{end}}</td><td>{{.Plugin}}</td><td class="mono">{{.HBBeforeLSN}}</td><td class="mono">{{.OriginLSN}}</td></tr>{{end}}{{end}}</table>
+<h2>After cutover</h2>
+{{with .Checklist}}<ol>{{range .}}<li><strong>{{.Title}}</strong>{{with .Databases}} <span class="muted">({{range $i, $d := .}}{{if $i}}, {{end}}{{$d}}{{end}})</span>{{end}}<br>{{.Detail}}{{with .SQL}}<pre class="mono">{{.}}</pre>{{end}}</li>{{end}}</ol>{{else}}<p>Nothing left to do.</p>{{end}}
 <h2>Verification</h2>
 {{if .Verification}}<table><tr><th>Database</th><th>Check</th><th>Result</th><th>Detail</th></tr>
 {{range .Verification}}<tr><td>{{.Database}}</td><td>{{.Title}}</td><td class="lv-{{.Result}}">{{upper .Result}}</td><td>{{msg .Detail}}</td></tr>{{end}}</table>{{else}}<p>Not verified yet.</p>{{end}}
@@ -206,6 +210,20 @@ func (r *Report) Markdown() []byte {
 	for _, d := range r.Databases {
 		if d.Include {
 			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n", d.SourceName, d.TargetName, bytesH(d.SizeBytes), orch.Label(d.State), d.Verdict)
+		}
+	}
+	b.WriteString("\n## After cutover\n\n")
+	if len(r.Checklist) == 0 {
+		b.WriteString("Nothing left to do.\n")
+	}
+	for i, it := range r.Checklist {
+		fmt.Fprintf(&b, "%d. **%s**", i+1, it.Title)
+		if len(it.Databases) > 0 {
+			fmt.Fprintf(&b, " (%s)", strings.Join(it.Databases, ", "))
+		}
+		fmt.Fprintf(&b, ": %s\n", esc(it.Detail))
+		if it.SQL != "" {
+			fmt.Fprintf(&b, "\n   ```sql\n   %s\n   ```\n", strings.ReplaceAll(strings.TrimRight(it.SQL, "\n"), "\n", "\n   "))
 		}
 	}
 	b.WriteString("\n## Verification\n\n| Database | Check | Result | Detail |\n| --- | --- | --- | --- |\n")

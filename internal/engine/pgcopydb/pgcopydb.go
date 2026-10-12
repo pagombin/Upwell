@@ -78,6 +78,9 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 		return engine.RunPlan{}, fmt.Errorf("database name %q or %q is not allowed", d.Source, d.Target)
 	}
 	work := filepath.Join(d.RunDir, "clone")
+	if d.Offline && resume {
+		return engine.RunPlan{}, fmt.Errorf("an offline copy cannot be resumed; restart it from zero")
+	}
 	args := []string{"clone", "--follow",
 		"--source", d.SourceConn.WithDB(d.Source).URI(),
 		"--target", d.TargetConn.WithDB(d.Target).URI(),
@@ -88,6 +91,20 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 		"--index-jobs", strconv.Itoa(max(d.IndexJobs, 1)),
 		"--skip-extensions", "--no-owner",
 	}
+	if d.Offline {
+		// A one-time copy with writes stopped: no --follow, so no slot, no
+		// origin and no decoding plugin (offline mode, D65).
+		args = append([]string{"clone"}, args[2:]...)
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--slot-name" || args[i] == "--origin" {
+				args = append(args[:i], args[i+2:]...)
+				i--
+			}
+		}
+	}
+	if d.SkipDBProperties {
+		args = append(args, "--skip-db-properties")
+	}
 	if d.SplitLarger != "" && d.SplitLarger != "off" && d.SplitLarger != "auto" {
 		args = append(args, "--split-tables-larger-than", d.SplitLarger)
 	}
@@ -97,8 +114,13 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	if resume {
 		// pgcopydb reads the plugin from its own catalog on resume: never pass --plugin.
 		args = append(args, "--resume", "--not-consistent")
-	} else if d.Plugin != "" {
+	} else if d.Plugin != "" && !d.Offline {
 		args = append(args, "--plugin", d.Plugin)
+	}
+	if !resume && d.DropIfExists {
+		// pg_restore --clean --if-exists: drops only objects in the source's
+		// schema dump, so the target's own objects are kept.
+		args = append(args, "--drop-if-exists")
 	}
 	args = append(args, d.ExtraArgs...)
 	for _, a := range args {
@@ -230,6 +252,10 @@ func (e *Engine) Nudge(ctx context.Context, d engine.DatabaseSpec) error {
 	// pgcopydb 0.18 cannot parse a logical decoding message under
 	// test_decoding and its receive process fails on it (F14), so the message
 	// is only a fallback for pgoutput when the heartbeat table is off.
+	// Read-write explicitly, for the write freeze.
+	if _, err := c.Exec(ctx, `SET default_transaction_read_only = off`); err != nil {
+		return err
+	}
 	var hb *string
 	_ = c.QueryRow(ctx, `SELECT to_regclass('upwell.heartbeat')::text`).Scan(&hb)
 	if hb != nil {
@@ -469,7 +495,7 @@ func (e *Engine) CopyRoles(ctx context.Context, src, dst pg.Conn, runDir string)
 	// passwords (pg_roles is readable) and apply what a non-superuser may.
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "pg_dumpall", "--roles-only", "--no-role-passwords", "--dbname", src.URI())
+	cmd := exec.CommandContext(cctx, "pg_dumpall", rolesDumpArgs(src)...)
 	cmd.Env = append(os.Environ(), "PGPASSFILE="+pass)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -601,4 +627,16 @@ func limitStrings(s []string, n int) []string {
 		return append(s[:n:n], fmt.Sprintf("and %d more", len(s)-n))
 	}
 	return s
+}
+
+// rolesDumpArgs are pg_dumpall's arguments for the role copy. pg_dumpall
+// ignores the database named in --dbname and connects to "postgres", then
+// "template1"; managed clusters (DigitalOcean) refuse both in pg_hba, so the
+// maintenance database is named with --database.
+func rolesDumpArgs(src pg.Conn) []string {
+	db := src.DBName
+	if db == "" {
+		db = "defaultdb"
+	}
+	return []string{"--roles-only", "--no-role-passwords", "--dbname", src.URI(), "--database", db}
 }

@@ -4,9 +4,9 @@ import { api } from "../lib/api";
 import { bytes, duration, time } from "../lib/format";
 import { useApi, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
-import type { Operation, VerificationRow } from "../lib/types";
+import type { FreezePreview, FreezeState, Operation, VerificationRow } from "../lib/types";
 import { OpSteps, useOps } from "../components/ops";
-import { Card, ComingSoon, ConfirmDialog, Dialog, Empty, ErrorState, LevelPill, Pill, Skeleton, Trunc, useAction } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, LevelPill, Pill, Skeleton, Trunc, useAction } from "../components/ui";
 import { useMig } from "./migration";
 
 interface Cond { key: string; label: string; ok: boolean; detail: string; database?: string }
@@ -43,6 +43,8 @@ export function CutoverTab() {
     return () => clearInterval(t);
   }, [running, op.refresh]); // eslint-disable-line react-hooks/exhaustive-deps
   const [start, setStart] = useState(false);
+  const [method, setMethod] = useState<"manual" | "freeze">("manual");
+  const admin = me?.user.role === "admin";
   const [abort, setAbort] = useState(false);
   const [switched, setSwitched] = useState(false);
   const inc = v.databases.filter((d) => d.include);
@@ -50,11 +52,14 @@ export function CutoverTab() {
   const pauseStart = c?.writes_stopped_at || c?.started_at;
   const pauseMs = pauseStart ? (c?.ended_at || now) - pauseStart : 0;
   const retryable = m.flags.verdict === "NO-GO" && !endposSet;
-  const canStart = can("operator") && !m.fixture && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
+  const offline = v.settings_effective?.mode === "offline";
+  const canStart = !offline && can("operator") && !m.fixture && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
   return (
     <div className="stack" style={{ gap: 24 }}>
       <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
-      <div className="grid cols-2">
+      {m.flags.freeze && <FreezeBanner mig={id} f={m.flags.freeze} canUndo={can("operator") && !m.fixture} onDone={view.refresh} />}
+      {offline && <div className="callout info"><div className="body"><strong>Offline migration</strong><span>Writes stopped before the copy (confirmed, or the write freeze); Upwell copies each database once, then syncs sequences and verifies, and the verdict below decides. There is no separate cutover.{!m.flags.started && !c ? " Start it from the plan review." : ""}</span></div></div>}
+      <div className="grid cols-2" style={offline ? { display: "none" } : undefined}>
         <Card title="Readiness" actions={ready.data ? <Pill kind={ready.data.ready ? "ok" : "warn"} text={ready.data.ready ? "Ready" : "Not ready"} /> : undefined}>
           {ready.error ? <ErrorState error={ready.error} retry={ready.refresh} /> : !ready.data ? <Skeleton lines={5} /> : (
             <ul className="opsteps" aria-label="Readiness conditions">
@@ -74,8 +79,8 @@ export function CutoverTab() {
             <span className="muted small">{!c ? "Starts when you confirm writers are stopped." : c.ended_at ? `Writes were paused for ${duration(pauseMs)}; the cutover ended ${time(c.ended_at)}.` : "Applications must not write to the source while this runs."}</span>
             <fieldset className="stack" style={{ border: 0, padding: 0, margin: 0, gap: 6 }}>
               <legend className="small muted" style={{ marginBottom: 6 }}>How writes stop</legend>
-              <label className="check"><input type="radio" name="stopmethod" defaultChecked />Manual: the customer or you stop every application writer</label>
-              <span className="row small muted"><span>Write freeze on the source (revokes write privileges, with preview)</span><ComingSoon what="Write freeze" /></span>
+              <label className="check"><input type="radio" name="stopmethod" checked={method === "manual"} onChange={() => setMethod("manual")} />Manual: the customer or you stop every application writer</label>
+              <label className="check"><input type="radio" name="stopmethod" checked={method === "freeze"} disabled={!admin} onChange={() => setMethod("freeze")} />Write freeze: Upwell makes the source databases read-only for new sessions and ends client sessions, with a preview first{!admin && <span className="small muted"> (Admins only)</span>}</label>
             </fieldset>
             {canStart && (
               <div className="row">
@@ -131,7 +136,8 @@ export function CutoverTab() {
           </div>
         </Card>
       </div>
-      {start && <StartCutoverDialog mig={id} name={m.name} admin={me?.user.role === "admin"} onClose={() => setStart(false)} onStarted={(opId) => { ops.open(opId, "Cutover"); view.refresh(); }} />}
+      {start && method === "freeze" && <FreezeCutoverDialog mig={id} onClose={() => setStart(false)} onStarted={(opId) => { ops.open(opId, "Cutover with write freeze"); view.refresh(); }} />}
+      {start && method === "manual" && <StartCutoverDialog mig={id} name={m.name} admin={admin} onClose={() => setStart(false)} onStarted={(opId) => { ops.open(opId, "Cutover"); view.refresh(); }} />}
       {abort && (
         <ConfirmDialog title="Abort the cutover" danger confirmLabel="Abort the cutover" onClose={() => setAbort(false)}
           onConfirm={async () => { await run("abort", () => api.post(`/api/v1/migrations/${id}/cutover/abort`), "Cutover aborted; databases keep streaming"); view.refresh(); }}>
@@ -145,6 +151,77 @@ export function CutoverTab() {
         </ConfirmDialog>
       )}
     </div>
+  );
+}
+
+function FreezeBanner({ mig, f, canUndo, onDone }: { mig: string; f: FreezeState; canUndo: boolean; onDone: () => void }) {
+  const { run, busy } = useAction();
+  const [confirm, setConfirm] = useState(false);
+  if (f.state === "undone") {
+    return <p className="small muted" data-testid="freeze-undone">Write freeze undone {f.undone_at ? time(f.undone_at) : ""} by {f.undone_by} ({f.undo_reason}).</p>;
+  }
+  const names = f.databases.map((d) => d.name).join(", ");
+  return (
+    <div className={`callout ${f.undo_error ? "crit" : "warn"}`} role="status" data-testid="freeze-banner">
+      <div className="body">
+        <strong>Write freeze applied on {names}</strong>
+        <span>Applied by {f.by} {time(f.applied_at)}. New sessions on the source are read-only; {f.databases.reduce((n, d) => n + d.terminated, 0)} client session(s) were ended. It is undone automatically if the cutover does not end GO.</span>
+        {f.undo_error && <span>Undo failed and is retried: {f.undo_error}</span>}
+        {canUndo && <div><button disabled={!!busy} onClick={() => setConfirm(true)}>Undo write freeze</button></div>}
+      </div>
+      {confirm && (
+        <ConfirmDialog title="Undo the write freeze" confirmLabel="Undo write freeze" onClose={() => setConfirm(false)}
+          onConfirm={async () => { await run("unfreeze", () => api.post(`/api/v1/migrations/${mig}/cutover/unfreeze`), "Write freeze undone; the source accepts writes"); onDone(); }}>
+          <p>Restores each database's setting and ends the client sessions opened during the freeze, so applications reconnect read-write. During a cutover, any write from now on ends NO-GO.</p>
+        </ConfirmDialog>
+      )}
+    </div>
+  );
+}
+
+function FreezeCutoverDialog({ mig, onClose, onStarted }: { mig: string; onClose: () => void; onStarted: (op: string) => void }) {
+  return <FreezeDialog mig={mig} title="Start the cutover with a write freeze" onClose={onClose} onConfirm={async (typed) => {
+    const r = await api.post<{ operation_id: string }>(`/api/v1/migrations/${mig}/cutover`, { write_freeze: true, freeze_confirm: typed });
+    onStarted(r.operation_id);
+  }} />;
+}
+
+// FreezeDialog previews the write freeze and asks for the source cluster's
+// name; onConfirm starts whatever applies it (a cutover, an offline start).
+export function FreezeDialog({ mig, title, onClose, onConfirm }: { mig: string; title: string; onClose: () => void; onConfirm: (typed: string) => Promise<void> }) {
+  const pv = useApi<FreezePreview>(`/api/v1/migrations/${mig}/cutover/freeze`);
+  const [typed, setTyped] = useState("");
+  const [err, setErr] = useState<Error>();
+  const [busy, setBusy] = useState(false);
+  const p = pv.data;
+  const go = async () => {
+    setBusy(true); setErr(undefined);
+    try { await onConfirm(typed); onClose(); } catch (e) { setErr(e as Error); } finally { setBusy(false); }
+  };
+  return (
+    <Dialog title={title} wide onClose={onClose} footer={<><button onClick={onClose}>Cancel</button><button className="cutover" disabled={!p?.available || typed !== p?.confirm || busy} onClick={go}>{busy && <span className="spin" />}Apply the freeze and start</button></>}>
+      {pv.error ? <ErrorState error={pv.error} retry={pv.refresh} /> : !p ? <Skeleton lines={6} /> : <>
+        <p>Exactly what Upwell will run on the source, per database, before sampling for writes. Nothing has changed yet.</p>
+        {p.databases.map((d) => (
+          <div key={d.database} className="stack" style={{ gap: 6 }}>
+            <div className="row"><strong className="mono">{d.database}</strong>{d.available ? <Pill kind="ok" text="Available" /> : <Pill kind="crit" text="Not available" />}</div>
+            {!d.available && <p className="small">{d.reason}</p>}
+            <pre className="cmd">{d.apply_sql.join("\n")}</pre>
+            <span className="small muted">{d.sessions.length === 0 ? "No client sessions to end." : `${d.sessions.length} client session(s) will be ended:`}</span>
+            {d.sessions.length > 0 && (
+              <div className="tablewrap"><table className="data" aria-label={`Sessions in ${d.database}`}>
+                <thead><tr><th>PID</th><th>User</th><th>Application</th><th>Client</th><th>State</th></tr></thead>
+                <tbody>{d.sessions.slice(0, 20).map((x) => <tr key={x.pid}><td>{x.pid}</td><td>{x.user}</td><td><Trunc>{x.application || "—"}</Trunc></td><td className="mono">{x.client}</td><td>{x.state}{x.open_write_transaction ? " (open write transaction)" : ""}</td></tr>)}</tbody>
+              </table></div>
+            )}
+            <span className="small muted">Undo: <span className="mono">{d.undo_sql[0]}</span></span>
+          </div>
+        ))}
+        <div className="callout info"><div className="body"><span>{p.note}</span></div></div>
+        <label className="field"><span className="lbl">Type the source cluster's name, <strong className="mono">{p.confirm}</strong>, to apply the freeze</span><input value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" /></label>
+      </>}
+      {err && <ErrorState error={err} />}
+    </Dialog>
   );
 }
 
@@ -255,7 +332,7 @@ export function ReportTab() {
         <button className="ghost" onClick={() => setN((x) => x + 1)}>Refresh</button>
         <a className="btn" href={`/api/v1/migrations/${id}/report?format=html&download=1`} download>Download HTML</a>
         <a className="btn" href={`/api/v1/migrations/${id}/report?format=md&download=1`} download>Download Markdown</a>
-        <span className="row small muted" style={{ gap: 6 }}>PDF <ComingSoon what="PDF reports" /></span>
+        <a className="btn" href={`/api/v1/migrations/${id}/report?format=pdf&download=1`} download>Download PDF</a>
       </div>
       <iframe key={n} title={`Report for ${m.name}`} src={`/api/v1/migrations/${id}/report?format=html`} style={{ width: "100%", height: "calc(100vh - 300px)", minHeight: 480, border: "1px solid var(--border)", borderRadius: 6, background: "#fff" }} />
     </div>

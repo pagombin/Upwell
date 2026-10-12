@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { FreezeDialog } from "./cutover";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
 import { bytes, count, duration } from "../lib/format";
@@ -231,6 +232,7 @@ function StepOptions({ v, onDone }: { v: MigrationView; onDone: () => void }) {
     setBusy(true); setErr(undefined);
     const changed: Record<string, unknown> = {};
     for (const i of items) if (JSON.stringify(vals[i.key]) !== JSON.stringify(eff[i.key])) changed[i.key] = vals[i.key];
+    if ((vals.mode ?? "online") !== (eff.mode ?? "online")) changed.mode = vals.mode;
     try {
       if (Object.keys(changed).length) await api.patch(`/api/v1/migrations/${v.migration.id}`, { settings: changed });
       if (vals.heartbeat === false) toast("info", "Heartbeat is off", "GO will rely on data comparison only; this is recorded as an accepted risk.");
@@ -241,8 +243,8 @@ function StepOptions({ v, onDone }: { v: MigrationView; onDone: () => void }) {
     <Card title="Options">
       <div className="stack">
         <div className="row">
-          <Field label="Mode"><select value="online" onChange={() => {}} aria-describedby="mode-hint"><option value="online">Online: copy, then stream changes until cutover</option></select></Field>
-          <span className="small muted" id="mode-hint">Offline mode <ComingSoon what="Offline mode" /></span>
+          <Field label="Mode"><select value={String(vals.mode ?? "online")} onChange={(e) => setVals({ ...vals, mode: e.target.value })} aria-describedby="mode-hint"><option value="online">Online: copy, then stream changes until cutover</option><option value="offline">Offline: stop writes, copy once, verify</option></select></Field>
+          <span className="small muted" id="mode-hint">{vals.mode === "offline" ? "Writes stop before the copy (confirmed, or the write freeze) and stay stopped until the verdict. No slot, decoding or change apply." : "Applications keep writing until the cutover."}</span>
         </div>
         {cat.error ? <ErrorState error={cat.error} retry={cat.refresh} /> : !cat.data ? <Skeleton lines={6} /> : (
           <div className="fieldgrid">
@@ -250,7 +252,7 @@ function StepOptions({ v, onDone }: { v: MigrationView; onDone: () => void }) {
           </div>
         )}
         {vals.heartbeat === false && <div className="callout warn"><div className="body"><strong>Heartbeat off</strong><span>The final heartbeat proves the last writes reached the target. Without it, GO relies on data comparison alone and the report records the accepted risk.</span></div></div>}
-        <div className="row small muted"><span>Watched tables</span><ComingSoon what="Watched tables" /><span>Notifications</span><ComingSoon what="Notifications" /></div>
+        <div className="row small muted"><span>Watched tables: choose them on each database's page once the migration runs.</span><span>Notifications</span><ComingSoon what="Notifications" /></div>
         {err && <ErrorState error={err} />}
         <Nav next={save} busy={busy} />
       </div>
@@ -302,11 +304,19 @@ function StepPlan({ v }: { v: MigrationView }) {
   const { can } = useSession();
   const { run, busy } = useAction();
   const [reviewed, setReviewed] = useState(false);
+  const [stopped, setStopped] = useState(false);
+  const [how, setHow] = useState<"confirm" | "freeze">("confirm");
+  const [freezing, setFreezing] = useState(false);
+  const [autoStart, setAutoStart] = useState(false);
+  const { me } = useSession();
+  const offline = v.settings_effective?.mode === "offline";
   const sum = pf.data?.run?.summary;
   const e = plan.data?.estimates || {};
   const start = async () => {
-    const r = await run("start", () => api.post(`/api/v1/migrations/${v.migration.id}/start`, { warnings_reviewed: reviewed }), "Migration started");
-    if (r) nav(`/migrations/${v.migration.short_id}`);
+    if (offline && how === "freeze") { setFreezing(true); return; }
+    const body = offline ? { warnings_reviewed: reviewed, confirm_writers_stopped: stopped } : { warnings_reviewed: reviewed };
+    const r = await run("start", () => api.post(`/api/v1/migrations/${v.migration.id}/start`, body), offline ? "Offline migration started" : "Migration started");
+    if (r) nav(offline ? `/migrations/${v.migration.short_id}/cutover` : `/migrations/${v.migration.short_id}`);
   };
   return (
     <Card title="Plan review">
@@ -329,10 +339,27 @@ function StepPlan({ v }: { v: MigrationView }) {
         </>}
         {sum && !sum.can_start && <div className="callout crit"><div className="body"><strong>Preflight does not allow a start yet</strong><span>Resolve or accept every blocker, then run preflight again.</span></div></div>}
         {sum?.needs_warning_review && <label className="check"><input type="checkbox" checked={reviewed} onChange={(x) => setReviewed(x.target.checked)} />I reviewed the {sum.warnings} preflight warnings</label>}
+        {offline && (
+          <fieldset className="stack" style={{ border: 0, padding: 0, margin: 0, gap: 6 }}>
+            <legend className="small muted" style={{ marginBottom: 6 }}>Offline: writes stop before the copy and stay stopped until the verdict</legend>
+            <label className="check"><input type="radio" name="offlinehow" checked={how === "confirm"} onChange={() => setHow("confirm")} />Every application writer to the source is stopped, and I confirm it</label>
+            {how === "confirm" && <label className="check" style={{ marginLeft: 24 }}><input type="checkbox" checked={stopped} onChange={(x) => setStopped(x.target.checked)} />Every application writer to the source is stopped</label>}
+            <label className="check"><input type="radio" name="offlinehow" checked={how === "freeze"} disabled={me?.user.role !== "admin"} onChange={() => setHow("freeze")} />Apply the write freeze first, with a preview{me?.user.role !== "admin" && <span className="small muted"> (Admins only)</span>}</label>
+            <span className="small muted">Upwell samples the source for writes before copying, and verification fails if anything changed.</span>
+          </fieldset>
+        )}
         <div className="row" style={{ justifyContent: "flex-end" }}>
-          <span className="small muted">Queue instead <ComingSoon what="Queueing several migrations" /></span>
-          {can("operator") && <button className="primary" disabled={!sum?.can_start || (sum.needs_warning_review && !reviewed) || !!busy} onClick={start}>{busy && <span className="spin" />}Start migration</button>}
+          {can("operator") && !offline && <label className="check small"><input type="checkbox" checked={autoStart} onChange={(x) => setAutoStart(x.target.checked)} />Auto-start when it reaches the front of the queue</label>}
+          {can("operator") && <button disabled={!sum?.can_start || (sum.needs_warning_review && !reviewed) || !!busy} onClick={async () => {
+            const r = await run("queue", () => api.post(`/api/v1/migrations/${v.migration.id}/queue`, { warnings_reviewed: reviewed, auto_start: autoStart && !offline }), "Queued");
+            if (r) nav("/");
+          }}>Queue instead</button>}
+          {can("operator") && <button className="primary" disabled={!sum?.can_start || (sum.needs_warning_review && !reviewed) || (offline && how === "confirm" && !stopped) || !!busy} onClick={start}>{busy && <span className="spin" />}{offline ? "Start offline migration" : "Start migration"}</button>}
         </div>
+        {freezing && <FreezeDialog mig={v.migration.id} title="Start the offline migration with a write freeze" onClose={() => setFreezing(false)} onConfirm={async (typed) => {
+          await api.post(`/api/v1/migrations/${v.migration.id}/start`, { warnings_reviewed: reviewed, write_freeze: true, freeze_confirm: typed });
+          nav(`/migrations/${v.migration.short_id}/cutover`);
+        }} />}
       </div>
     </Card>
   );

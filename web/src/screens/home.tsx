@@ -1,10 +1,11 @@
+import { api } from "../lib/api";
 import { Link } from "react-router-dom";
 import { copyEtaMs, LIFECYCLE, lifecycleIndex, overallProgress, readyForCutover } from "../lib/derive";
 import { ago, bytes, duration, pct, time } from "../lib/format";
 import { useApi, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { Alert, MigrationView, Series } from "../lib/types";
-import { Card, ComingSoon, Empty, ErrorState, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc } from "../components/ui";
+import { Card, Empty, ErrorState, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction } from "../components/ui";
 
 export interface SystemInfo {
   version: string; go: string; started_at: number; uptime_s: number;
@@ -43,7 +44,7 @@ function ActiveCard({ id, alerts }: { id: string; alerts: Alert[] }) {
   const open = alerts.filter((a) => a.migration_id === m.id);
   const ready = readyForCutover(d);
   return (
-    <Card title={<Link to={`/migrations/${m.short_id}`}><Trunc>{m.name}</Trunc></Link>} id="active-mig" actions={<><StaleBadge updatedAt={v.updatedAt} now={now} /><Pill state={m.state} /></>}>
+    <Card title={<Link to={`/migrations/${m.short_id}`}><Trunc>{m.name}</Trunc></Link>} id={`active-mig-${m.short_id}`} actions={<><StaleBadge updatedAt={v.updatedAt} now={now} /><Pill state={m.state} /></>}>
       <div className="stack">
         <Stepper index={lifecycleIndex(d)} bad={m.state === "needs_attention"} />
         <div className="grid cols-4">
@@ -90,9 +91,7 @@ export function HomeScreen() {
           <Tile label="Engine" value={<Trunc>{sys.data.engine.version || "not installed"}</Trunc>} sub={`Upwell ${sys.data.version}`} />
         </>}
       </div>
-      <Card title="Queue" actions={<ComingSoon what="Queueing several migrations" />}>
-        <p className="muted">This build runs one migration at a time per operator action; a queue with reordering is coming soon.</p>
-      </Card>
+      <QueueCard />
       <Card title="Recent migrations">
         {!migs.data ? <Skeleton lines={4} /> : list.length === 0 ? <Empty title="No migrations yet">Migrations you define appear here with their state and verdict.</Empty> : (
           <div className="tablewrap">
@@ -116,5 +115,53 @@ export function HomeScreen() {
         )}
       </Card>
     </div>
+  );
+}
+
+interface QueueView { running: { id: string; short_id: string; name: string; state: string } | null; entries: { migration_id: string; short_id: string; name: string; position: number; auto_start: boolean; queued_by: string; queued_at: number }[] }
+
+// The run lock and the queue (overnight item 7): one migration runs at a
+// time; queued ones start when an operator starts them, or by themselves
+// when their entry has auto-start.
+function QueueCard() {
+  const q = useApi<QueueView>("/api/v1/queue", 5000);
+  const { can } = useSession();
+  const { run, busy } = useAction();
+  const op = can("operator");
+  const move = (i: number, d: number) => {
+    const ids = (q.data?.entries || []).map((e) => e.migration_id);
+    const j = i + d;
+    if (j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    run("order", () => api.put("/api/v1/queue/order", { ids })).then(q.refresh);
+  };
+  return (
+    <Card title="Queue">
+      {q.error ? <ErrorState error={q.error} retry={q.refresh} /> : !q.data ? <Skeleton lines={3} /> : (
+        <div className="stack">
+          <p className="small muted">{q.data.running ? <>Running now: <Link to={`/migrations/${q.data.running.short_id}`}>{q.data.running.name}</Link>. One migration runs at a time; the next starts when it ends GO, is aborted or is cleaned up.</> : "Nothing is running: any ready migration can start."}</p>
+          {q.data.entries.length === 0 ? <p className="muted">No migrations are queued. Queue one from its plan review.</p> : (
+            <div className="tablewrap">
+              <table className="data" aria-label="Queue">
+                <thead><tr><th>#</th><th>Migration</th><th>Queued</th><th>Auto-start</th><th><span className="sr-only">Actions</span></th></tr></thead>
+                <tbody>{q.data.entries.map((e, i) => (
+                  <tr key={e.migration_id}>
+                    <td>{i + 1}</td>
+                    <td style={{ maxWidth: 280 }}><Link to={`/migrations/${e.short_id}`}><Trunc>{e.name}</Trunc></Link></td>
+                    <td>{time(e.queued_at)} <span className="small muted">by {e.queued_by}</span></td>
+                    <td><label className="check"><input type="checkbox" aria-label={`Auto-start ${e.name}`} checked={e.auto_start} disabled={!op || !!busy} onChange={(x) => run("auto", () => api.patch(`/api/v1/migrations/${e.migration_id}/queue`, { auto_start: x.target.checked })).then(q.refresh)} />{e.auto_start ? "On" : "Off"}</label></td>
+                    <td>{op && <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                      <button className="ghost" aria-label={`Move ${e.name} up`} disabled={i === 0 || !!busy} onClick={() => move(i, -1)}>Up</button>
+                      <button className="ghost" aria-label={`Move ${e.name} down`} disabled={i === q.data!.entries.length - 1 || !!busy} onClick={() => move(i, 1)}>Down</button>
+                      <button className="ghost" disabled={!!busy} onClick={() => run("unq", () => api.del(`/api/v1/migrations/${e.migration_id}/queue`), "Taken out of the queue").then(q.refresh)}>Unqueue</button>
+                    </div>}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }

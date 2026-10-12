@@ -28,6 +28,7 @@ import (
 	"github.com/pagombin/upwell/internal/orch"
 	"github.com/pagombin/upwell/internal/settings"
 	"github.com/pagombin/upwell/internal/store"
+	"github.com/pagombin/upwell/internal/tlsutil"
 	"github.com/pagombin/upwell/internal/webui"
 )
 
@@ -43,6 +44,7 @@ type Server struct {
 	Log      *logx.Logger
 	Version  string
 	TLSInfo  func() TLSInfo
+	TLS      *tlsutil.Holder // nil where the certificate cannot be managed (tests)
 	Health   *Health
 
 	mux    *http.ServeMux
@@ -71,6 +73,7 @@ type route struct {
 	h                           handlerFunc
 	public                      bool
 	noIdem                      bool
+	mfaExempt                   bool // allowed for an Admin who must still set up the second factor
 }
 
 type ctxKey int
@@ -243,7 +246,29 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 				writeErr(w, apiErr(500, "internal", "Something went wrong on the server; the error is in the app log.", ""))
 			}
 		}()
-		if !rt.public {
+		if bearer := bearerToken(r); bearer != "" && !rt.public {
+			// API tokens (D68): read-only, scoped, checked against the store on
+			// every request so a revoked token fails at once.
+			t, err := s.Auth.ResolveAPIToken(r.Context(), bearer)
+			if err != nil {
+				writeErr(w, apiErr(401, "invalid_token", auth.ErrTokenInvalid.Error(), "Create a new token in Settings, API tokens."))
+				return
+			}
+			isMetrics := rt.Path == "/metrics"
+			switch {
+			case mutating:
+				writeErr(w, apiErr(403, "read_only_token", "API tokens are read-only.", "Sign in to make changes."))
+				return
+			case t.Scope == auth.ScopeMetrics && !isMetrics:
+				writeErr(w, apiErr(403, "token_scope", "This token may only read /metrics.", ""))
+				return
+			case !isMetrics && !auth.Allows(auth.RoleViewer, rt.Role):
+				writeErr(w, apiErr(403, "forbidden", "API tokens read what a Viewer can; this needs "+rt.Role+".", ""))
+				return
+			}
+			sess := auth.Session{ID: "token:" + t.ID, User: auth.User{ID: "token:" + t.ID, Username: "token:" + t.Name, Role: auth.RoleViewer}}
+			r = r.WithContext(context.WithValue(r.Context(), sessKey, sess))
+		} else if !rt.public {
 			c, _ := r.Cookie("upwell_session")
 			tok := ""
 			if c != nil {
@@ -252,6 +277,10 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			sess, err := s.Auth.Resolve(r.Context(), tok)
 			if err != nil {
 				writeErr(w, apiErr(401, "unauthenticated", "Your session ended. Sign in again.", ""))
+				return
+			}
+			if !rt.mfaExempt && !rt.public && s.mfaEnrollmentRequired(r.Context(), sess.User) {
+				writeErr(w, apiErr(403, "mfa_enrollment_required", "Admins must turn on the second factor (TOTP) first.", "Open your account settings and set up an authenticator app."))
 				return
 			}
 			if !auth.Allows(sess.User.Role, rt.Role) {
@@ -465,4 +494,13 @@ func SDNotify(msg string) {
 	}
 	defer func() { _ = c.Close() }()
 	_, _ = c.Write([]byte(msg))
+}
+
+// bearerToken returns the token from an "Authorization: Bearer" header.
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return ""
 }

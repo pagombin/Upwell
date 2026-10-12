@@ -41,8 +41,8 @@ export function LogsScreen() {
               </select>
             </label>
           </div>
+          <SavedViews value={f} onChange={setF} />
           <LogViewer filter={{ migration: f.migration, level: f.level, component: f.component, q }} height={600} label="All logs" />
-          <p className="small faint">Saved views <ComingSoon what="Saved log views" /></p>
         </div>
       </Card>
     </Page>
@@ -160,7 +160,7 @@ export function HostScreen() {
   const [mins, setMins] = useState(60);
   const now = useNow(30000);
   const from = Math.floor(now / 30000) * 30000 - mins * 60000, to = Math.floor(now / 30000) * 30000;
-  const mx = useApi<Series[]>(`/api/v1/host/metrics?names=work_volume_pct,work_volume_free_bytes,staging_bytes,cpu_pct,mem_pct,load1&from=${from}&to=${to}`, 30000);
+  const mx = useApi<Series[]>(`/api/v1/host/metrics?names=work_volume_pct,work_volume_free_bytes,staging_bytes,cpu_pct,mem_pct,load1,net_rx_bps,net_tx_bps&from=${from}&to=${to}`, 30000);
   const sys = useApi<SystemInfo & { units: { migration: string; migration_name: string; database: string; state: string; unit: string; status: { active: boolean; main_pid: number; main_live: boolean } | null }[] }>("/api/v1/system", 15000);
   const lastV = (n: string) => mx.data?.find((s) => s.name === n)?.points.slice(-1)[0]?.v;
   const staging = mx.data?.find((s) => s.name === "staging_bytes")?.points || [];
@@ -184,9 +184,11 @@ export function HostScreen() {
             <TimeChart title="Staging size" series={seriesFor(mx.data, "staging_bytes", "")} fmt={(n) => bytes(n, 0)} from={from} to={to} />
             <TimeChart title="CPU" series={seriesFor(mx.data, "cpu_pct", "")} fmt={(n) => pct(n)} from={from} to={to} />
             <TimeChart title="Memory" series={seriesFor(mx.data, "mem_pct", "")} fmt={(n) => pct(n)} from={from} to={to} />
+            <TimeChart title="Network received" series={seriesFor(mx.data, "net_rx_bps", "")} fmt={(n) => `${bytes(n, 0)}/s`} from={from} to={to} />
+            <TimeChart title="Network sent" series={seriesFor(mx.data, "net_tx_bps", "")} fmt={(n) => `${bytes(n, 0)}/s`} from={from} to={to} />
           </div>
         </CrosshairProvider>
-        <p className="small faint" style={{ marginTop: 12 }}>Network throughput <ComingSoon what="Network metrics" /></p>
+        <p className="small faint" style={{ marginTop: 12 }}>Network throughput is the sum over the droplet's interfaces, loopback excluded (from /proc/net/dev): the source's WAL coming in and the copy going out.</p>
       </Card>
       <Card title="Engine units">
         {!sys.data ? <Skeleton lines={4} /> : sys.data.units.length === 0 ? <p className="muted">No engine units: no migration is running.</p> : (
@@ -264,8 +266,8 @@ export function SettingsScreen() {
           ))}
         </nav>
         <div className="stack" style={{ minWidth: 0 }}>
-          {sec === "Users and roles" ? <UsersSection /> : sec === "TLS" ? <TLSSection /> : sec === "System" ? <Card title="System"><p>Versions, services, watchdog and restart are on the <Link to="/system">System</Link> screen.</p></Card>
-            : ["Notifications", "DigitalOcean API", "API tokens", "Metrics export"].includes(sec) ? <Card title={sec} actions={<ComingSoon what={sec} />}><p className="muted">{sec} is not part of this build.</p></Card>
+          {sec === "Users and roles" ? <UsersSection /> : sec === "TLS" ? <TLSSection /> : sec === "API tokens" ? <TokensSection /> : sec === "Metrics export" ? <MetricsSection /> : sec === "System" ? <Card title="System"><p>Versions, services, watchdog and restart are on the <Link to="/system">System</Link> screen.</p></Card>
+            : ["Notifications", "DigitalOcean API"].includes(sec) ? <Card title={sec} actions={<ComingSoon what={sec} />}><p className="muted">{sec} is not part of this build.</p></Card>
             : cat.error ? <ErrorState error={cat.error} retry={cat.refresh} /> : !cat.data ? <Skeleton lines={8} /> : <CatalogSection key={sec} items={cat.data.filter((i) => i.group === sec)} title={sec} refresh={cat.refresh} />}
         </div>
       </div>
@@ -307,26 +309,29 @@ function UsersSection() {
   const [create, setCreate] = useState(false);
   const [del, setDel] = useState<User | null>(null);
   const [reset, setReset] = useState<User | null>(null);
+  const [resetMfa, setResetMfa] = useState<User | null>(null);
   const { run } = useAction();
   if (!can("admin")) return <Card title="Users and roles"><p className="muted">Only Admins manage users.</p></Card>;
   const update = (u: User, p: Partial<User>) => run("u", () => api.patch(`/api/v1/users/${u.id}`, { role: p.role ?? u.role, disabled: p.disabled ?? u.disabled }), "User updated").then(users.refresh);
   return (
     <Card title="Users and roles" actions={<button className="primary" onClick={() => setCreate(true)}>Add user</button>}>
       <div className="stack">
-        <p className="small muted">Viewers see everything. Operators also run migrations, preflight, cutover and cleanup. Admins also manage users and settings. SSO and TOTP are coming soon.</p>
+        <p className="small muted">Viewers see everything. Operators also run migrations, preflight, cutover and cleanup. Admins also manage users and settings, and must use a second factor while mfa_required_for_admins is on. SSO is not part of this build.</p>
         {users.error ? <ErrorState error={users.error} retry={users.refresh} /> : !users.data ? <Skeleton lines={4} /> : (
           <div className="tablewrap">
             <table className="data" aria-label="Users">
-              <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last sign-in</th><th><span className="sr-only">Actions</span></th></tr></thead>
+              <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Second factor</th><th>Last sign-in</th><th><span className="sr-only">Actions</span></th></tr></thead>
               <tbody>{users.data.map((u) => (
                 <tr key={u.id}>
                   <td style={{ maxWidth: 240 }}><Trunc>{u.username}</Trunc></td>
                   <td><select aria-label={`Role of ${u.username}`} value={u.role} disabled={u.id === me?.user.id} onChange={(e) => update(u, { role: e.target.value as User["role"] })}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option></select></td>
                   <td>{u.disabled ? <Pill kind="warn" text="Disabled" /> : <Pill kind="ok" text="Active" />}</td>
+                  <td>{u.totp_enabled ? <Pill kind="ok" text="On" /> : <span className="muted">Off</span>}</td>
                   <td>{u.last_login_at ? time(u.last_login_at) : "Never"}</td>
-                  <td>{u.id !== me?.user.id && <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
+                  <td>{u.id !== me?.user.id && <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
                     <button className="ghost" onClick={() => update(u, { disabled: !u.disabled })}>{u.disabled ? "Enable" : "Disable"}</button>
                     <button className="ghost" onClick={() => setReset(u)}>Reset password</button>
+                    {u.totp_enabled && <button className="ghost" onClick={() => setResetMfa(u)}>Reset second factor</button>}
                     <button className="ghost" onClick={() => setDel(u)}>Delete</button>
                   </div>}</td>
                 </tr>
@@ -337,6 +342,7 @@ function UsersSection() {
       </div>
       {create && <CreateUser onClose={() => setCreate(false)} onDone={users.refresh} />}
       {reset && <ResetPassword u={reset} onClose={() => setReset(null)} />}
+      {resetMfa && <ConfirmDialog title={`Reset ${resetMfa.username}'s second factor`} danger confirmLabel="Reset second factor" onClose={() => setResetMfa(null)} onConfirm={async () => { await api.post(`/api/v1/users/${resetMfa.id}/totp/reset`); users.refresh(); }}><p>For a lost device: their authenticator app and recovery codes stop working, and they sign in with their password (an Admin must then set up a new second factor). Recorded in the audit log.</p></ConfirmDialog>}
       {del && <ConfirmDialog title={`Delete ${del.username}`} danger typeToConfirm={del.username} confirmLabel="Delete user" onClose={() => setDel(null)} onConfirm={async () => { await api.del(`/api/v1/users/${del.id}`); users.refresh(); }}><p>The user can no longer sign in. Their audit entries stay.</p></ConfirmDialog>}
     </Card>
   );
@@ -364,20 +370,174 @@ function ResetPassword({ u, onClose }: { u: User; onClose: () => void }) {
   );
 }
 
+interface CertInfo { fingerprint: string; not_after: string; subject: string; self_signed: boolean }
+interface CertCheck { subject: string; names: string[]; issuer: string; not_before: string; not_after: string; fingerprint: string; chain_length: number; self_signed: boolean; trusted_by_system: boolean; warnings: string[] }
+
+// TLS (overnight item 12): upload a certificate, checked before it is
+// served; the previous pair is kept for rollback.
 function TLSSection() {
-  const sys = useApi<SystemInfo>("/api/v1/system");
+  const info = useApi<{ current: CertInfo; source: string; previous: CertInfo | null; previous_error?: string }>("/api/v1/tls");
+  const [f, setF] = useState({ cert: "", key: "", chain: "" });
+  const [check, setCheck] = useState<CertCheck | null>(null);
+  const [err, setErr] = useState<Error>();
+  const [confirm, setConfirm] = useState<"install" | "rollback" | null>(null);
+  const { run, busy } = useAction();
+  const load = (k: "cert" | "key" | "chain") => async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) { setF((x) => ({ ...x, [k]: "" })); const t = await file.text(); setF((x) => ({ ...x, [k]: t })); setCheck(null); }
+  };
+  const validate = async () => {
+    setErr(undefined); setCheck(null);
+    try { setCheck(await api.post<CertCheck>("/api/v1/tls/validate", f)); } catch (e) { setErr(e as Error); }
+  };
+  const c = info.data?.current;
   return (
     <Card title="TLS">
-      {!sys.data ? <Skeleton /> : (
+      {info.error ? <ErrorState error={info.error} retry={info.refresh} /> : !info.data || !c ? <Skeleton /> : (
         <div className="stack">
-          <dl className="kv"><dt>Subject</dt><dd>{sys.data.tls.subject}</dd><dt>Fingerprint (SHA-256)</dt><dd className="mono wrapany">{sys.data.tls.fingerprint}</dd><dt>Valid until</dt><dd>{time(sys.data.tls.not_after)}</dd><dt>Type</dt><dd>{sys.data.tls.self_signed ? "Self-signed, created by install.sh" : "Provided certificate"}</dd></dl>
-          <p className="small muted">To use your own certificate, set tls_cert and tls_key in /etc/upwell/config.yaml and restart Upwell. Uploading a certificate here is coming soon.</p>
+          <dl className="kv"><dt>Subject</dt><dd>{c.subject}</dd><dt>Fingerprint (SHA-256)</dt><dd className="mono wrapany">{c.fingerprint}</dd><dt>Valid until</dt><dd>{time(Date.parse(c.not_after))}</dd><dt>Type</dt><dd>{info.data.source === "uploaded" ? "Uploaded here" : c.self_signed ? "Self-signed, created by install.sh" : "From the configuration file"}</dd></dl>
+          {info.data.previous && (
+            <div className="row"><span className="small muted">Previous: {info.data.previous.subject}, valid until {time(Date.parse(info.data.previous.not_after))}</span><button disabled={!!busy} onClick={() => setConfirm("rollback")}>Roll back to the previous certificate</button></div>
+          )}
+          <h3>Upload a certificate</h3>
+          <p className="small muted">PEM files: the certificate (with or without its chain), its private key, and the intermediate chain if separate. Upwell checks that the key matches, the certificate is valid now and is for servers, and the chain is unbroken before serving it; the current pair is kept for rollback. The browser may ask you to accept the new certificate.</p>
+          <div className="fieldgrid">
+            <label className="field"><span className="lbl">Certificate</span><input type="file" accept=".pem,.crt,.cer" aria-label="Certificate file" onChange={load("cert")} /><textarea aria-label="Certificate PEM" rows={4} className="mono small" value={f.cert} onChange={(e) => { setF({ ...f, cert: e.target.value }); setCheck(null); }} placeholder="-----BEGIN CERTIFICATE-----" /></label>
+            <label className="field"><span className="lbl">Private key</span><input type="file" accept=".pem,.key" aria-label="Private key file" onChange={load("key")} /><textarea aria-label="Private key PEM" rows={4} className="mono small" value={f.key} onChange={(e) => { setF({ ...f, key: e.target.value }); setCheck(null); }} placeholder="-----BEGIN PRIVATE KEY-----" /></label>
+            <label className="field"><span className="lbl">Chain (optional)</span><input type="file" accept=".pem,.crt" aria-label="Chain file" onChange={load("chain")} /><textarea aria-label="Chain PEM" rows={4} className="mono small" value={f.chain} onChange={(e) => { setF({ ...f, chain: e.target.value }); setCheck(null); }} /></label>
+          </div>
+          <div className="row"><button disabled={!f.cert || !f.key || !!busy} onClick={validate}>Check</button>{check && <button className="primary" disabled={!!busy} onClick={() => setConfirm("install")}>Install this certificate</button>}</div>
+          {check && (
+            <div className="callout info" data-testid="cert-check"><div className="body">
+              <strong>{check.subject} · valid until {time(Date.parse(check.not_after))}</strong>
+              <span className="small">Names: {check.names.join(", ") || "none"} · issuer {check.issuer} · chain of {check.chain_length} · {check.trusted_by_system ? "trusted by public authorities" : check.self_signed ? "self-signed" : "private authority"}</span>
+              <span className="mono small wrapany">{check.fingerprint}</span>
+              {check.warnings.map((w) => <span key={w} className="small">{w}</span>)}
+            </div></div>
+          )}
+          {err && <ErrorState error={err} />}
         </div>
       )}
+      {confirm === "install" && <ConfirmDialog title="Install this certificate" confirmLabel="Install" onClose={() => setConfirm(null)} onConfirm={async () => { await run("tls", () => api.post("/api/v1/tls/certificate", f), "Certificate installed"); setF({ cert: "", key: "", chain: "" }); setCheck(null); info.refresh(); }}><p>New connections get the new certificate at once; the current one is kept so you can roll back. Recorded in the audit log.</p></ConfirmDialog>}
+      {confirm === "rollback" && <ConfirmDialog title="Roll back the certificate" confirmLabel="Roll back" onClose={() => setConfirm(null)} onConfirm={async () => { await run("tlsrb", () => api.post("/api/v1/tls/rollback"), "Previous certificate restored"); info.refresh(); }}><p>New connections get the previous certificate again; the current one becomes the previous one.</p></ConfirmDialog>}
     </Card>
   );
 }
 
 export function NotFound() {
   return <Page title="Not found"><Empty title="This page does not exist" action={<Link className="btn" to="/">Go home</Link>}>Check the address, or use Ctrl K to jump to a screen or migration.</Empty></Page>;
+}
+
+interface APIToken { id: string; name: string; prefix: string; scope: string; created_by: string; created_at: number; expires_at: number; last_used_at?: number; revoked_at?: number; revoked_by?: string }
+
+// API tokens (overnight item 4): read-only bearer tokens, shown once.
+function TokensSection() {
+  const { can } = useSession();
+  const list = useApi<APIToken[]>(can("admin") ? "/api/v1/api-tokens" : null);
+  const [create, setCreate] = useState(false);
+  const [shown, setShown] = useState<string | null>(null);
+  const [revoke, setRevoke] = useState<APIToken | null>(null);
+  if (!can("admin")) return <Card title="API tokens"><p className="muted">Only Admins manage API tokens.</p></Card>;
+  const now = Date.now();
+  return (
+    <Card title="API tokens" actions={<button className="primary" onClick={() => setCreate(true)}>Create token</button>}>
+      <div className="stack">
+        <p className="small muted">Tokens let scripts read Upwell with <span className="mono">Authorization: Bearer &lt;token&gt;</span>. They are read-only: <strong>read</strong> sees what a Viewer sees; <strong>metrics</strong> reads only <span className="mono">/metrics</span>. Upwell stores only a hash, so a token is shown once. Revoking one stops it on its next request.</p>
+        {shown && (
+          <div className="callout warn" role="status" data-testid="new-token"><div className="body">
+            <strong>Copy the token now; it is not shown again</strong>
+            <code className="mono wrapany">{shown}</code>
+            <div className="row"><button onClick={() => { navigator.clipboard?.writeText(shown).catch(() => {}); }}>Copy</button><button className="ghost" onClick={() => setShown(null)}>Done</button></div>
+          </div></div>
+        )}
+        {list.error ? <ErrorState error={list.error} retry={list.refresh} /> : !list.data ? <Skeleton lines={3} /> : list.data.length === 0 ? <Empty title="No API tokens">Create one for a script or for Prometheus.</Empty> : (
+          <div className="tablewrap">
+            <table className="data" aria-label="API tokens">
+              <thead><tr><th>Name</th><th>Token</th><th>Scope</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead>
+              <tbody>{list.data.map((t) => (
+                <tr key={t.id}>
+                  <td style={{ maxWidth: 220 }}><Trunc>{t.name}</Trunc></td>
+                  <td className="mono">{t.prefix}…</td>
+                  <td>{t.scope}</td>
+                  <td>{time(t.created_at)} <span className="small muted">by {t.created_by}</span></td>
+                  <td>{time(t.expires_at)}</td>
+                  <td>{t.last_used_at ? time(t.last_used_at) : "Never"}</td>
+                  <td>{t.revoked_at ? <Pill kind="crit" text="Revoked" /> : t.expires_at < now ? <Pill kind="warn" text="Expired" /> : <Pill kind="ok" text="Active" />}</td>
+                  <td>{!t.revoked_at && <button className="ghost" onClick={() => setRevoke(t)}>Revoke</button>}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      {create && <CreateToken onClose={() => setCreate(false)} onDone={(tok) => { setShown(tok); list.refresh(); }} />}
+      {revoke && <ConfirmDialog title={`Revoke ${revoke.name}`} danger confirmLabel="Revoke token" onClose={() => setRevoke(null)} onConfirm={async () => { await api.del(`/api/v1/api-tokens/${revoke.id}`); list.refresh(); }}><p>Anything using this token stops working on its next request. Recorded in the audit log.</p></ConfirmDialog>}
+    </Card>
+  );
+}
+
+function CreateToken({ onClose, onDone }: { onClose: () => void; onDone: (token: string) => void }) {
+  const [f, setF] = useState({ name: "", scope: "read", expires_days: 90 });
+  const [err, setErr] = useState<Error>();
+  const save = async () => {
+    try { const r = await api.post<{ token: string }>("/api/v1/api-tokens", f); onDone(r.token); onClose(); } catch (e) { setErr(e as Error); }
+  };
+  return (
+    <Dialog title="Create an API token" onClose={onClose} footer={<><button onClick={onClose}>Cancel</button><button className="primary" disabled={!f.name.trim()} onClick={save}>Create token</button></>}>
+      <Field label="Name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="What uses it, e.g. prometheus" /></Field>
+      <Field label="Scope"><select value={f.scope} onChange={(e) => setF({ ...f, scope: e.target.value })}><option value="read">read: everything a Viewer can read</option><option value="metrics">metrics: only /metrics</option></select></Field>
+      <Field label="Expires after (days)"><input type="number" min={1} max={366} value={f.expires_days} onChange={(e) => setF({ ...f, expires_days: Number(e.target.value) })} /></Field>
+      {err && <ErrorState error={err} />}
+    </Dialog>
+  );
+}
+
+// Metrics export (overnight item 5): the Prometheus endpoint.
+function MetricsSection() {
+  const origin = window.location.origin;
+  const example = `scrape_configs:
+  - job_name: upwell
+    scheme: https
+    tls_config: { insecure_skip_verify: true }   # or ca_file: the droplet's certificate
+    authorization: { credentials: "<token with the metrics scope>" }
+    static_configs: [{ targets: ["${window.location.host}"] }]
+    metrics_path: /metrics`;
+  return (
+    <Card title="Metrics export">
+      <div className="stack">
+        <p>Upwell serves Prometheus metrics at <span className="mono">{origin}/metrics</span>: migration state, verdict and write freeze; per database its state, backlog, heartbeat lag, apply watchdog, slot retention and sizes; per cluster connections, WAL rate and the oldest transaction; the droplet's disk, CPU and memory; and firing alerts. Series are labelled <span className="mono">migration</span>, <span className="mono">database</span> and <span className="mono">scope</span>. No passwords, connection strings or hostnames are exported.</p>
+        <p>Scrape it with an API token that has the <strong>metrics</strong> scope (create one in API tokens). Nothing is sent anywhere: Prometheus pulls.</p>
+        <pre className="cmd">{example}</pre>
+      </div>
+    </Card>
+  );
+}
+
+interface LogView { id: string; name: string; filters: Record<string, string>; created_at: number }
+
+// Saved log views (overnight item 10): named filter sets, yours only.
+function SavedViews({ value, onChange }: { value: Record<string, string>; onChange: (f: Record<string, string>) => void }) {
+  const views = useApi<LogView[]>("/api/v1/log-views");
+  const [name, setName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const { run, busy } = useAction();
+  const current = (views.data || []).find((v) => JSON.stringify(v.filters) === JSON.stringify(Object.fromEntries(Object.entries(value).filter(([, x]) => x))));
+  return (
+    <div className="row small" style={{ gap: 8 }}>
+      <label className="row" style={{ gap: 6 }}>Saved view
+        <select aria-label="Saved view" value={current?.id || ""} onChange={(e) => { const v = views.data?.find((x) => x.id === e.target.value); if (v) onChange({ level: "info", ...v.filters }); }} style={{ maxWidth: 240 }}>
+          <option value="">{(views.data || []).length ? "Choose a view" : "No saved views"}</option>
+          {(views.data || []).map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+        </select>
+      </label>
+      {current && <button className="ghost" disabled={!!busy} onClick={() => run("delview", () => api.del(`/api/v1/log-views/${current.id}`), `Deleted ${current.name}`).then(views.refresh)}>Delete view</button>}
+      {saving ? (
+        <span className="row" style={{ gap: 6 }}>
+          <input aria-label="View name" placeholder="Name this view" value={name} onChange={(e) => setName(e.target.value)} style={{ width: 200 }} />
+          <button className="primary" disabled={!name.trim() || !!busy} onClick={() => run("saveview", () => api.post("/api/v1/log-views", { name, filters: value }), `Saved ${name}`).then(() => { setSaving(false); setName(""); views.refresh(); })}>Save</button>
+          <button className="ghost" onClick={() => setSaving(false)}>Cancel</button>
+        </span>
+      ) : <button className="ghost" onClick={() => setSaving(true)}>Save these filters</button>}
+    </div>
+  );
 }

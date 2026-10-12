@@ -20,6 +20,7 @@ type VerifyInput struct {
 	TargetMaint        pg.Conn
 	Origin             string
 	HeartbeatRequired  bool
+	Offline            bool // writes were stopped before a one-time copy
 	HeartbeatToken     string
 	HBBeforeLSN        string
 	OriginLSN          string // measured after the drain; empty to measure now
@@ -51,7 +52,7 @@ func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) 
 	// A partitioned parent has no storage of its own: its size is its
 	// partitions', so the budget orders it correctly. The column signature
 	// includes NOT NULL, identity and generated expressions and defaults.
-	rows, err := c.Query(ctx, `SELECT format('%I.%I', n.nspname, c.relname),
+	rows, err := pg.Query(ctx, c, `SELECT format('%I.%I', n.nspname, c.relname),
 		CASE WHEN c.relkind='p' THEN (SELECT COALESCE(sum(pg_total_relation_size(pt.relid)),0)::bigint FROM pg_partition_tree(c.oid) pt) ELSE pg_total_relation_size(c.oid) END,
 		GREATEST(c.reltuples,0)::bigint,
 		c.relkind::text || '|' || COALESCE((SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod)||CASE WHEN a.attnotnull THEN ' not null' ELSE '' END||
@@ -124,7 +125,7 @@ func prepareVerifySession(ctx context.Context, c *pgx.Conn) error {
 		stmts = append(stmts, "SET idle_session_timeout = 0")
 	}
 	for _, q := range stmts {
-		if _, err := c.Exec(ctx, q); err != nil {
+		if _, err := pg.Exec(ctx, c, q); err != nil {
 			return fmt.Errorf("%s: %w", q, err)
 		}
 	}
@@ -135,7 +136,7 @@ func prepareVerifySession(ctx context.Context, c *pgx.Conn) error {
 func rowsHash(ctx context.Context, c *pgx.Conn, table string) (int64, string, error) {
 	var n int64
 	var sum *string
-	err := c.QueryRow(ctx, fmt.Sprintf(`SELECT count(*), COALESCE(sum(('x'||substr(md5(ROW(t.*)::text),1,15))::bit(60)::bigint),0)::text FROM %s t`, table)).Scan(&n, &sum)
+	err := pg.QueryRow(ctx, c, fmt.Sprintf(`SELECT count(*), COALESCE(sum(('x'||substr(md5(ROW(t.*)::text),1,15))::bit(60)::bigint),0)::text FROM %s t`, table)).Scan(&n, &sum)
 	if err != nil {
 		return 0, "", err
 	}
@@ -144,7 +145,7 @@ func rowsHash(ctx context.Context, c *pgx.Conn, table string) (int64, string, er
 
 func exactCount(ctx context.Context, c *pgx.Conn, table string) (int64, error) {
 	var n int64
-	err := c.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, table)).Scan(&n)
+	err := pg.QueryRow(ctx, c, fmt.Sprintf(`SELECT count(*) FROM %s`, table)).Scan(&n)
 	return n, err
 }
 
@@ -172,7 +173,11 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			}
 		}
 	} else {
-		add(vres("final_heartbeat", db, check.Warning, "Final heartbeat on the target", "Heartbeat is off for this migration (accepted risk): no proof the last writes arrived beyond the data comparison.", map[string]any{"required": false}))
+		if in.Offline {
+			add(vres("final_heartbeat", db, check.Info, "Final heartbeat on the target", "Offline migration: writes were stopped before the copy, so no heartbeat is needed; the writes_stopped check proves the source did not change.", map[string]any{"required": false, "offline": true}))
+		} else {
+			add(vres("final_heartbeat", db, check.Warning, "Final heartbeat on the target", "Heartbeat is off for this migration (accepted risk): no proof the last writes arrived beyond the data comparison.", map[string]any{"required": false}))
+		}
 	}
 
 	// 2. Origin reached the final heartbeat's position (D3).
@@ -397,7 +402,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			if e1 == nil && e2 == nil && an == bn && as == bs {
 				continue
 			}
-			if _, err := dst.Exec(ctx, "REFRESH MATERIALIZED VIEW "+mv); err == nil {
+			if _, err := pg.Exec(ctx, dst, "REFRESH MATERIALIZED VIEW "+mv); err == nil {
 				bn, bs, e2 = rowsHash(ctx, dst, mv)
 				if e1 == nil && e2 == nil && an == bn && as == bs {
 					refreshed = append(refreshed, mv)
@@ -447,7 +452,7 @@ type seqVal struct {
 }
 
 func sequenceValues(ctx context.Context, c *pgx.Conn) (map[string]seqVal, error) {
-	rows, err := c.Query(ctx, `SELECT format('%I.%I', schemaname, sequencename), last_value, start_value, increment_by < 0 FROM pg_sequences WHERE schemaname <> 'upwell'`)
+	rows, err := pg.Query(ctx, c, `SELECT format('%I.%I', schemaname, sequencename), last_value, start_value, increment_by < 0 FROM pg_sequences WHERE schemaname <> 'upwell'`)
 	if err != nil {
 		return nil, err
 	}
@@ -531,7 +536,7 @@ func SyncSequences(ctx context.Context, srcC, dstC pg.Conn) (int, error) {
 		if !ok || !behind(v, cur) {
 			continue
 		}
-		if _, err := dst.Exec(ctx, `SELECT setval($1::regclass, $2)`, name, v.v); err != nil {
+		if _, err := pg.Exec(ctx, dst, `SELECT setval($1::regclass, $2)`, name, v.v); err != nil {
 			return n, fmt.Errorf("sequence %s: %w", name, err)
 		}
 		n++
@@ -539,19 +544,41 @@ func SyncSequences(ctx context.Context, srcC, dstC pg.Conn) (int, error) {
 	return n, nil
 }
 
-// WriteActivity samples total row changes in a database (for the manual
-// stop-writes check).
-func WriteActivity(ctx context.Context, c pg.Conn) (int64, []string, error) {
+// Activity is one sample of a source database's writes.
+type Activity struct {
+	// Changes is the row-change counter (inserts, updates and deletes in
+	// user tables). PostgreSQL adds a transaction's changes when it ends.
+	Changes int64
+	// OpenWriters are client sessions inside a transaction that has written
+	// (it holds a transaction ID): invisible to Changes until they commit.
+	OpenWriters []string
+	// Sessions are the other client sessions connected to the database.
+	Sessions []string
+}
+
+// WriteActivity samples a source database's writes. It fails closed: any
+// failed query is an error, never "no writes" (D44). Upwell's own and the
+// engine's sessions are excluded, and so is Upwell's heartbeat schema.
+func WriteActivity(ctx context.Context, c pg.Conn) (Activity, error) {
+	var a Activity
 	conn, err := pg.Connect(ctx, c, 15*time.Second)
 	if err != nil {
-		return 0, nil, err
+		return a, err
 	}
 	defer conn.Close(ctx)
-	var n int64
-	conn.QueryRow(ctx, `SELECT COALESCE(sum(n_tup_ins+n_tup_upd+n_tup_del),0)::bigint FROM pg_stat_user_tables WHERE schemaname <> 'upwell'`).Scan(&n)
-	sessions, _ := pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' ('||COALESCE(application_name,'')||', '||state||')' FROM pg_stat_activity
-		WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND COALESCE(application_name,'') NOT LIKE 'upwell%' AND COALESCE(application_name,'') NOT LIKE 'pgcopydb%' ORDER BY 1 LIMIT 50`)
-	return n, sessions, nil
+	if err := pg.QueryRow(ctx, conn, `SELECT COALESCE(sum(n_tup_ins+n_tup_upd+n_tup_del),0)::bigint FROM pg_stat_user_tables WHERE schemaname <> 'upwell'`).Scan(&a.Changes); err != nil {
+		return a, fmt.Errorf("reading row-change statistics: %w", err)
+	}
+	const others = ClientSessionsWhere
+	if a.OpenWriters, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' pid '||pid||' ('||COALESCE(application_name,'')||', '||state||', open '||
+		COALESCE(extract(epoch FROM now()-xact_start)::int,0)||' s)' FROM pg_stat_activity WHERE `+others+` AND backend_xid IS NOT NULL ORDER BY 1 LIMIT 50`); err != nil {
+		return a, fmt.Errorf("listing open write transactions: %w", err)
+	}
+	if a.Sessions, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' ('||COALESCE(application_name,'')||', '||state||')' FROM pg_stat_activity
+		WHERE `+others+` ORDER BY 1 LIMIT 50`); err != nil {
+		return a, fmt.Errorf("listing client sessions: %w", err)
+	}
+	return a, nil
 }
 
 // SchemaDrift lists the differences that logical decoding cannot carry and
@@ -636,7 +663,7 @@ type loSummary struct {
 func largeObjects(ctx context.Context, c *pgx.Conn) (loSummary, error) {
 	var s loSummary
 	var sum *string
-	err := c.QueryRow(ctx, `SELECT count(*), COALESCE(sum(('x'||substr(md5(m.oid::text||':'||md5(lo_get(m.oid))),1,15))::bit(60)::bigint),0)::text FROM pg_largeobject_metadata m`).Scan(&s.Count, &sum)
+	err := pg.QueryRow(ctx, c, `SELECT count(*), COALESCE(sum(('x'||substr(md5(m.oid::text||':'||md5(lo_get(m.oid))),1,15))::bit(60)::bigint),0)::text FROM pg_largeobject_metadata m`).Scan(&s.Count, &sum)
 	if sum != nil {
 		s.Sum = *sum
 	}

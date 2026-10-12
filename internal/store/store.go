@@ -117,7 +117,7 @@ func (s *Store) Immediate(ctx context.Context, fn func(c *sql.Conn) error) (err 
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if _, err := c.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return err
 	}

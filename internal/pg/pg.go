@@ -79,10 +79,19 @@ func Connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn,
 	if err != nil {
 		return nil, Explain(err)
 	}
-	pinned, _, perr := sessionPinned(ctx, conn, c)
-	if perr != nil {
-		conn.Close(ctx)
-		return nil, Explain(perr)
+	// Probing costs a second connection and several round trips, and a busy
+	// proxy can be slow to accept connections: probe an endpoint once every
+	// 10 minutes, not on every connection. The connection test and preflight
+	// always probe (ProbeSession).
+	pinned, cached := pinnedCached(key)
+	if !cached {
+		var perr error
+		pinned, _, perr = sessionPinned(ctx, conn, c)
+		if perr != nil {
+			conn.Close(ctx)
+			return nil, Explain(perr)
+		}
+		pinnedCache.Store(key, pinnedEntry{pinned, time.Now()})
 	}
 	if pinned {
 		if _, err := conn.Exec(ctx, "SET statement_timeout = "+strconv.Itoa(int(stmtTimeout/time.Millisecond)), pgx.QueryExecModeSimpleProtocol); err != nil {
@@ -91,6 +100,27 @@ func Connect(ctx context.Context, c Conn, stmtTimeout time.Duration) (*pgx.Conn,
 		}
 	}
 	return conn, nil
+}
+
+type pinnedEntry struct {
+	pinned bool
+	at     time.Time
+}
+
+// pinnedCache remembers, per endpoint, whether sessions behind its pooler
+// keep their settings.
+var pinnedCache sync.Map
+
+func pinnedCached(key string) (pinned, ok bool) {
+	v, found := pinnedCache.Load(key)
+	if !found {
+		return false, false
+	}
+	e := v.(pinnedEntry)
+	if time.Since(e.at) > 10*time.Minute {
+		return false, false
+	}
+	return e.pinned, true
 }
 
 // refusesStartupParams remembers endpoints (host:port) that refused a
@@ -126,7 +156,7 @@ type Session struct {
 func ProbeSession(ctx context.Context, c *pgx.Conn, at Conn) (Session, error) {
 	var s Session
 	var addr *string
-	if err := c.QueryRow(ctx, `SELECT host(inet_client_addr())`, pgx.QueryExecModeSimpleProtocol).Scan(&addr); err != nil {
+	if err := QueryRow(ctx, c, `SELECT host(inet_client_addr())`, pgx.QueryExecModeSimpleProtocol).Scan(&addr); err != nil {
 		return s, err
 	}
 	if addr != nil {
@@ -149,7 +179,7 @@ func sessionPinned(ctx context.Context, c *pgx.Conn, at Conn) (bool, []int, erro
 	pinned := true
 	probe := func() error {
 		var pid int
-		if err := c.QueryRow(ctx, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid); err != nil {
+		if err := QueryRow(ctx, c, `SELECT pg_backend_pid()`, pgx.QueryExecModeSimpleProtocol).Scan(&pid); err != nil {
 			return err
 		}
 		pids = append(pids, pid)
@@ -309,7 +339,7 @@ func trim(s string) string {
 // ServerVersionNum returns server_version_num.
 func ServerVersionNum(ctx context.Context, c *pgx.Conn) (int, error) {
 	var s string
-	if err := c.QueryRow(ctx, `SHOW server_version_num`).Scan(&s); err != nil {
+	if err := QueryRow(ctx, c, `SHOW server_version_num`).Scan(&s); err != nil {
 		return 0, err
 	}
 	return strconv.Atoi(s)
@@ -317,7 +347,7 @@ func ServerVersionNum(ctx context.Context, c *pgx.Conn) (int, error) {
 
 // QueryStrings runs q and returns the first column as strings.
 func QueryStrings(ctx context.Context, c *pgx.Conn, q string, args ...any) ([]string, error) {
-	rows, err := c.Query(ctx, q, args...)
+	rows, err := Query(ctx, c, q, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,6 +82,7 @@ type Env struct {
 	csrf   string
 	cancel context.CancelFunc
 	log    *logx.Logger
+	Audit  *audit.Log
 }
 
 func TestMain(m *testing.M) {
@@ -129,6 +131,7 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 	o := orch.New(orch.Deps{Config: cfg, Store: st, Vault: vault, Engine: pgcopydb.New("pgcopydb", r), Runner: r, Logger: lg, Bus: b, Audit: au, Settings: set})
 	o.SetTestHooks(hooks)
 	as := auth.NewService(st)
+	as.Vault = vault
 	as.FastHashForTests()
 	health := api.NewHealth()
 	health.Ready = func() (bool, map[string]any) { return true, map[string]any{} }
@@ -136,10 +139,11 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 	srv := api.New(&api.Server{Cfg: cfg, Store: st, Auth: as, Audit: au, Orch: o, Settings: set, Bus: b, Log: lg, Version: "test", Health: health,
 		TLSInfo: func() api.TLSInfo { return api.TLSInfo{} }})
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Env{t: t, Dir: dir, Cfg: cfg, Store: st, Orch: o, cancel: cancel, log: lg}
+	e := &Env{t: t, Dir: dir, Cfg: cfg, Store: st, Orch: o, cancel: cancel, log: lg, Audit: au}
 	// Fast settings for tests.
 	for k, v := range map[string]any{"wal_sample_seconds": 10, "cutover_stable_seconds": 5, "cutover_write_sample_seconds": 5, "sample_interval_seconds": 2,
-		"alert_disk_crit_pct": 99, "alert_disk_warn_pct": 98, "disk_guard_stop_pct": 99, "cutover_drain_timeout_seconds": 120, "retry_base_seconds": 2} {
+		"alert_disk_crit_pct": 99, "alert_disk_warn_pct": 98, "disk_guard_stop_pct": 99, "cutover_drain_timeout_seconds": 120, "retry_base_seconds": 2,
+		"mfa_required_for_admins": false} {
 		if _, _, err := set.Set(ctx, k, v, "test"); err != nil {
 			t.Fatal(err)
 		}
@@ -316,6 +320,7 @@ func dropDB(t *testing.T, name string) {
 type writer struct {
 	stop chan struct{}
 	done chan struct{}
+	once sync.Once
 	n    int
 }
 
@@ -344,7 +349,11 @@ func startWriter(t *testing.T, db string) *writer {
 	return w
 }
 
-func (w *writer) Stop() { close(w.stop); <-w.done }
+// Stop ends the writer; calling it again is harmless.
+func (w *writer) Stop() {
+	w.once.Do(func() { close(w.stop) })
+	<-w.done
+}
 
 // ---------- migration helpers
 
@@ -392,7 +401,12 @@ func (e *Env) defineMigration(name string, dbs []string, overrides map[string]an
 		}
 	})
 	e.do("PUT", "/api/v1/migrations/"+m.ID+"/permission", map[string]any{"customer": "Test Customer", "account_id": "team-1", "ticket": "TEST-1", "granted_by": "tester@example.com", "granted_at": "2026-10-08", "scope": "test databases"}, nil, 200)
-	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/source", map[string]any{"host": "127.0.0.1", "port": srcPort, "user": "doadmin", "password": password, "sslmode": "disable"}, nil, 200)
+	sport := srcPort
+	if p, ok := overrides["_source_port"].(int); ok {
+		sport = p
+		delete(overrides, "_source_port")
+	}
+	e.do("PUT", "/api/v1/migrations/"+m.ID+"/connections/source", map[string]any{"host": "127.0.0.1", "port": sport, "user": "doadmin", "password": password, "sslmode": "disable"}, nil, 200)
 	tport := dstPort
 	if p, ok := overrides["_target_port"].(int); ok {
 		tport = p
@@ -418,7 +432,7 @@ func (e *Env) defineMigration(name string, dbs []string, overrides map[string]an
 		}
 	}
 	e.do("PUT", "/api/v1/migrations/"+m.ID+"/databases", sel, nil, 200)
-	if overrides != nil {
+	if len(overrides) > 0 {
 		e.do("PATCH", "/api/v1/migrations/"+m.ID, map[string]any{"settings": overrides}, nil, 200)
 	}
 	return m.ID

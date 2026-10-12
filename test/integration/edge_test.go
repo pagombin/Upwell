@@ -125,6 +125,9 @@ func TestEdgeNoReplicaIdentity(t *testing.T) {
 		t.Fatalf("the application's UPDATE failed on the source: %v", upErr)
 	}
 	exec1(t, srcConn, db, `INSERT INTO nokey VALUES (1000, 'inserted')`)
-	outcome(t, e, id, db)
+	// Bug bash 2: after the fix (REPLICA IDENTITY FULL) the migration is GO.
+	if v := outcome(t, e, id, db); v != "GO" {
+		t.Fatalf("verdict %s after the replica identity fix", v)
+	}
 	e.cleanup(id, "Edge no identity")
 }

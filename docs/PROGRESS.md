@@ -1,6 +1,122 @@
 # Upwell overnight build: progress
 
-Branch `overnight-build`. Status legend: **done**; **partial** (what is missing is stated); **needs droplet** (implemented to spec and tested as far as a container allows, but it needs systemd as PID 1, a real DigitalOcean cluster or a DO account to prove); **stub** (labelled "Coming soon" in the UI, never a dead button).
+## Final regression (bug bash 12), 2026-10-11
+
+Run from a fresh clone of `origin/overnight-build-2` at `ed3470b` (the only later commit changes one README line), by `regress.sh`: every step must pass, and the clusters are checked for leftovers afterwards. **Overall: pass (exit 0).**
+
+| Step | Result | Time |
+| --- | --- | --- |
+| `go build ./...` | pass | 4 s |
+| `go vet` (plus the integration tag) | pass | 1 s |
+| `staticcheck` (plus the integration tag) | pass, 0 findings | 4 s |
+| `golangci-lint` (plus the integration tag) | pass, 0 findings | 21 s |
+| `go test -race -count=1 ./...` | pass | 15 s |
+| `shellcheck -S warning` on deploy, dev and spikes scripts | pass | 1 s |
+| `npm ci`, `npm audit`, `tsc --noEmit`, `eslint src e2e` | pass, 0 vulnerabilities | 11 s |
+| Integration suite (`-tags integration`, local clusters PG14, 15, 16 and 18) | pass: 58 tests, 0 failures, 1 skipped (`TestApplyThroughput`, a 15-minute measurement run only with `UPWELL_MEASURE=1`); includes `TestVersionMatrix` (PG14, 15, 16, 18), `TestOfflineWithFreeze`, `TestReadinessFailsClosed`, `TestRedactionCanaries` | 75 min |
+| `dev/e2e.sh` (Playwright 1.56.1, Chromium) | pass: UI 229/229, walkthrough 4/4, features 12/12; visual baseline unchanged from `ed3470b` | 12 min |
+| Leftovers | 0 replication slots on either source, 0 replication origins on any target, 0 `it_` or `upwell_rate_` databases; the four `e2e_*` databases are the browser-test fixtures, dropped and re-created at the start of every `dev/e2e.sh` run | |
+
+
+Branch `overnight-build` (the first build; the second is above, on `overnight-build-2`). Status legend: **done**; **partial** (what is missing is stated); **needs droplet** (implemented to spec and tested as far as a container allows, but it needs systemd as PID 1, a real DigitalOcean cluster or a DO account to prove); **stub** (labelled "Coming soon" in the UI, never a dead button).
+
+## Overnight build 2 (2026-10-11): the audit of 643e4c1
+
+Branch `overnight-build-2`. Every item below was first given a test that failed because of the problem, then fixed, then the test was run again; the decision entry has the before and after evidence. Tests run against the local clusters only (PostgreSQL 16 source and target, PostgreSQL 18 target without ICU).
+
+### Codebase findings
+
+| # | Finding | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| 1 | Preflight fails open | done: all 73 injected query failures end as a blocker (13 before) | `TestPreflightFailsClosed` | D47 |
+| 2 | Writers check fails open, misses open transactions | done | `TestWritersOpenTransactionRefused`, `TestWritesAfterVerificationNoGo`, `TestWritersCheckFailsClosed` | D48 |
+| 3 | Stale readiness | done (with E6) | `TestStaleReadinessTurnsRed` | D50 |
+| 4 | Admin override makes verification meaningless | done | `TestOverrideWithWritesRunningNoGo` | D49 |
+| 5 | mode=offline ignored | done: refused until offline mode exists | `TestModeOfflineNeverIgnored` | D51 |
+| 6 | Silent collation fallback | done (confirmed, and wider: the provider was ignored too) | `TestCollationFallbackWarned` | D53 |
+| 7 | Counts and quoting | done | `TestPreflightCountsAndQuoting` | D52 |
+| 8 | Plan errors ignored | done | `TestPlanErrorStopsEndPositions` (hung 15 min before) | D55 |
+| 9 | Sequence sync failures shown as done | done | `TestSequenceSyncFailureShown` | D56 |
+| 10 | Verification rows can be lost | done: NO-GO | `TestVerificationStoreFailureNoGo` | D57 |
+| 11 | Overrides proceed without their audit entry | done: refused | `TestAuditFailureRefusesOverrides` | D58 |
+
+### Preflight findings
+
+| # | Finding | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| 1 | Replica identity message wrong under test_decoding | done: verified on PG16 (the statement succeeds and is decoded without the old key) | `TestReplicaIdentityMatrix` | D59 |
+| 2 | FULL cost understated | done: `n_tup_upd`, `n_tup_del`, size and a cost verdict per table | `TestReplicaIdentityMatrix` | D59 |
+| 3 | lock_timeout | done | `TestReplicaIdentityMatrix` | D59 |
+| 4 | PK rewrite warning | done | `TestReplicaIdentityMatrix` | D59 |
+| 5 | Who can run it | done: ownership per table, named in the message | `TestReplicaIdentityMatrix` | D59 |
+| 6 | Privilege trade-off and revoke | done: stated, revoke script shipped and proven | `TestApplyPrivilegeGuidance` | D60 |
+| 7 | "before PostgreSQL 15" | done | `TestApplyPrivilegeGuidance` | D60 |
+| 8 | template1 gap | confirmed; guidance in the remediation and the grant script, launch message (E7) | `TestApplyPrivilegeGuidance`, `TestTemplate0LaunchExplains` | D54, D60 |
+| 9 | `'i'` with a dropped index; partitioned parents | verified on PG16 and pgcopydb's source: `'i'` behaves like NOTHING (now covered); parents were a false blocker (now leaf tables only) | `TestReplicaIdentityMatrix` | D59 |
+| 10 | Verify apply progress | done (with E2) | `TestApplyWatchStall`, `TestApplyStallDetected` | D61 |
+
+### Enhancements
+
+| # | Enhancement | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| E1 | Apply-rate measurement and calibration | done: 4.8 tps measured here | `TestApplyRateMeasured` | D62 |
+| E2 | Apply-progress watchdog | done | `TestApplyWatchStall`, `TestApplyStallDetected` | D61 |
+| E3 | Copy-ready fix SQL | done: `fix_sql`, `grant_script`, `revoke_script` with a Copy button | `TestReplicaIdentityMatrix`, `TestApplyPrivilegeGuidance` | D59, D60 |
+| E4 | FULL evidence | done | `TestReplicaIdentityMatrix` | D59 |
+| E5 | Post-cutover checklist | done | `TestPostCutoverChecklist` | D63 |
+| E6 | Sample age | done | `TestStaleReadinessTurnsRed` | D50 |
+| E7 | template0 explanation at launch | done | `TestTemplate0LaunchExplains` | D54 |
+
+### Overnight items
+
+Each works end to end from the browser (`web/e2e/features.spec.ts`, run by `dev/e2e.sh` after the walkthrough), keeps the data-safety gate (verification still decides GO), and its "Coming soon" label is gone. Nothing needs an external service.
+
+| # | Item | Status | Tests | Decision |
+| --- | --- | --- | --- | --- |
+| 1 | Write freeze | done: preview, typed confirmation, audited, automatic undo (stopped, NO-GO, aborted, cleanup, restart), undo button; the target never inherits the freeze | `TestWriteFreezeGO`, `TestWriteFreezeOverrideDetected`, `TestWriteFreezeAbortAndRestart`; browser "write freeze" | D64 |
+| 2 | Offline mode | done: writers stopped or frozen first, one copy, no slot, origin or heartbeat, verification with `writes_stopped`; resumes after a restart | `TestOfflineMigrationGO`, `TestOfflineWritesDuringCopyNoGo`, `TestOfflineWithFreeze`, `TestModeOfflineNeverIgnored`; browser "offline migration" | D65 |
+| 3 | TOTP and recovery codes | done (no QR code: secret and URI to copy) | `TestTOTP`, `TestTOTPLockout`, `TestTOTPVectors`; browser "second factor" | D66 |
+| 4 | API tokens | done | `TestAPITokens`, `TestAPITokenExpiry` | D67 |
+| 5 | Prometheus `/metrics` | done | `TestPrometheusMetrics` | D68 |
+| 6 | Support bundle | done | `TestSupportBundle`; browser "support bundle" | D69 |
+| 7 | Migration queue | done: run lock (store row and lock file), queue, reorder, unqueue, auto-start (not for offline) | `TestQueueRunLock`; browser "queue" | D70 |
+| 8 | PDF report | done: go-pdf/fpdf v0.9.0 vendored in `third_party/fpdf` | `TestPDFReport`; browser "PDF report" | D71 |
+| 9 | Watched tables | done | `TestWatchedTables`; browser (inside "write freeze") | D72 |
+| 10 | Saved log views | done | `TestSavedLogViews`; browser "saved log views" | D73 |
+| 11 | Network throughput | done | `TestParseNetDev`; browser "host" | D74 |
+| 12 | TLS certificate upload | done: validated before swap, served without a restart, previous pair kept for rollback | `TestCertificateUpload`; browser "TLS" | D75 |
+
+Still labelled "Coming soon", by instruction (they need an external service): DigitalOcean API discovery and token, notifications (Slack, email, PagerDuty) and the channel test. SSO, automatic update checks and self-serve mode stay out of this build.
+
+### Bug bashes
+
+Each bash ran its tests until they passed; the final regression (bash 12, at the top of this file) ran everything again from a clean checkout.
+
+**1. Fail closed.** `TestPreflightFailsClosed` fails each preflight query in turn (every query now ends as a blocker naming the failure); new `TestReadinessFailsClosed` fails the readiness collectors' own queries (heartbeat latency, the apply watchdog's origin read, the schema comparison) with every cluster reachable: lag, apply and schema turn red with the cause, the gate refuses a cutover, and they recover. `TestStaleReadinessTurnsRed` and `TestWritersCheckFailsClosed` cover lost access and the writers sample. Found: nothing new (the gaps were fixed under finding 1 and finding 3).
+
+**2. Replica identity matrix.** `TestReplicaIdentityMatrix` (`'d'` and `'n'`, `'i'` with its index dropped, keyed and unkeyed partitions, mixed case, a table owned by another role, both plugins), `TestPreflightCountsAndQuoting` (150 tables), new `TestPartitionedKeyedLeavesGO` (no blocker for a keyed-partition parent; UPDATE and DELETE through the parent while streaming; GO with equal data), `TestEdgeNoReplicaIdentity` (the application's UPDATE on the source during the migration, then GO after the fix). Found: `TestEdgeNoReplicaIdentity` only logged the verdict; it now requires GO. The partitioned-parent false blocker was fixed under preflight finding 9.
+
+**3. Writers at cutover.** `TestWritersOpenTransactionRefused` (a transaction open through the writers step, committed after), `TestWritesAfterVerificationNoGo` (a writer resuming after verification), `TestOverrideWithWritesRunningNoGo` (Admin override with writes running): NO-GO in every case with the reason named. Found: nothing new.
+
+**4. Write freeze.** `TestWriteFreezeGO`, `TestWriteFreezeOverrideDetected` (a session turns read-only off and writes: detected, cutover stopped, freeze undone), `TestWriteFreezeAbortAndRestart` (undone on abort, and by the restart after the process went away with the freeze applied), every step audited; browser "write freeze". Found while building: the undo ran in a read-only session and failed (fixed); with the offline mode, pgcopydb copied the freeze's `default_transaction_read_only` to the target (fixed, D65).
+
+**5. Stale readiness.** `TestStaleReadinessTurnsRed`: access to the target revoked mid-stream for longer than three collection intervals; lag and schema turn red within about a minute and show their age; they recover. Found: nothing new.
+
+**6. Template and collation.** `TestTemplate0LaunchExplains` (the launch re-check names template0 as the cause), `TestCollationFallbackWarned` (an ICU collation missing on a PostgreSQL 18 target without ICU: warning event, in the report). Found: nothing new.
+
+**7. Offline mode.** Browser "offline migration from the wizard to GO" (identical data), `TestOfflineMigrationGO`, `TestOfflineWritesDuringCopyNoGo`, `TestOfflineWithFreeze`, `TestModeOfflineNeverIgnored` (the setting through the API changes the engine command). Found while building: the scheduler refused launches during the offline run's copy step (the first test hung; fixed).
+
+**8. Auth.** `TestTOTP` (one step of clock skew each way, replay, recovery codes once, Admin enforcement, Admin reset), `TestTOTPLockout` (wrong codes lock the account), `TestAPITokens` and `TestAPITokenExpiry` (revoked and expired tokens fail on the next request); browser "second factor". Found: the browser test needed its console guard to accept the intended 401 `mfa_required` answer (test fix, not a product bug).
+
+**9. Redaction.** New `TestRedactionCanaries` plants the clusters' real password, an API token and a bearer header in log lines (through the logger) and searches the support bundle, `/metrics`, the HTML, Markdown and PDF reports (PDF streams inflated) and the logs, events and audit APIs: no canary anywhere, and the redacted forms are present. `TestSupportBundle` and `TestPrometheusMetrics` plant canaries in stored connections. Found: an Upwell API token written bare (without `token=`) was not redacted by the logger; a pattern for `upw_` tokens was added (`TestRedactUpwellToken`).
+
+**10. Queue.** `TestQueueRunLock`: one runner at a time, the queue survives a restart with one running and two queued, reorder while running, only the auto-start entry starts by itself; browser "queue". Found: nothing new beyond the run-lock ripple in `dev/e2e.sh` (the screen-test migration now ends before the walkthrough).
+
+**11. Version matrix.** New `TestVersionMatrix` with targets on PostgreSQL 14.22, 15.18, 16 and 18.6: 14 gets the "before PostgreSQL 15" hard blocker and the start is refused; 15, 16 and 18 reach GO with equal data (14 and 15 fed from a PostgreSQL 14 source, since a source may not be newer than its target). PostgreSQL 14 and 15 came from the `@embedded-postgres` npm packages (the PostgreSQL download site and GitHub are blocked by the session's network policy). Found: `spikes/env/local-clusters.sh` failed on a PostgreSQL 14 target (`GRANT SET ON PARAMETER` exists from 15); it now skips that grant before 15.
+
+**12. Full regression.** vet, staticcheck, golangci-lint (also over the integration tests), the race detector, shellcheck, npm audit, tsc, ESLint, the integration suite and the browser suite with the walkthrough and the feature tests, from a clean checkout; results at the top of this file. Found during the sweep and fixed before it: an ineffectual assignment and an unused handler, two unchecked errors, `t.Context()` (needs Go 1.24, the module says 1.23), and 17 npm advisories (dev tools and React Router) cleared by raising Playwright to 1.56.1 (it matches the installed Chromium 141), ESLint 9.39, typescript-eslint 8.71, Vite 6 and React Router 7.18; the login redirect also refuses backslashes. `TestComplexWorkloadGO` once timed out waiting for In sync while three test runs shared the container; it passed alone in 80 s, and its wait is now 5 minutes.
+
+The droplet fixes made while this branch started (D43 to D46: target connection lost mid-COPY reported as such, `pg_dumpall --database`, supervision deadlines, restart from zero with `--drop-if-exists`) are on `overnight-build` and merged here.
 
 ## Summary
 

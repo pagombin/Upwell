@@ -24,6 +24,18 @@ type Condition struct {
 	OK       bool   `json:"ok"`
 	Detail   string `json:"detail"`
 	Database string `json:"database,omitempty"`
+	// SampleAgeMS is how old the measurement behind the condition is (nil
+	// when it is not a measurement).
+	SampleAgeMS *int64 `json:"sample_age_ms,omitempty"`
+}
+
+func ageMS(at time.Time) *int64 {
+	ms := time.Since(at).Milliseconds()
+	return &ms
+}
+
+func ago(at time.Time) string {
+	return humanDuration(time.Since(at).Seconds()) + " ago"
 }
 
 // Readiness evaluates the cutover readiness gate.
@@ -61,25 +73,80 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 		// Lag in time, from the heartbeat: bytes of backlog can hide a long
 		// apply (pgcopydb applies a few transactions a second, F11), and the
 		// write pause lasts at least as long as the target is behind.
+		// Measurements older than three collection intervals no longer count:
+		// a collector that cannot reach a cluster must not leave the last good
+		// value green (D50).
+		iv := max(o.globalSettings(ctx).Int("sample_interval_seconds"), 5)
+		lagMaxAge := time.Duration(3*max(10, iv)) * time.Second
+		driftMaxAge := time.Duration(3*max(60, iv)) * time.Second
 		if v.Bool("heartbeat") {
 			maxLag := float64(o.globalSettings(ctx).Int("cutover_max_lag_seconds"))
 			lc := Condition{Key: "lag", Label: d.SourceName + " target lag", Database: d.SourceName}
-			if lag, ok := o.LastValue(m.ID, d.SourceName, "heartbeat_latency_s"); !ok {
+			lag, at, ok := o.metrics.LastAt(m.ID, d.SourceName, "heartbeat_latency_s")
+			switch {
+			case !ok:
 				lc.Detail = "Not measured yet: waiting for the heartbeat to reach the target"
-			} else if lag > maxLag {
-				lc.Detail = fmt.Sprintf("The target is %s behind (limit %s); the write pause would last at least that long", humanDuration(lag), humanDuration(maxLag))
-			} else {
+			case time.Since(at) > lagMaxAge:
+				lc.SampleAgeMS = ageMS(at)
+				lc.Detail = fmt.Sprintf("Not measured for %s (last measured %s, when the target was %s behind): Upwell may not be able to reach the source or the target", humanDuration(time.Since(at).Seconds()), ago(at), humanDuration(lag))
+			case lag > maxLag:
+				lc.SampleAgeMS = ageMS(at)
+				lc.Detail = fmt.Sprintf("The target is %s behind (limit %s); the write pause would last at least that long (measured %s)", humanDuration(lag), humanDuration(maxLag), ago(at))
+			default:
+				lc.SampleAgeMS = ageMS(at)
 				lc.OK = true
-				lc.Detail = fmt.Sprintf("The target is %s behind", humanDuration(lag))
+				lc.Detail = fmt.Sprintf("The target is %s behind (measured %s)", humanDuration(lag), ago(at))
 			}
 			out = append(out, lc)
 		}
+		// Apply progress, measured independently of the engine (E2): a
+		// sample that is missing, failed or too old is not a pass.
+		ac := Condition{Key: "apply", Label: d.SourceName + " target applying changes", Database: d.SourceName}
+		w, seen := o.metrics.ApplyWatch(d.ID)
+		if !w.At.IsZero() {
+			ac.SampleAgeMS = ageMS(w.At)
+		}
+		switch {
+		case !seen || (w.At.IsZero() && w.Err == nil):
+			ac.Detail = "Not measured yet: the first sample is taken within seconds of streaming"
+		case w.Err != nil && !w.ErrAt.Before(w.At):
+			ac.Detail = fmt.Sprintf("Could not measure apply progress: %v", w.Err)
+		case time.Since(w.At) > lagMaxAge:
+			ac.Detail = fmt.Sprintf("Not measured for %s (last measured %s)", humanDuration(time.Since(w.At).Seconds()), ago(w.At))
+		case w.Stalled:
+			ac.Detail = fmt.Sprintf("Stalled: the target origin has not moved for %s while the source's tables changed %d time(s) (measured %s)", humanDuration(time.Since(w.OriginChangedAt).Seconds()), w.ChangesSince(), ago(w.At))
+		case w.ChangesSince() == 0:
+			ac.OK = true
+			ac.Detail = fmt.Sprintf("Nothing changed on the source since the target last applied (origin at %s, measured %s)", orNone(w.Origin), ago(w.At))
+		default:
+			ac.OK = true
+			ac.Detail = fmt.Sprintf("The target origin moved %s ago; %d source change(s) since (measured %s)", humanDuration(time.Since(w.OriginChangedAt).Seconds()), w.ChangesSince(), ago(w.At))
+		}
+		out = append(out, ac)
 		// DDL is not streamed: a schema changed on the source ends NO-GO at
-		// verification, so refuse the cutover now and say why.
-		sc := Condition{Key: "schema", Label: d.SourceName + " schema unchanged", Database: d.SourceName, OK: true, Detail: "Same tables, columns and enum values on both sides"}
-		if drift := o.metrics.Drift(d.ID); len(drift) > 0 {
-			sc.OK = false
-			sc.Detail = "Changed on the source: " + strings.Join(limitStrings(drift, 3), "; ")
+		// verification, so refuse the cutover now and say why. A comparison
+		// that has not run, failed, or is too old is not a pass.
+		sc := Condition{Key: "schema", Label: d.SourceName + " schema unchanged", Database: d.SourceName}
+		drift, at, derr := o.metrics.DriftSample(d.ID)
+		if !at.IsZero() {
+			sc.SampleAgeMS = ageMS(at)
+		}
+		switch {
+		case derr != nil:
+			last := "never compared"
+			if !at.IsZero() {
+				last = "last compared " + ago(at)
+			}
+			sc.Detail = fmt.Sprintf("Could not compare the schemas: %v (%s)", derr, last)
+		case at.IsZero():
+			sc.Detail = "Not compared yet: the first comparison runs within a minute of the base copy finishing"
+		case time.Since(at) > driftMaxAge:
+			sc.Detail = fmt.Sprintf("Not compared for %s (last compared %s)", humanDuration(time.Since(at).Seconds()), ago(at))
+		case len(drift) > 0:
+			sc.Detail = "Changed on the source: " + strings.Join(limitStrings(drift, 3), "; ") + " (compared " + ago(at) + ")"
+		default:
+			sc.OK = true
+			sc.Detail = "Same tables, columns and enum values on both sides (compared " + ago(at) + ")"
 		}
 		out = append(out, sc)
 	}
@@ -105,6 +172,10 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 type CutoverParams struct {
 	ConfirmWritersStopped bool   `json:"confirm_writers_stopped"`
 	OverrideConfirm       string `json:"override_confirm"`
+	// WriteFreeze applies the write freeze at the writers step; FreezeConfirm
+	// must be the source cluster's name (FreezeConfirmName).
+	WriteFreeze   bool   `json:"write_freeze"`
+	FreezeConfirm string `json:"freeze_confirm"`
 }
 
 var cutoverCancels sync.Map // op id -> context.CancelFunc
@@ -123,6 +194,9 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	}
 	if m.Fixture {
 		return nil, uerr("fixture", "This is a demonstration fixture.", "")
+	}
+	if o.IsOffline(ctx, m) && m.Flags.Started {
+		return nil, uerr("offline", "An offline migration has no separate cutover: it verifies as soon as the copy finishes.", "Use Verify again after restarting a database.")
 	}
 	continuing := m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0
 	if continuing {
@@ -153,8 +227,19 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 		if m.Flags.Verdict != "" {
 			return nil, uerr("verdict", "This migration already has a verdict.", "Restart the failed databases to try again.")
 		}
-		if !p.ConfirmWritersStopped {
-			return nil, uerr("confirm_writers", "Confirm that the customer has stopped every writer.", "Tick the confirmation in the cutover console.")
+		if p.WriteFreeze {
+			if role != "admin" {
+				return nil, uerr("admin_only", "Only an Admin can apply the write freeze.", "Ask an Admin, or stop writers by hand and confirm it.")
+			}
+			src, _, err := o.Conns(ctx, m)
+			if err != nil {
+				return nil, err
+			}
+			if want := FreezeConfirmName(src.Host); p.FreezeConfirm != want {
+				return nil, uerr("freeze_confirm", "Type the source cluster's name ("+want+") to apply the write freeze.", "Review the freeze preview first.")
+			}
+		} else if !p.ConfirmWritersStopped {
+			return nil, uerr("confirm_writers", "Confirm that the customer has stopped every writer.", "Tick the confirmation in the cutover console, or apply the write freeze.")
 		}
 		conds, ready, err := o.Readiness(ctx, m.ID)
 		if err != nil {
@@ -175,7 +260,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	steps := []Step{{Key: "readiness", Title: "Readiness gate"}, {Key: "writers", Title: "Confirm writers stopped"}, {Key: "heartbeat", Title: "Write final heartbeat"},
 		{Key: "await", Title: "Wait for the final heartbeat on the target"}, {Key: "endpos", Title: "Set end positions and nudge"}, {Key: "drain", Title: "Drain to end positions"}, {Key: "origin", Title: "Check target origin reached the final heartbeat"},
 		{Key: "sequences", Title: "Sync sequences"}, {Key: "verify", Title: "Verify data"}, {Key: "verdict", Title: "Verdict"}}
-	op, err := o.newOp(ctx, m.ID, "cutover", key, a.Username, steps, map[string]any{"confirm_writers_stopped": p.ConfirmWritersStopped, "override": p.OverrideConfirm != "", "continuing": continuing})
+	op, err := o.newOp(ctx, m.ID, "cutover", key, a.Username, steps, map[string]any{"confirm_writers_stopped": p.ConfirmWritersStopped, "override": p.OverrideConfirm != "", "write_freeze": p.WriteFreeze, "continuing": continuing})
 	if err != nil {
 		return op, err
 	}
@@ -188,7 +273,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 			f.Cutover.Phase = "readiness"
 		}
 	})
-	o.audit.Append(ctx, a, "cutover.start", m.ID, nil, map[string]any{"operation": op.ID, "confirm_writers_stopped": p.ConfirmWritersStopped, "continuing": continuing})
+	o.audit.Append(ctx, a, "cutover.start", m.ID, nil, map[string]any{"operation": op.ID, "confirm_writers_stopped": p.ConfirmWritersStopped, "write_freeze": p.WriteFreeze, "continuing": continuing})
 	o.refreshState(ctx, m.ID)
 	cctx, cancel := context.WithCancel(context.Background())
 	cutoverCancels.Store(op.ID, cancel)
@@ -227,7 +312,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		})
 		if f.Cutover == nil {
 			for _, d := range dbs {
-				o.setDB(bg, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil})
+				o.setDB(bg, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil, "writes_baseline": nil})
+			}
+			// Streaming continues and applications keep the source.
+			if uerr := o.undoFreeze(bg, m.ID, "Upwell", "the cutover stopped before end positions: "+err.Error()); uerr != nil {
+				op.Log("error", "%v", uerr)
 			}
 		}
 		o.refreshState(bg, m.ID)
@@ -275,16 +364,23 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		if secs <= 0 {
 			secs = 10
 		}
-		first := map[string]int64{}
-		for _, d := range dbs {
-			n, sessions, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
-			if err != nil {
-				fail("writers", fmt.Errorf("%s: %w", d.SourceName, err))
+		if p.WriteFreeze {
+			op.StepDetail("writers", "applying the write freeze", 0.1)
+			if err := o.applyFreeze(bg, m, a, dbs, src, op); err != nil {
+				fail("writers", err)
 				return
 			}
-			first[d.SourceName] = n
-			if len(sessions) > 0 {
-				op.LogDB("warn", d.SourceName, "%d client session(s) still connected: %s", len(sessions), strings.Join(sessions, "; "))
+		}
+		first := map[string]pgpack.Activity{}
+		for _, d := range dbs {
+			act, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
+			if err != nil {
+				fail("writers", fmt.Errorf("%s: could not sample writes: %w", d.SourceName, err))
+				return
+			}
+			first[d.SourceName] = act
+			if len(act.Sessions) > 0 {
+				op.LogDB("warn", d.SourceName, "%d client session(s) still connected: %s", len(act.Sessions), strings.Join(act.Sessions, "; "))
 			} else {
 				op.LogDB("info", d.SourceName, "no client sessions besides the engine and Upwell")
 			}
@@ -296,26 +392,41 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			return
 		case <-time.After(time.Duration(secs) * time.Second):
 		}
+		// Writes show in the counters when their transaction ends; a writer
+		// inside an open transaction shows as a session holding a
+		// transaction ID. Either one means writes have not stopped.
 		var changing []string
+		baseline := map[string]int64{}
 		for _, d := range dbs {
-			n, _, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
+			act, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
 			if err != nil {
-				fail("writers", fmt.Errorf("%s: %w", d.SourceName, err))
+				fail("writers", fmt.Errorf("%s: could not sample writes: %w", d.SourceName, err))
 				return
 			}
-			if n != first[d.SourceName] {
-				changing = append(changing, fmt.Sprintf("%s (%d row changes in %d s)", d.SourceName, n-first[d.SourceName], secs))
+			baseline[d.SourceName] = act.Changes
+			if n := act.Changes - first[d.SourceName].Changes; n != 0 {
+				changing = append(changing, fmt.Sprintf("%s (%d row changes in %d s)", d.SourceName, n, secs))
+			}
+			if len(act.OpenWriters) > 0 {
+				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
 			}
 		}
 		override := false
 		if len(changing) > 0 {
 			if role != "admin" || p.OverrideConfirm != m.Name {
-				fail("writers", fmt.Errorf("rows are still changing in %s. Stop every writer, or an Admin can override by typing the migration name", strings.Join(changing, ", ")))
+				fail("writers", fmt.Errorf("writes have not stopped: %s. Stop every writer (and end open transactions), or an Admin can override by typing the migration name; verification then ends NO-GO if the source changed at all", strings.Join(changing, ", ")))
+				return
+			}
+			// An override that is not on the audit record does not happen (D58).
+			if _, err := o.audit.Append(bg, a, "cutover.override_writes", m.ID, nil, map[string]any{"changing": changing}); err != nil {
+				fail("writers", fmt.Errorf("the override of detected writes was refused because it could not be recorded in the audit log: %w", err))
 				return
 			}
 			override = true
-			o.audit.Append(bg, a, "cutover.override_writes", m.ID, nil, map[string]any{"changing": changing})
 			op.Log("warn", "Admin %s overrode detected writes: %s", a.Username, strings.Join(changing, ", "))
+		}
+		for _, d := range dbs {
+			o.setDB(bg, d.ID, map[string]any{"writes_baseline": baseline[d.SourceName]})
 		}
 		now := store.Now()
 		o.updateFlags(bg, m.ID, func(f *Flags) {
@@ -442,6 +553,24 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			return
 		}
 	}
+	// Every database's engine command must be known before the point of no
+	// return: a plan error stops the cutover with streaming intact (D55).
+	plans := map[string]engine.RunPlan{}
+	specs := map[string]engine.DatabaseSpec{}
+	for _, d := range dbs {
+		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+		spec, err := o.dbSpec(bg, m, cur)
+		if err == nil {
+			var plan engine.RunPlan
+			if plan, err = o.eng.Plan(spec, true); err == nil {
+				plans[d.ID], specs[d.ID] = plan, spec
+			}
+		}
+		if err != nil {
+			fail("endpos", fmt.Errorf("%s: the engine command could not be prepared, so no end position was set and streaming continues: %w", d.SourceName, err))
+			return
+		}
+	}
 	// Check-and-set against an abort racing this step: only the cutover
 	// that is still current, and not cancelled, may move past the point of
 	// no return.
@@ -460,14 +589,8 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	op.StepStart("endpos", "")
 	for _, d := range dbs {
 		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
-		spec, err := o.dbSpec(bg, m, cur)
-		if err != nil {
-			op.StepEnd("endpos", "failed", err.Error())
-			o.finishCutover(bg, m, op, a, err)
-			return
-		}
+		spec, plan := specs[d.ID], plans[d.ID]
 		if cur.EndPos == "" {
-			plan, _ := o.eng.Plan(spec, true)
 			lsn, err := o.eng.SetEndPosition(bg, plan, spec)
 			if err != nil {
 				op.StepEnd("endpos", "failed", fmt.Sprintf("%s: %v", d.SourceName, err))
@@ -570,15 +693,22 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	v := o.Settings(ctx, m)
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	inc := included(dbs)
-	hbOn := v.Bool("heartbeat")
-	// Only a database whose engine reached the end position can be GO.
+	offline := v.Str("mode") == "offline"
+	hbOn := v.Bool("heartbeat") && !offline
+	// Only a database whose engine reached the end position (offline: whose
+	// copy finished) can be GO.
 	undrained := o.stopUndrained(ctx, m, inc)
 
-	// 6. Origin progress (D3).
-	o.setPhase(ctx, m.ID, "origin")
-	op.StepStart("origin", "")
+	// 6. Origin progress (D3). Offline there is no origin: nothing streamed.
 	originFail := map[string]string{}
+	if !offline {
+		o.setPhase(ctx, m.ID, "origin")
+		op.StepStart("origin", "")
+	}
 	for _, d := range inc {
+		if offline {
+			break
+		}
 		if d.HBBeforeLSN == "" {
 			if hbOn {
 				originFail[d.SourceName] = "no final heartbeat position recorded"
@@ -598,13 +728,15 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			op.LogDB("info", d.SourceName, "target origin %s is past the final heartbeat at %s", origin, d.HBBeforeLSN)
 		}
 	}
-	if len(originFail) > 0 {
+	switch {
+	case offline:
+	case len(originFail) > 0:
 		var parts []string
 		for k, x := range originFail {
 			parts = append(parts, k+": "+x)
 		}
 		op.StepEnd("origin", "failed", "NO-GO for "+strings.Join(parts, "; "))
-	} else {
+	default:
 		op.StepEnd("origin", "done", "every database's target origin reached its final heartbeat")
 	}
 
@@ -612,14 +744,21 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	o.setPhase(ctx, m.ID, "sequences")
 	op.StepStart("sequences", "")
 	total := 0
+	var seqErrs []string
 	for _, d := range inc {
 		n, err := pgpack.SyncSequences(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
 		if err != nil {
-			op.LogDB("warn", d.SourceName, "sequence sync: %v", err)
+			op.LogDB("error", d.SourceName, "sequence sync failed: %v", err)
+			seqErrs = append(seqErrs, fmt.Sprintf("%s: %v", d.SourceName, err))
 		}
 		total += n
 	}
-	op.StepEnd("sequences", "done", fmt.Sprintf("%d sequence(s) synced", total))
+	if len(seqErrs) > 0 {
+		// Verification still compares every sequence and decides (D56).
+		op.StepEnd("sequences", "failed", fmt.Sprintf("%d sequence(s) synced; sync failed for %s; verification compares every sequence", total, strings.Join(seqErrs, "; ")))
+	} else {
+		op.StepEnd("sequences", "done", fmt.Sprintf("%d sequence(s) synced", total))
+	}
 
 	// 8. Verification.
 	o.setPhase(ctx, m.ID, "verify")
@@ -633,23 +772,44 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		}
 		cur, _ := o.GetDatabase(ctx, m.ID, d.ID)
 		res, err := pgpack.Verify(ctx, pgpack.VerifyInput{Source: src.WithDB(d.SourceName), Target: dst.WithDB(d.TargetName), TargetMaint: dst, Origin: d.OriginName,
-			HeartbeatRequired: hbOn, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
+			HeartbeatRequired: hbOn, Offline: offline, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
 			ExactCountMaxBytes: int64(v.Int("exact_count_max_mb")) << 20, ChecksumBudget: time.Duration(v.Int("verify_checksum_budget_seconds")) * time.Second, Database: d.SourceName})
 		if err != nil {
 			res.GO = false
 			res.Results = append(res.Results, check.Result{CheckID: "verify_error", Level: check.Blocker, Hard: true, Title: "Verification completed", Message: err.Error(), Database: d.SourceName})
+		}
+		if o.testHooks.AfterVerify != nil {
+			o.testHooks.AfterVerify(ctx, d)
+		}
+		// The source must not have changed since the writers step: a write
+		// after it (a writer that resumed, an open transaction that committed,
+		// writes an Admin overrode) is missing on the target (D44, D45).
+		wr := o.writesSinceWritersStep(ctx, m, src.WithDB(d.SourceName), cur)
+		res.Results = append(res.Results, wr)
+		if wr.Level == check.Blocker {
+			res.GO = false
 		}
 		if _, bad := originFail[d.SourceName]; bad {
 			res.GO = false
 		}
 		if undrained[d.SourceName] {
 			res.GO = false
-			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName,
-				Message: "The engine did not reach this database's end position during the cutover, so changes before it may be missing on the target."})
+			msg := "The engine did not reach this database's end position during the cutover, so changes before it may be missing on the target."
+			if offline {
+				msg = "The offline copy of this database did not finish."
+			}
+			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName, Message: msg})
 		}
+		table := "verifications"
+		if o.testHooks.FailVerificationStore {
+			table = "verifications_unavailable"
+		}
+		var storeErr error
 		for _, r := range res.Results {
-			o.st.DB.ExecContext(ctx, `INSERT INTO verifications(id,migration_id,database,run_id,check_id,result,title,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
-				store.NewID(), m.ID, d.SourceName, runID, r.CheckID, r.Level, r.Title, toJSON(map[string]any{"message": r.Message, "evidence": r.Evidence}), store.Now())
+			if _, err := o.st.DB.ExecContext(ctx, `INSERT INTO `+table+`(id,migration_id,database,run_id,check_id,result,title,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
+				store.NewID(), m.ID, d.SourceName, runID, r.CheckID, r.Level, r.Title, toJSON(map[string]any{"message": r.Message, "evidence": r.Evidence}), store.Now()); err != nil && storeErr == nil {
+				storeErr = err
+			}
 			lvl := "info"
 			if r.Level == check.Blocker {
 				lvl = "error"
@@ -658,11 +818,19 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 			}
 			op.LogDB(lvl, d.SourceName, "%s: %s", r.Title, r.Message)
 		}
+		if storeErr != nil {
+			// A verdict nobody can review is not a GO (D57).
+			res.GO = false
+			op.LogDB("error", d.SourceName, "verification results could not be recorded: %v", storeErr)
+		}
 		verdicts[d.SourceName] = res.GO
 		state, verdict, lastErr := DVerified, "GO", ""
 		if !res.GO {
 			state, verdict = DFailed, "NO-GO"
 			var why []string
+			if storeErr != nil {
+				why = append(why, "verification results could not be recorded ("+storeErr.Error()+")")
+			}
 			for _, r := range res.Results {
 				if r.Level == check.Blocker {
 					why = append(why, r.Title)
@@ -719,6 +887,14 @@ func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Opera
 	if f.Cutover != nil {
 		pause = f.Cutover.WritePauseMS
 	}
+	if verdict != "GO" {
+		// Applications stay on the source: give it its writes back.
+		if uerr := o.undoFreeze(ctx, m.ID, "Upwell", "the verdict is NO-GO"); uerr != nil {
+			op.Log("error", "%v", uerr)
+		}
+	} else if f.Freeze.Active() {
+		o.Event(ctx, m.ID, "", "write_freeze", "info", "The write freeze stays applied after GO, so nothing writes to the old source; undo it from the cutover console when the customer wants the source writable", nil)
+	}
 	if verdict == "GO" {
 		op.StepEnd("verdict", "done", fmt.Sprintf("GO: every database verified; write pause %s", (time.Duration(pause)*time.Millisecond).Round(time.Second)))
 		o.Event(ctx, m.ID, "", "verdict", "info", fmt.Sprintf("Cutover verdict GO: every database verified (write pause %s)", (time.Duration(pause)*time.Millisecond).Round(time.Second)), map[string]any{"verdict": verdict})
@@ -767,10 +943,13 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	for _, d := range dbs {
-		o.setDB(ctx, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil})
+		o.setDB(ctx, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil, "writes_baseline": nil})
 	}
 	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Cutover = nil })
 	o.audit.Append(ctx, a, "cutover.abort", m.ID, nil, nil)
+	if err := o.undoFreeze(ctx, m.ID, a.Username, "the cutover was aborted"); err != nil {
+		o.Event(ctx, m.ID, "", "write_freeze", "critical", err.Error(), nil)
+	}
 	o.Event(ctx, m.ID, "", "cutover_aborted", "warning", "Cutover aborted by "+a.Username+" before end positions were set; streaming continues", nil)
 	o.refreshState(ctx, m.ID)
 	return nil
@@ -788,12 +967,22 @@ func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key stri
 		return nil, uerr("busy", "A cutover or verification is already running.", "Wait for its verdict.")
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
+	offline := o.IsOffline(ctx, m)
 	for _, d := range included(dbs) {
+		if offline {
+			if !d.Drained || (d.State != DCopied && d.State != DVerified && d.State != DFailed) {
+				return nil, uerr("not_copied", "Verification runs after every database's offline copy finished.", "")
+			}
+			continue
+		}
 		if d.EndPos == "" || (d.State != DDrained && d.State != DVerified && d.State != DFailed) {
 			return nil, uerr("not_drained", "Verification runs after the cutover drained every database.", "")
 		}
 	}
 	steps := []Step{{Key: "origin", Title: "Check target origin reached the final heartbeat"}, {Key: "sequences", Title: "Sync sequences"}, {Key: "verify", Title: "Verify data"}, {Key: "verdict", Title: "Verdict"}}
+	if offline {
+		steps = steps[1:]
+	}
 	op, err := o.newOp(ctx, m.ID, "verify", key, a.Username, steps, nil)
 	if err != nil {
 		return op, err
@@ -858,4 +1047,44 @@ func noEndPositions(o *Orchestrator, ctx context.Context, id string) bool {
 		}
 	}
 	return true
+}
+
+// writesSinceWritersStep resamples the source's writes after verification and
+// compares them with the baseline taken when the writers step confirmed
+// writes stopped. It fails closed: no baseline, or a failed sample, is a
+// blocker.
+func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, src pg.Conn, d Database) check.Result {
+	res := check.Result{CheckID: "writes_stopped", Title: "No writes on the source since writers stopped", Database: d.SourceName, Hard: true}
+	override := false
+	if cur, err := o.GetMigration(ctx, m.ID); err == nil && cur.Flags.Cutover != nil {
+		override = cur.Flags.Cutover.Override
+	}
+	overrideNote := ""
+	if override {
+		overrideNote = " An Admin overrode detected writes at the writers step, so this resample decides the verdict."
+	}
+	if d.WritesBaseline == nil {
+		res.Level = check.Blocker
+		res.Message = "There is no write sample from the writers step for this database, so Upwell cannot show that the source stopped changing."
+		return res
+	}
+	// Statistics reach pg_stat_user_tables about a second after a transaction ends.
+	time.Sleep(1500 * time.Millisecond)
+	act, err := pgpack.WriteActivity(ctx, src)
+	res.Evidence = map[string]any{"baseline": *d.WritesBaseline, "now": act.Changes, "open_writers": act.OpenWriters, "override": override}
+	switch {
+	case err != nil:
+		res.Level = check.Blocker
+		res.Message = "Could not resample the source's writes after verification: " + err.Error() + "."
+	case act.Changes != *d.WritesBaseline:
+		res.Level = check.Blocker
+		res.Message = fmt.Sprintf("Rows changed on the source after the writers step confirmed writes stopped (%d row changes since then); those changes are not on the target.%s", act.Changes-*d.WritesBaseline, overrideNote)
+	case len(act.OpenWriters) > 0:
+		res.Level = check.Blocker
+		res.Message = fmt.Sprintf("%d session(s) hold an open write transaction on the source (%s): when they commit, their changes will be missing on the target.%s", len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; "), overrideNote)
+	default:
+		res.Level = check.OK
+		res.Message = "No row changes on the source since writers were confirmed stopped, and no open write transaction."
+	}
+	return res
 }

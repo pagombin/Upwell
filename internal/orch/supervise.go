@@ -55,16 +55,38 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 			o.logf("error", "orchestrator", "", "", "", "supervision panicked: %v", r)
 		}
 	}()
-	ms, err := o.ListMigrations(ctx)
+	// A deadline per tick: a cluster that is slow to answer (a busy proxy in
+	// front of the target, on the droplet) must not stall supervision, whose
+	// heartbeat feeds the systemd watchdog.
+	tctx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	defer cancel()
+	start := time.Now()
+	slowest, slowestFor := "", time.Duration(0)
+	ms, err := o.ListMigrations(tctx)
 	if err == nil {
 		for _, m := range ms {
+			if !m.Fixture && !m.Flags.CleanupRunning {
+				o.freezeJanitor(tctx, m)
+			}
 			if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp || m.Flags.CleanupRunning {
 				continue
 			}
-			o.superviseMigration(ctx, m)
+			t0 := time.Now()
+			o.superviseMigration(tctx, m)
+			if d := time.Since(t0); d > slowestFor {
+				slowest, slowestFor = "migration "+m.Name, d
+			}
 		}
 	}
-	o.metrics.hostSample(ctx)
+	o.runLockJanitor(tctx)
+	t0 := time.Now()
+	o.metrics.hostSample(tctx)
+	if d := time.Since(t0); d > slowestFor {
+		slowest, slowestFor = "host metrics", d
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		o.logf("warn", "orchestrator", "", "", "", "a supervision tick took %s (slowest: %s, %s); a cluster may be slow to answer", d.Round(time.Second), slowest, slowestFor.Round(time.Second))
+	}
 	o.loopMu.Lock()
 	o.lastLoop = time.Now()
 	o.loopMu.Unlock()
@@ -91,19 +113,32 @@ func (o *Orchestrator) superviseMigration(ctx context.Context, m Migration) {
 		return
 	}
 	v := o.Settings(ctx, m)
+	steps := map[string]time.Duration{}
+	timed := func(name string, f func()) {
+		t0 := time.Now()
+		f()
+		steps[name] += time.Since(t0)
+	}
 	for _, d := range included(dbs) {
 		if m.Flags.Aborted {
 			break
 		}
-		o.superviseDB(ctx, m, d)
+		timed("engine status of "+d.SourceName, func() { o.superviseDB(ctx, m, d) })
 	}
 	if !m.Flags.Aborted && !m.Flags.Paused {
-		o.schedule(ctx, m, v.Int("max_concurrent_base_copies"))
-		o.retries(ctx, m)
+		timed("scheduling", func() {
+			o.schedule(ctx, m, v.Int("max_concurrent_base_copies"))
+			o.retries(ctx, m)
+		})
 	}
 	dbs, _ = o.ListDatabases(ctx, m.ID)
-	o.metrics.sample(ctx, m, included(dbs))
-	o.alerts.evaluate(ctx, m, included(dbs))
+	timed("cluster metrics", func() { o.metrics.sample(ctx, m, included(dbs)) })
+	timed("alerts", func() { o.alerts.evaluate(ctx, m, included(dbs)) })
+	for name, d := range steps {
+		if d > 10*time.Second {
+			o.logf("warn", "orchestrator", m.ID, "", "", "supervising %s: %s took %s", m.Name, name, d.Round(time.Second))
+		}
+	}
 	o.refreshState(ctx, m.ID)
 	o.bus.Publish("migration", "progress", m.ID, map[string]any{"databases": included(dbs)})
 }
@@ -120,7 +155,11 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	if err != nil {
 		return
 	}
-	plan, _ := o.eng.Plan(spec, d.BaseCopyDone)
+	plan, perr := o.eng.Plan(spec, d.BaseCopyDone)
+	if perr != nil {
+		o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "engine command could not be prepared, skipping this check: %v", perr)
+		return
+	}
 	// New log lines: classify since the attempt started.
 	o.tails.attach(m.ID, d.SourceName, plan.LogFile, o.attemptNumber(ctx, d.ID))
 	classes := o.tails.poll(m.ID, d.SourceName)
@@ -211,6 +250,24 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	}
 
 	// The unit is no longer running.
+	if spec.Offline && st.ExitCode != nil && *st.ExitCode == 0 && classes.errors == 0 && !classes.baseCopyFailed && !classes.fatal {
+		// An offline copy ends by exiting: on a clean exit with no error in
+		// its log, the copy is done. Verification decides the rest (D65).
+		o.endAttempt(ctx, d, st.ExitCode, "copy finished")
+		if prior, frozen := m.Flags.Freeze.dbPrior(d.SourceName); frozen && prior != "" {
+			// The source had its own default_transaction_read_only before the
+			// freeze: give the target the same.
+			if tc, err := pg.Connect(ctx, spec.TargetConn, 30*time.Second); err == nil {
+				if _, err := pg.Exec(ctx, tc, `ALTER DATABASE `+pg.QuoteIdent(d.TargetName)+` SET default_transaction_read_only = `+pg.QuoteLiteral(prior)); err != nil {
+					o.Event(ctx, m.ID, d.SourceName, "db_properties", "warning", "Could not set default_transaction_read_only = "+prior+" on the target: "+err.Error(), nil)
+				}
+				tc.Close(ctx)
+			}
+		}
+		o.setDB(ctx, d.ID, map[string]any{"state": DCopied, "base_copy_done": 1, "drained": 1, "last_error": nil, "error_class": nil})
+		o.Event(ctx, m.ID, d.SourceName, "db_state", "info", "Offline copy of "+d.SourceName+" finished", nil)
+		return
+	}
 	var reason, cls string
 	switch {
 	case classes.endposReached || (d.State == DDraining && d.EndPos != "" && classes.errors == 0 && st.ExitCode != nil && *st.ExitCode == 0):
@@ -222,14 +279,14 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	case classes.slotLost:
 		cls, reason = engine.FailSlotLost, classes.lastError
 	case !d.BaseCopyDone:
-		cls, reason = engine.FailBaseCopy, firstNonEmpty(classes.lastError, "the engine exited during the base copy")
+		cls, reason = engine.FailBaseCopy, firstNonEmpty(classes.rootCause(), "the engine exited during the base copy")
 		if classes.engineLock {
 			reason = engineLockReason + " (" + reason + ")"
 		}
 	case classes.permanent:
 		cls, reason = engine.FailPermanent, classes.lastError
 	default:
-		cls, reason = engine.FailTransient, firstNonEmpty(classes.lastError, "the engine exited unexpectedly")
+		cls, reason = engine.FailTransient, firstNonEmpty(classes.rootCause(), "the engine exited unexpectedly")
 	}
 	if classes.lastError == "" && st.Detail != "" {
 		reason += " (" + st.Detail + ")"
@@ -365,7 +422,9 @@ func (o *Orchestrator) schedule(ctx context.Context, m Migration, limit int) {
 	if limit < 1 {
 		limit = 4
 	}
-	if m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0 {
+	// No launches during a cutover, except an offline migration's copy step
+	// (D65), whose run is kept in the cutover state.
+	if c := m.Flags.Cutover; c != nil && c.EndedAt == 0 && c.Phase != "copy" {
 		return
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
@@ -461,6 +520,17 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 	ms, _ := o.ListMigrations(ctx)
 	g := o.globalSettings(ctx)
 	for _, m := range ms {
+		if !m.Fixture && o.IsOffline(ctx, m) && m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0 && m.Flags.Cutover.Phase != "writers" && m.Flags.Cutover.Phase != "" {
+			// The copy runs on in its units: continue the run, keeping the
+			// freeze; the writes check at verification still decides.
+			o.resumeOffline(ctx, m)
+		} else if !m.Fixture && m.Flags.Freeze.Active() && m.Flags.Verdict != "GO" {
+			// No cutover survives a restart: give the source its writes back.
+			// Continuing the cutover re-checks that writes stopped (D48).
+			if err := o.undoFreeze(ctx, m.ID, "Upwell", "Upwell restarted during the cutover"); err != nil {
+				o.logf("error", "orchestrator", m.ID, "", "", "%v", err)
+			}
+		}
 		if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp {
 			continue
 		}

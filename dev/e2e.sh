@@ -43,6 +43,12 @@ cleanup_all() {
   [[ -n "${WRITER:-}" ]] && kill "$WRITER" 2>/dev/null || true
   if [[ -z "${E2E_KEEP:-}" ]]; then
     # Abort and clean up the migration so no slot or origin is left behind.
+    if [[ -n "${FREEZE:-}" ]]; then
+      api POST /api/v1/migrations/$FREEZE/cutover/unfreeze >/dev/null 2>&1 || true
+      api POST /api/v1/migrations/$FREEZE/abort "{\"confirm\":\"$FREEZE_NAME\"}" >/dev/null 2>&1 || true
+      sleep 5
+      api POST /api/v1/migrations/$FREEZE/cleanup "{\"confirm\":\"$FREEZE_NAME\"}" >/dev/null 2>&1 || true
+    fi
     if [[ -n "${MIG:-}" ]]; then
       api POST /api/v1/migrations/$MIG/abort "{\"confirm\":\"$MIG_NAME\"}" >/dev/null 2>&1 || true
       sleep 12
@@ -62,6 +68,12 @@ api() { # METHOD PATH [JSON]
     -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" ${d:+-d "$d"} "$BASE$p"
 }
 json() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
+totp() { # SECRET [STEP_OFFSET] -> the current RFC 6238 code
+  python3 -c 'import base64,hashlib,hmac,struct,sys,time
+k=base64.b32decode(sys.argv[1]+"="*(-len(sys.argv[1])%8)); s=int(time.time())//30+int(sys.argv[2])
+h=hmac.new(k,struct.pack(">Q",s),hashlib.sha1).digest(); o=h[-1]&15
+print("%06d"%((struct.unpack(">I",h[o:o+4])[0]&0x7fffffff)%1000000))' "$1" "${2:-0}"
+}
 
 # --reuse: keep a server from an earlier E2E_KEEP=1 run and only rerun Playwright.
 if [[ $REUSE -eq 1 && -f $DATA/e2e.env ]] && curl -sk $BASE/readyz | grep -q '"ok":true'; then
@@ -123,6 +135,15 @@ log "First Admin"
 TOKEN=$(cat $DATA/setup-token)
 curl -sk -H 'Content-Type: application/json' -H "Idempotency-Key: setup-1" -d "{\"setup_token\":\"$TOKEN\",\"username\":\"admin\",\"password\":\"$PW\",\"time_zone\":\"UTC\"}" $BASE/api/v1/setup >/dev/null
 CSRF=$(curl -sk -c "$JAR" -H 'Content-Type: application/json' -H "Idempotency-Key: login-1" -d "{\"username\":\"admin\",\"password\":\"$PW\"}" $BASE/api/v1/auth/login | json 'd["csrf_token"]')
+# Admins must use a second factor by default (mfa_required_for_admins): set it
+# up through the API, turn the requirement off for the suite (the browser
+# tests sign in with passwords), then turn the Admin's second factor off with
+# a recovery code. features.spec.ts tests the second factor in the browser.
+SECRET=$(api POST /api/v1/auth/totp/enroll '{}' | json 'd["secret"]')
+RECOVERY=$(api POST /api/v1/auth/totp/confirm "{\"code\":\"$(totp "$SECRET")\"}" | json 'd["recovery_codes"][0]')
+api PATCH /api/v1/settings '{"mfa_required_for_admins":false}' >/dev/null
+api POST /api/v1/auth/totp/disable "{\"code\":\"$RECOVERY\"}" >/dev/null
+api POST /api/v1/users "{\"username\":\"mfa-user\",\"password\":\"$PW\",\"role\":\"operator\"}" >/dev/null
 api POST /api/v1/users "{\"username\":\"viewer\",\"password\":\"$PW\",\"role\":\"viewer\"}" >/dev/null
 api POST /api/v1/users "{\"username\":\"operator\",\"password\":\"$PW\",\"role\":\"operator\"}" >/dev/null
 # Fast cadence so charts and live updates move during the suite. The container's
@@ -152,14 +173,14 @@ SQL
 conn() { echo "{\"host\":\"127.0.0.1\",\"port\":$1,\"user\":\"doadmin\",\"password\":\"spike-password-not-secret\",\"dbname\":\"defaultdb\",\"sslmode\":\"disable\",\"storage_gb\":20}"; }
 perm='{"customer":"Example Customer","account_id":"acct-0001","ticket":"SUP-1234","granted_by":"Jamie Customer","granted_at":"2026-10-07","scope":"Copy e2e_shop to the target and cut over."}'
 
-define() { # name [target] -> id; sets connections, permission and databases
-  local name=$1 target=${2:-$DB} id
+define() { # name [target] [source] -> id; sets connections, permission and databases
+  local name=$1 target=${2:-$DB} src=${3:-$DB} id
   id=$(api POST /api/v1/migrations "{\"name\":\"$name\"}" | json 'd["id"]')
   api PUT /api/v1/migrations/$id/permission "$perm" >/dev/null
   api PUT /api/v1/migrations/$id/connections/source "$(conn $SRC_PORT)" >/dev/null
   api PUT /api/v1/migrations/$id/connections/target "$(conn $DST_PORT)" >/dev/null
   # Include only $DB; discovery includes every database by default.
-  sel=$(api POST /api/v1/migrations/$id/discover | python3 -c "import sys,json; print(json.dumps([{'source_name':d['source_name'],'target_name':('$target' if d['source_name']=='$DB' else d['target_name']),'include':d['source_name']=='$DB'} for d in json.load(sys.stdin) if not d.get('skip_reason') or d['source_name']=='$DB']))")
+  sel=$(api POST /api/v1/migrations/$id/discover | python3 -c "import sys,json; print(json.dumps([{'source_name':d['source_name'],'target_name':('$target' if d['source_name']=='$src' else d['target_name']),'include':d['source_name']=='$src'} for d in json.load(sys.stdin) if not d.get('skip_reason') or d['source_name']=='$src']))")
   api PUT /api/v1/migrations/$id/databases "$sel" >/dev/null
   echo "$id"
 }
@@ -189,6 +210,22 @@ echo "database state: $st"
 ( while true; do psql_do $SRC_PORT $DB -c "INSERT INTO orders(customer, amount, note) SELECT g%1000, 1.5, 'live' FROM generate_series(1,200) g" >/dev/null 2>&1 || true; sleep 1; done ) &
 WRITER=$!
 
+log "Streaming migration for the feature tests (write freeze)"
+psql_su $SRC_PORT postgres -c "DROP DATABASE IF EXISTS e2e_freeze WITH (FORCE)" -c "CREATE DATABASE e2e_freeze OWNER doadmin"
+psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS e2e_freeze WITH (FORCE)"
+psql_do $SRC_PORT e2e_freeze -c "CREATE TABLE orders(id bigserial PRIMARY KEY, customer int NOT NULL, amount numeric(12,2), note text); INSERT INTO orders(customer, amount, note) SELECT g%1000, 1, md5(g::text) FROM generate_series(1,5000) g;"
+FREEZE_NAME="E2E: write freeze"
+FREEZE=$(define "$FREEZE_NAME" e2e_freeze e2e_freeze)
+api POST /api/v1/migrations/$FREEZE/preflight >/dev/null
+wait_preflight $FREEZE
+# Started by the feature test, once the running migration has ended (one
+# migration runs at a time: the run lock).
+
+log "Source database e2e_offline for the offline browser test"
+psql_su $SRC_PORT postgres -c "DROP DATABASE IF EXISTS e2e_offline WITH (FORCE)" -c "CREATE DATABASE e2e_offline OWNER doadmin"
+psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS e2e_offline WITH (FORCE)"
+psql_do $SRC_PORT e2e_offline -c "CREATE TABLE orders(id bigserial PRIMARY KEY, customer int NOT NULL, amount numeric(12,2), note text); INSERT INTO orders(customer, amount, note) SELECT g%1000, 1, md5(g::text) FROM generate_series(1,5000) g;"
+
 log "Draft migration for the wizard"
 psql_su $DST_PORT postgres -c "DROP DATABASE IF EXISTS ${DB}_draft WITH (FORCE)"
 DRAFT=$(define "Draft: wizard walkthrough" "${DB}_draft")
@@ -199,6 +236,13 @@ log "Fixtures"
 api POST /api/v1/dev/fixtures >/dev/null
 
 SHORT=$(api GET /api/v1/migrations/$MIG | json 'd["migration"]["short_id"]')
+FSHORT=$(api GET /api/v1/migrations/$FREEZE | json 'd["migration"]["short_id"]')
+export E2E_FREEZE=$FSHORT
+# A certificate for the TLS upload test (rolled back by the test).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=upwell-e2e.local" \
+  -addext "subjectAltName=DNS:upwell-e2e.local" -addext "extendedKeyUsage=serverAuth" \
+  -keyout $DATA/upload-key.pem -out $DATA/upload-cert.pem >/dev/null 2>&1
+export E2E_UPLOAD_CERT=$DATA/upload-cert.pem E2E_UPLOAD_KEY=$DATA/upload-key.pem
 DSHORT=$(api GET /api/v1/migrations/$DRAFT | json 'd["migration"]["short_id"]')
 export E2E_BASE=$BASE E2E_PASSWORD=$PW E2E_MIG=$SHORT E2E_DRAFT=$DSHORT E2E_DB=$DB
 printf 'export E2E_BASE=%s E2E_PASSWORD=%s E2E_MIG=%s E2E_DRAFT=%s E2E_DB=%s\n' "$BASE" "$PW" "$SHORT" "$DSHORT" "$DB" > $DATA/e2e.env
@@ -208,12 +252,20 @@ set +e
 npx playwright test --project=ui $UPDATE "${PWARGS[@]}"
 RC=$?
 if [[ ${#PWARGS[@]} -eq 0 ]]; then
-  log "Browser walkthrough (writer stopped)"
+  log "Browser walkthrough (writer stopped; the running migration ends first: one runs at a time)"
   [[ -n "${WRITER:-}" ]] && kill "$WRITER" 2>/dev/null
   WRITER=""
+  api POST /api/v1/migrations/$MIG/abort "{\"confirm\":\"$MIG_NAME\"}" >/dev/null
+  sleep 12
+  api POST /api/v1/migrations/$MIG/cleanup "{\"confirm\":\"$MIG_NAME\"}" >/dev/null
+  sleep 8
   npx playwright test --project=flow
   RC2=$?
   [[ $RC -eq 0 ]] && RC=$RC2
+  log "Feature tests (write freeze and the other overnight items)"
+  npx playwright test --project=features
+  RC3=$?
+  [[ $RC -eq 0 ]] && RC=$RC3
 fi
 set -e
 echo "playwright exit $RC"

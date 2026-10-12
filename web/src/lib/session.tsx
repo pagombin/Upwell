@@ -3,7 +3,7 @@ import { api, setCsrf, setUnauthenticatedHandler } from "./api";
 import { setTimePref, timePref, type TimePref } from "./format";
 import type { Role, User } from "./types";
 
-export interface Me { user: User; csrf_token: string; expires_at: number; idle_minutes: number; time_zone: string; version: string }
+export interface Me { user: User; csrf_token: string; expires_at: number; idle_minutes: number; time_zone: string; version: string; mfa_enrollment_required?: boolean; recovery_codes_left?: number }
 
 interface Session {
   me: Me | null;

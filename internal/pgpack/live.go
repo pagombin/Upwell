@@ -17,7 +17,7 @@ func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
 	}
 	defer conn.Close(ctx)
 	copies := []map[string]any{}
-	rows, err := conn.Query(ctx, `SELECT COALESCE(p.relid::regclass::text, '?'), p.bytes_processed, p.bytes_total, p.tuples_processed FROM pg_stat_progress_copy p WHERE p.datname=current_database()`)
+	rows, err := pg.Query(ctx, conn, `SELECT COALESCE(p.relid::regclass::text, '?'), p.bytes_processed, p.bytes_total, p.tuples_processed FROM pg_stat_progress_copy p WHERE p.datname=current_database()`)
 	if err == nil {
 		for rows.Next() {
 			var rel string
@@ -28,7 +28,7 @@ func CopyProgress(ctx context.Context, c pg.Conn) map[string]any {
 		rows.Close()
 	}
 	idx := []map[string]any{}
-	rows, err = conn.Query(ctx, `SELECT COALESCE(p.index_relid::regclass::text, p.relid::regclass::text), p.phase, p.blocks_done, p.blocks_total, p.tuples_done, p.tuples_total FROM pg_stat_progress_create_index p WHERE p.datname=current_database()`)
+	rows, err = pg.Query(ctx, conn, `SELECT COALESCE(p.index_relid::regclass::text, p.relid::regclass::text), p.phase, p.blocks_done, p.blocks_total, p.tuples_done, p.tuples_total FROM pg_stat_progress_create_index p WHERE p.datname=current_database()`)
 	if err == nil {
 		for rows.Next() {
 			var rel, phase string
@@ -59,7 +59,7 @@ func SourceHealth(ctx context.Context, src pg.Conn, dbs []string) map[string]any
 	var oldestXact, oldestSnapshot float64
 	var xminAge int64
 	var conns, maxConns int
-	conn.QueryRow(ctx, `SELECT COALESCE(max(extract(epoch FROM now()-xact_start)),0), COALESCE(max(extract(epoch FROM now()-backend_xact_start)) FILTER (WHERE backend_xmin IS NOT NULL),0),
+	pg.QueryRow(ctx, conn, `SELECT COALESCE(max(extract(epoch FROM now()-xact_start)),0), COALESCE(max(extract(epoch FROM now()-backend_xact_start)) FILTER (WHERE backend_xmin IS NOT NULL),0),
 		COALESCE(max(age(backend_xmin)),0), count(*), current_setting('max_connections')::int
 		FROM (SELECT xact_start, xact_start AS backend_xact_start, backend_xmin FROM pg_stat_activity) a`).Scan(&oldestXact, &oldestSnapshot, &xminAge, &conns, &maxConns)
 	out["oldest_xact_seconds"] = oldestXact
@@ -68,7 +68,7 @@ func SourceHealth(ctx context.Context, src pg.Conn, dbs []string) map[string]any
 	out["connections"] = conns
 	out["max_connections"] = maxConns
 	long := []map[string]any{}
-	rows, err := conn.Query(ctx, `SELECT pid, usename, COALESCE(datname,''), COALESCE(application_name,''), COALESCE(state,''), extract(epoch FROM now()-xact_start)::float8, left(COALESCE(query,''), 200)
+	rows, err := pg.Query(ctx, conn, `SELECT pid, usename, COALESCE(datname,''), COALESCE(application_name,''), COALESCE(state,''), extract(epoch FROM now()-xact_start)::float8, left(COALESCE(query,''), 200)
 		FROM pg_stat_activity WHERE xact_start IS NOT NULL AND backend_type='client backend' AND pid <> pg_backend_pid() ORDER BY xact_start LIMIT 20`)
 	if err == nil {
 		for rows.Next() {
@@ -87,7 +87,7 @@ func SourceHealth(ctx context.Context, src pg.Conn, dbs []string) map[string]any
 		if err != nil {
 			continue
 		}
-		rows, err := dc.Query(ctx, `SELECT format('%I.%I', schemaname, relname), n_dead_tup, n_live_tup, n_tup_upd+n_tup_del, COALESCE(extract(epoch FROM now()-GREATEST(last_autovacuum,last_vacuum))::float8, -1)
+		rows, err := pg.Query(ctx, dc, `SELECT format('%I.%I', schemaname, relname), n_dead_tup, n_live_tup, n_tup_upd+n_tup_del, COALESCE(extract(epoch FROM now()-GREATEST(last_autovacuum,last_vacuum))::float8, -1)
 			FROM pg_stat_user_tables WHERE schemaname <> 'upwell' ORDER BY n_dead_tup DESC LIMIT 10`)
 		if err == nil {
 			for rows.Next() {

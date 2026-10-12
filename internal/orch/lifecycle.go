@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/pagombin/upwell/internal/audit"
 	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/pg"
@@ -233,13 +235,17 @@ func TestConnection(ctx context.Context, c pg.Conn, kind string) []ProbeResult {
 		out = append(out, ProbeResult{"replication", repl || super, map[bool]string{true: "The user has the REPLICATION privilege.", false: "The user lacks REPLICATION."}[repl || super]},
 			ProbeResult{"wal_level", wl == "logical", "wal_level is " + wl + "."})
 	} else {
-		ver, _ := pg.ServerVersionNum(ctx, conn)
-		ap := pgpack.TargetApplyPrivileges(ctx, conn, ver)
+		ver, verr := pg.ServerVersionNum(ctx, conn)
+		ap, err := pgpack.TargetApplyPrivileges(ctx, conn, ver)
 		msg := "The user can apply replicated changes."
-		if !ap.OK {
+		okAP := ap.OK && err == nil && verr == nil
+		switch {
+		case verr != nil || err != nil:
+			msg = "Could not check the apply privileges: " + firstErr(verr, err).Error() + "."
+		case !ap.OK:
 			msg = "The user cannot " + strings.Join(ap.Missing, " or ") + "."
 		}
-		out = append(out, ProbeResult{"apply_privileges", ap.OK, msg}, ProbeResult{"createdb", createdb || super, map[bool]string{true: "The user can create databases.", false: "The user cannot create databases."}[createdb || super]})
+		out = append(out, ProbeResult{"apply_privileges", okAP, msg}, ProbeResult{"createdb", createdb || super, map[bool]string{true: "The user can create databases.", false: "The user cannot create databases."}[createdb || super]})
 	}
 	return out
 }
@@ -430,6 +436,7 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 			}
 		}
 	}
+	o.st.DB.ExecContext(ctx, `DELETE FROM queue_entries WHERE migration_id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM migrations WHERE id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM logs WHERE migration_id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM events WHERE migration_id=?`, m.ID)
@@ -447,6 +454,11 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 // StartOptions are the operator's confirmations at start.
 type StartOptions struct {
 	WarningsReviewed bool `json:"warnings_reviewed"`
+	// Offline only: how writes stop before the copy.
+	ConfirmWritersStopped bool   `json:"confirm_writers_stopped"`
+	WriteFreeze           bool   `json:"write_freeze"`
+	FreezeConfirm         string `json:"freeze_confirm"`
+	Role                  string `json:"-"` // the caller's role, set by the API
 }
 
 // Start freezes the settings and begins the migration. The scheduler launches
@@ -458,25 +470,60 @@ func (o *Orchestrator) Start(ctx context.Context, a audit.Actor, id string, opts
 	if err != nil {
 		return m, err
 	}
+	if err := o.startChecks(ctx, m, opts); err != nil {
+		return m, err
+	}
+	snap := o.Settings(ctx, m)
+	if snap.Str("mode") == "offline" {
+		if err := o.offlineChecks(ctx, m, opts); err != nil {
+			return m, err
+		}
+	}
+	if err := o.acquireRunLock(ctx, m); err != nil {
+		return m, err
+	}
+	dbs, _ := o.ListDatabases(ctx, m.ID)
+	if snap.Str("mode") == "offline" {
+		return o.startOffline(ctx, a, m, opts, snap)
+	}
+	now := store.Now()
+	o.st.DB.ExecContext(ctx, `UPDATE migrations SET settings_snapshot=?, started_at=?, frozen_at=?, updated_at=? WHERE id=?`, toJSON(snap), now, now, now, m.ID)
+	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Started = true; f.Paused = false })
+	o.audit.Append(ctx, a, "migration.start", m.ID, nil, map[string]any{"settings_snapshot": snap, "warnings_reviewed": opts.WarningsReviewed})
+	o.Event(ctx, m.ID, "", "started", "info", fmt.Sprintf("Migration started by %s with %d database(s)", a.Username, len(included(dbs))), nil)
+	o.refreshState(ctx, m.ID)
+	go o.Tick(context.Background())
+	return o.GetMigration(ctx, m.ID)
+}
+
+// startChecks are the conditions to start (or queue) a migration.
+func (o *Orchestrator) startChecks(ctx context.Context, m Migration, opts StartOptions) error {
 	if m.Flags.Started {
-		return m, uerr("already_started", "This migration has already started.", "")
+		return uerr("already_started", "This migration has already started.", "")
 	}
 	if m.Fixture {
-		return m, uerr("fixture", "This is a demonstration fixture and cannot be started.", "")
+		return uerr("fixture", "This is a demonstration fixture and cannot be started.", "")
 	}
 	if err := o.requirePermission(ctx, m); err != nil {
-		return m, err
+		return err
+	}
+	// A mode the engine does not run must never be silently replaced by
+	// another (a value stored before it was refused, D51).
+	if mode, _ := m.Settings["mode"].(string); mode != "" {
+		if _, err := settings.Validate("mode", mode); err != nil {
+			return uerr("mode_unavailable", "This migration is set to "+mode+" mode: "+err.Error()+".", "Change the mode in the migration's options.")
+		}
 	}
 	if !o.testHooks.SkipPreflightGate {
 		run, results, err := o.LatestPreflight(ctx, m.ID)
 		if err != nil || run == nil {
-			return m, uerr("preflight_required", "Run preflight before starting.", "")
+			return uerr("preflight_required", "Run preflight before starting.", "")
 		}
 		if run.State != "done" {
-			return m, uerr("preflight_running", "Preflight is still running.", "Wait for it to finish.")
+			return uerr("preflight_running", "Preflight is still running.", "Wait for it to finish.")
 		}
 		if !o.preflightStillValid(ctx, m) {
-			return m, uerr("preflight_stale", "The migration changed after the last preflight.", "Run preflight again.")
+			return uerr("preflight_stale", "The migration changed after the last preflight.", "Run preflight again.")
 		}
 		var blocking, warnings int
 		for _, r := range results {
@@ -488,25 +535,17 @@ func (o *Orchestrator) Start(ctx context.Context, a audit.Actor, id string, opts
 			}
 		}
 		if blocking > 0 {
-			return m, uerr("preflight_blocked", fmt.Sprintf("%d preflight blocker(s) are unresolved.", blocking), "Fix them, or accept the acceptable ones with a reason, and run preflight again.")
+			return uerr("preflight_blocked", fmt.Sprintf("%d preflight blocker(s) are unresolved.", blocking), "Fix them, or accept the acceptable ones with a reason, and run preflight again.")
 		}
 		if warnings > 0 && !opts.WarningsReviewed {
-			return m, uerr("warnings_not_reviewed", fmt.Sprintf("Preflight raised %d warning(s).", warnings), "Tick \"I have reviewed the warnings\" to start.")
+			return uerr("warnings_not_reviewed", fmt.Sprintf("Preflight raised %d warning(s).", warnings), "Tick \"I have reviewed the warnings\" to start.")
 		}
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	if len(included(dbs)) == 0 {
-		return m, uerr("no_databases", "No databases are selected.", "")
+		return uerr("no_databases", "No databases are selected.", "")
 	}
-	snap := o.Settings(ctx, m)
-	now := store.Now()
-	o.st.DB.ExecContext(ctx, `UPDATE migrations SET settings_snapshot=?, started_at=?, frozen_at=?, updated_at=? WHERE id=?`, toJSON(snap), now, now, now, m.ID)
-	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Started = true; f.Paused = false })
-	o.audit.Append(ctx, a, "migration.start", m.ID, nil, map[string]any{"settings_snapshot": snap, "warnings_reviewed": opts.WarningsReviewed})
-	o.Event(ctx, m.ID, "", "started", "info", fmt.Sprintf("Migration started by %s with %d database(s)", a.Username, len(included(dbs))), nil)
-	o.refreshState(ctx, m.ID)
-	go o.Tick(context.Background())
-	return o.GetMigration(ctx, m.ID)
+	return nil
 }
 
 // dbSpec builds the engine spec for one database.
@@ -521,6 +560,14 @@ func (o *Orchestrator) dbSpec(ctx context.Context, m Migration, d Database) (eng
 	spec := engine.DatabaseSpec{MigrationID: m.ID, Source: d.SourceName, Target: d.TargetName, SourceConn: src, TargetConn: dst,
 		Instance: d.Instance, SlotName: d.SlotName, OriginName: d.OriginName, Plugin: d.Plugin,
 		RunDir: filepath.Join(o.cfg.RunsDir(), d.Instance), TableJobs: tj, IndexJobs: ij, SplitLarger: v.Str("split_tables_larger_than"),
+		Offline: v.Str("mode") == "offline",
+	}
+	// Under a write freeze the source database's properties include
+	// default_transaction_read_only = on, which pgcopydb would copy to the
+	// target (making its own restore, and later the applications, read-only):
+	// Upwell copies the properties itself instead (D65).
+	if _, frozen := m.Flags.Freeze.dbPrior(d.SourceName); frozen {
+		spec.SkipDBProperties = true
 	}
 	if o.testHooks.ExtraEngineArgs != nil {
 		spec.ExtraArgs = o.testHooks.ExtraEngineArgs(d.SourceName)
@@ -543,6 +590,10 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		done("failed: " + err.Error())
 		return o.dbFailed(ctx, m, d, engine.FailPermanent, err.Error())
 	}
+	// A restart from zero: the reset keeps the target's own objects, so the
+	// earlier attempt's other objects (types, functions, the publication
+	// pgcopydb copies from the source) may still be there.
+	spec.DropIfExists = o.attemptNumber(ctx, d.ID) > 0
 	v := o.Settings(ctx, m)
 	src, dst := spec.SourceConn, spec.TargetConn
 	// Roles once per migration, best effort.
@@ -554,14 +605,24 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 		}
 		o.updateFlags(ctx, m.ID, func(f *Flags) { f.RolesCopied = true })
 	}
+	createdFrom := ""
 	if v.Bool("create_target_databases") {
-		created, err := pgpack.EnsureTargetDB(ctx, src, dst, d.SourceName, d.TargetName)
+		tdb, err := pgpack.EnsureTargetDB(ctx, src, dst, d.SourceName, d.TargetName)
 		if err != nil {
 			done("failed: " + err.Error())
 			return o.dbFailed(ctx, m, d, engine.FailPermanent, err.Error())
 		}
-		if created {
-			o.Event(ctx, m.ID, d.SourceName, "target_db", "info", "Created target database "+d.TargetName, nil)
+		if tdb.Created {
+			createdFrom = tdb.Template
+			o.Event(ctx, m.ID, d.SourceName, "target_db", "info", fmt.Sprintf("Created target database %s from %s with %s", d.TargetName, tdb.Template, tdb.Got),
+				map[string]any{"template": tdb.Template, "wanted": tdb.Wanted, "got": tdb.Got})
+		}
+		if tdb.Fallback != "" {
+			// Never silent (D53): text may sort and compare differently on the
+			// target, so text indexes may need a REINDEX and ORDER BY results
+			// can change after the switch.
+			o.Event(ctx, m.ID, d.SourceName, "collation_fallback", "warning", fmt.Sprintf("%s: the target database does not match the source's %s: %s; it was created with %s. Text may sort and compare differently on the target: review ORDER BY results and reindex text indexes after cutover, or recreate the target database with a matching collation and restart from zero.",
+				d.SourceName, tdb.Wanted, tdb.Fallback, tdb.Got), map[string]any{"wanted": tdb.Wanted, "got": tdb.Got, "reason": tdb.Fallback})
 		}
 	}
 	// Extensions first: tables may use their types, functions and operators.
@@ -576,44 +637,71 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 			o.Event(ctx, m.ID, d.SourceName, "extensions", "warning", "Extensions not created on the target: "+strings.Join(skipped, "; "), nil)
 		}
 	}
-	// The data-safety gate starts here: re-check the apply privileges inside the
-	// database the engine will apply into (function grants are per database).
-	if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err != nil {
-		done("failed: " + err.Error())
-		return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not connect to target database "+d.TargetName+" to confirm the apply privileges, so it did not start the engine (finding F2): "+err.Error()+". Nothing was copied; restart it from zero once the target is reachable.")
-	} else {
-		ver, _ := pg.ServerVersionNum(ctx, tc)
-		ap := pgpack.TargetApplyPrivileges(ctx, tc, ver)
-		tc.Close(ctx)
-		if !ap.OK {
-			done("failed: apply privileges")
-			return o.dbFailed(ctx, m, d, engine.FailPermanent, "On target database "+d.TargetName+" the user cannot "+strings.Join(ap.Missing, " or ")+
-				". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it. Grant the privileges in that database and restart it from zero.")
-		}
-	}
-	if v.Bool("heartbeat") {
-		if err := pgpack.EnsureHeartbeat(ctx, src.WithDB(d.SourceName)); err != nil {
+	// Streaming only: an offline copy applies no changes (pgcopydb sets
+	// session_replication_role only in its apply), needs no heartbeat and
+	// decodes nothing (D65).
+	if !spec.Offline {
+		// The data-safety gate starts here: re-check the apply privileges inside the
+		// database the engine will apply into (function grants are per database).
+		if tc, err := pg.Connect(ctx, dst.WithDB(d.TargetName), 30*time.Second); err != nil {
 			done("failed: " + err.Error())
-			return o.dbFailed(ctx, m, d, engine.FailPermanent, "creating the heartbeat table: "+err.Error())
+			return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not connect to target database "+d.TargetName+" to confirm the apply privileges, so it did not start the engine (finding F2): "+err.Error()+". Nothing was copied; restart it from zero once the target is reachable.")
+		} else {
+			ver, verr := pg.ServerVersionNum(ctx, tc)
+			ap, err := pgpack.TargetApplyPrivileges(ctx, tc, ver)
+			tc.Close(ctx)
+			if err = firstErr(verr, err); err != nil {
+				done("failed: apply privileges not confirmed")
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "Upwell could not confirm the apply privileges on target database "+d.TargetName+" ("+err.Error()+"), so it did not start the engine (finding F2). Nothing was copied; restart it from zero.")
+			}
+			if !ap.OK {
+				done("failed: apply privileges")
+				why := ""
+				if createdFrom == "template0" {
+					// E7: preflight checked the maintenance database, where the
+					// grants exist; function grants are per database and template0
+					// never has them.
+					why = " Upwell created this database from template0, because the source's encoding or locale differs from the target's template1, so the grants run in template1 did not reach it; preflight checked the maintenance database, where they exist."
+				}
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "On target database "+d.TargetName+" the user cannot "+strings.Join(ap.Missing, " or ")+
+					". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it."+why+" Run the grant script in that database (it is in the target_apply_privileges evidence) and restart it from zero.")
+			}
+		}
+		if v.Bool("heartbeat") {
+			if err := pgpack.EnsureHeartbeat(ctx, src.WithDB(d.SourceName)); err != nil {
+				done("failed: " + err.Error())
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "creating the heartbeat table: "+err.Error())
+			}
+		}
+		// Decoding plugin.
+		if conn, err := pg.Connect(ctx, src.WithDB(d.SourceName), 30*time.Second); err == nil {
+			choice, err := pgpack.ChoosePlugin(ctx, conn, v.Str("decoding_plugin"))
+			conn.Close(ctx)
+			if err == nil {
+				if !choice.OK {
+					done("failed: plugin")
+					return o.dbFailed(ctx, m, d, engine.FailPermanent, "pgoutput is forced but cannot work: "+strings.Join(choice.Reasons, "; "))
+				}
+				spec.Plugin = choice.Plugin
+				if choice.Plugin == "pgoutput" && v.Str("decoding_plugin") == "auto" {
+					spec.Plugin = "" // engine default
+				}
+				o.setDB(ctx, d.ID, map[string]any{"plugin": choice.Plugin})
+				if len(choice.Reasons) > 0 {
+					o.Event(ctx, m.ID, d.SourceName, "plugin", "warning", d.SourceName+" uses test_decoding: "+strings.Join(choice.Reasons, "; "), nil)
+				}
+			}
 		}
 	}
-	// Decoding plugin.
-	if conn, err := pg.Connect(ctx, src.WithDB(d.SourceName), 30*time.Second); err == nil {
-		choice, err := pgpack.ChoosePlugin(ctx, conn, v.Str("decoding_plugin"))
-		conn.Close(ctx)
-		if err == nil {
-			if !choice.OK {
-				done("failed: plugin")
-				return o.dbFailed(ctx, m, d, engine.FailPermanent, "pgoutput is forced but cannot work: "+strings.Join(choice.Reasons, "; "))
-			}
-			spec.Plugin = choice.Plugin
-			if choice.Plugin == "pgoutput" && v.Str("decoding_plugin") == "auto" {
-				spec.Plugin = "" // engine default
-			}
-			o.setDB(ctx, d.ID, map[string]any{"plugin": choice.Plugin})
-			if len(choice.Reasons) > 0 {
-				o.Event(ctx, m.ID, d.SourceName, "plugin", "warning", d.SourceName+" uses test_decoding: "+strings.Join(choice.Reasons, "; "), nil)
-			}
+	if spec.SkipDBProperties {
+		set, skipped, err := pgpack.CopyDBProperties(ctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
+		if err != nil {
+			done("failed: " + err.Error())
+			return o.dbFailed(ctx, m, d, engine.FailPermanent, "copying the database properties during the write freeze: "+err.Error())
+		}
+		o.Event(ctx, m.ID, d.SourceName, "db_properties", "info", fmt.Sprintf("Copied %d database propert(ies) to %s without the write freeze's default_transaction_read_only", len(set), d.TargetName), map[string]any{"set": set, "skipped": skipped})
+		if len(skipped) > 0 {
+			o.Event(ctx, m.ID, d.SourceName, "db_properties", "warning", "Not copied to the target (set them by hand if needed): "+strings.Join(skipped, "; "), nil)
 		}
 	}
 	os.RemoveAll(spec.RunDir)
@@ -742,7 +830,13 @@ func (o *Orchestrator) stopUnit(ctx context.Context, m Migration, d Database) (e
 	if err != nil {
 		return engine.StopResult{}, err
 	}
-	plan, _ := o.eng.Plan(spec, d.BaseCopyDone)
+	plan, perr := o.eng.Plan(spec, d.BaseCopyDone)
+	if perr != nil {
+		// Stopping needs only the unit: never stop "no unit" because the full
+		// engine command could not be prepared (D55).
+		o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "engine command could not be prepared (%v); stopping the unit by name", perr)
+		plan = engine.RunPlan{Instance: spec.Instance, Unit: o.run.UnitName(spec.Instance)}
+	}
 	res, err := o.eng.Stop(ctx, plan, spec)
 	if err == nil {
 		o.logf("info", "orchestrator", m.ID, d.SourceName, "", "unit stopped in %s; slot released after %s (walsender terminated: %v)", res.Duration.Round(time.Millisecond), res.SlotReleaseWaited.Round(time.Millisecond), res.WalsenderKilled)
@@ -872,7 +966,7 @@ func (o *Orchestrator) RestartDatabase(ctx context.Context, a audit.Actor, id, d
 		return d, err
 	}
 	o.setDB(ctx, d.ID, map[string]any{"state": DPending, "base_copy_done": 0, "last_error": nil, "error_class": nil, "next_retry_at": nil, "retry_count": 0,
-		"hb_before_lsn": nil, "hb_token": nil, "endpos": nil, "origin_lsn": nil, "verdict": nil, "in_sync_since": nil, "replay_lsn": nil, "write_lsn": nil, "drained": 0, "auto_restarts": 0})
+		"hb_before_lsn": nil, "hb_token": nil, "endpos": nil, "origin_lsn": nil, "verdict": nil, "in_sync_since": nil, "replay_lsn": nil, "write_lsn": nil, "drained": 0, "auto_restarts": 0, "writes_baseline": nil})
 	done("reset")
 	o.audit.Append(ctx, a, "database.restart", m.ID, map[string]any{"database": d.SourceName, "state": d.State}, map[string]any{"state": DPending})
 	o.Event(ctx, m.ID, d.SourceName, "restart", "warning", d.SourceName+" restarted from zero by "+a.Username, nil)
@@ -899,11 +993,25 @@ func resetTargetDB(ctx context.Context, spec engine.DatabaseSpec) error {
 	if err != nil {
 		return fmt.Errorf("listing the source's relations: %w", err)
 	}
-	dst, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), time.Minute)
+	// No statement timeout: dropping a large table can take a while. A lock
+	// timeout instead, so a lock that is never released names its holder.
+	dst, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") {
 			return nil
 		}
+		return err
+	}
+	// The engine's server sessions outlive it: an index build or a COPY keeps
+	// running on the target after pgcopydb dies and holds its locks, so the
+	// drops below would wait behind it. End them first (they run as the same
+	// user, so no extra privilege is needed).
+	if _, err := endEngineSessions(ctx, dst); err != nil {
+		dst.Close(ctx)
+		return fmt.Errorf("ending the engine's leftover sessions on the target: %w", err)
+	}
+	if _, err := dst.Exec(ctx, `SET lock_timeout = '2min'`); err != nil {
+		dst.Close(ctx)
 		return err
 	}
 	// relkind first, so each object is dropped with the right command.
@@ -930,7 +1038,11 @@ func resetTargetDB(ctx context.Context, spec engine.DatabaseSpec) error {
 				continue
 			}
 			if _, err := dst.Exec(ctx, `DROP `+cmd[k]+` IF EXISTS `+r+` CASCADE`); err != nil {
+				holders := lockHolders(ctx, spec, r)
 				dst.Close(ctx)
+				if holders != "" {
+					return fmt.Errorf("dropping %s on the target: %w; the lock is held by %s", r, err, holders)
+				}
 				return fmt.Errorf("dropping %s on the target: %w", r, err)
 			}
 		}
@@ -1068,6 +1180,9 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 		}
 	}
 	o.audit.Append(ctx, a, "migration.abort", m.ID, map[string]any{"state": m.State}, nil)
+	if err := o.undoFreeze(ctx, m.ID, a.Username, "the migration was aborted"); err != nil {
+		o.Event(ctx, m.ID, "", "write_freeze", "critical", err.Error(), nil)
+	}
 	o.Event(ctx, m.ID, "", "aborted", "warning", "Migration aborted by "+a.Username+"; clean up removes its slots, publications and origins", nil)
 	o.refreshState(ctx, m.ID)
 	return o.GetMigration(ctx, m.ID)
@@ -1134,6 +1249,13 @@ func (o *Orchestrator) Cleanup(ctx context.Context, a audit.Actor, id, key, conf
 		for _, d := range included(dbs) {
 			o.setDB(bg, d.ID, map[string]any{"next_retry_at": nil})
 		}
+		// The stored credentials are needed to undo a write freeze: undo it
+		// before they are deleted, or stop.
+		if err := o.undoFreeze(bg, m.ID, a.Username, "the migration is being cleaned up"); err != nil {
+			o.updateFlags(bg, m.ID, func(f *Flags) { f.CleanupRunning = false })
+			op.Finish(fmt.Errorf("cleanup stopped: %w; the stored credentials are kept so the freeze can still be undone", err), nil)
+			return
+		}
 		var failed []string
 		for _, d := range included(dbs) {
 			op.StepStart("db:"+d.SourceName, "")
@@ -1188,4 +1310,51 @@ func orDash(s string) string {
 		return "no client address"
 	}
 	return s
+}
+
+// firstErr returns the first non-nil error.
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// endEngineSessions terminates the engine's leftover sessions in c's
+// database: pgcopydb names its sessions "pgcopydb[pid] ...", and pg_dump and
+// pg_restore inherit that name; Upwell starts the engine as "upwell-engine".
+// Only sessions of the same user are ended. It waits up to 15 s for them to go.
+func endEngineSessions(ctx context.Context, c *pgx.Conn) (int, error) {
+	const which = `datname = current_database() AND pid <> pg_backend_pid() AND usename = current_user
+		AND (application_name LIKE 'pgcopydb%' OR application_name LIKE 'upwell-engine%')`
+	var n int
+	if err := c.QueryRow(ctx, `SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE `+which+`) t`).Scan(&n); err != nil {
+		return 0, err
+	}
+	for i := 0; i < 30 && n > 0; i++ {
+		var left int
+		if err := c.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE `+which).Scan(&left); err != nil {
+			return n, err
+		}
+		if left == 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return n, nil
+}
+
+// lockHolders describes the sessions holding a lock on rel, for an error
+// message (best effort, on a fresh connection).
+func lockHolders(ctx context.Context, spec engine.DatabaseSpec, rel string) string {
+	c, err := pg.Connect(ctx, spec.TargetConn.WithDB(spec.Target), 15*time.Second)
+	if err != nil {
+		return ""
+	}
+	defer c.Close(ctx)
+	h, _ := pg.QueryStrings(ctx, c, `SELECT 'pid '||a.pid||' ('||a.usename||', '||COALESCE(NULLIF(a.application_name,''),'no application name')||', '||a.state||', '||left(regexp_replace(a.query, '\s+', ' ', 'g'), 80)||')'
+		FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.relation = $1::regclass AND l.granted AND a.pid <> pg_backend_pid() LIMIT 5`, rel)
+	return strings.Join(h, "; ")
 }

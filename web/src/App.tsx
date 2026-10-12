@@ -4,7 +4,7 @@ import { useSession } from "./lib/session";
 import { OpsProvider } from "./components/ops";
 import { Shell } from "./components/shell";
 import { Skeleton } from "./components/ui";
-import { LoginScreen, SetupScreen } from "./screens/auth";
+import { AccountScreen, LoginScreen, SecondFactorCard, SetupScreen } from "./screens/auth";
 import { CutoverTab, ReportTab, VerificationTab } from "./screens/cutover";
 import { AlertsScreen, EventsScreen, HostScreen, LogsScreen, NotFound, SettingsScreen, SystemScreen } from "./screens/global";
 import { HomeScreen } from "./screens/home";
@@ -15,11 +15,16 @@ import { NewMigrationScreen } from "./screens/wizard";
 import { useMig } from "./screens/migration";
 
 function Gate({ children }: { children: ReactNode }) {
-  const { status } = useSession();
+  const { status, me } = useSession();
   const loc = useLocation();
   if (status === "loading") return <div className="login"><div style={{ width: 320 }}><Skeleton lines={3} /></div></div>;
   if (status === "setup") return <Navigate to="/setup" replace />;
   if (status === "anonymous") return <Navigate to={`/login${loc.pathname !== "/" ? `?next=${encodeURIComponent(loc.pathname + loc.search)}` : ""}`} replace />;
+  if (me?.mfa_enrollment_required) {
+    // Admins must set up the second factor before anything else (only the
+    // enrollment endpoints answer them until then).
+    return <main className="login"><div style={{ width: "min(640px, 100%)" }}><SecondFactorCard enforced /></div></main>;
+  }
   return <OpsProvider><Shell>{children}</Shell></OpsProvider>;
 }
 
@@ -58,6 +63,7 @@ export function App() {
             <Route path="host" element={<HostScreen />} />
             <Route path="settings" element={<SettingsScreen />} />
             <Route path="system" element={<SystemScreen />} />
+            <Route path="account" element={<AccountScreen />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </Gate>
