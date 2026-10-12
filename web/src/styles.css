@@ -292,7 +292,7 @@ table.data tr.clickable { cursor: pointer; }
 .skel::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent); animation: shimmer 1.4s infinite; }
 @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 .empty { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s2); padding: var(--s5); border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--muted); }
-.empty h3 { color: var(--text); }
+.empty h3, .empty h4 { color: var(--text); font-size: 14px; }
 .errorstate { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s4); border: 1px solid var(--crit); background: var(--crit-bg); border-radius: var(--radius); }
 .errorstate h3 { color: var(--crit); }
 .stale { opacity: 0.6; filter: grayscale(0.4); }

@@ -240,7 +240,7 @@ test("database page during a base copy: per-table progress and named charts", as
   // no total) and the charts had no titles, so "No data yet" said nothing.
   const I = await ids(page.request);
   const db = I.db;
-  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}/databases/${db}`, async (r) => {
+  await page.route((u) => u.pathname.startsWith("/api/v1/migrations/") && u.pathname.endsWith(`/databases/${db}`), async (r) => {
     const real = await (await r.fetch()).json();
     real.database.state = "base_copy";
     real.copy_progress = {
@@ -252,7 +252,7 @@ test("database page during a base copy: per-table progress and named charts", as
     };
     await r.fulfill({ json: real });
   });
-  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}/metrics`, (r) => r.fulfill({ json: [] }));
+  await page.route((u) => u.pathname.startsWith("/api/v1/migrations/") && u.pathname.endsWith("/metrics"), (r) => r.fulfill({ json: [] }));
   await page.goto(`/migrations/${I.mig}/databases/${db}`);
   const card = page.locator(".card", { has: page.getByRole("heading", { name: "Base copy in progress" }) });
   await expect(card.getByRole("progressbar", { name: "stock3 copy" })).toHaveAttribute("aria-valuenow", "53");
