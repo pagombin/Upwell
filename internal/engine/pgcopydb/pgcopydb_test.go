@@ -179,3 +179,28 @@ func TestPlanExcludeSchemas(t *testing.T) {
 		t.Fatal("a schema name that is not plain was accepted")
 	}
 }
+
+// D78: a resume passes the split size the launch resolved for auto.
+func TestPlanSplitResume(t *testing.T) {
+	r, err := runner.New("local", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{Binary: "pgcopydb", Runner: r}
+	d := spec()
+	d.RunDir = t.TempDir()
+	d.SplitLarger = "auto"
+	if p, _ := e.Plan(d, false); strings.Contains(strings.Join(p.Args, " "), "--split-tables-larger-than") {
+		t.Fatal("auto reached pgcopydb unresolved")
+	}
+	if err := os.WriteFile(filepath.Join(d.RunDir, splitFile), []byte("7GB\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := e.Plan(d, true); !strings.Contains(strings.Join(p.Args, " "), "--split-tables-larger-than 7GB") {
+		t.Fatalf("resume lost the resolved split size: %v", p.Args)
+	}
+	d.SplitLarger = "50GB"
+	if p, _ := e.Plan(d, false); !strings.Contains(strings.Join(p.Args, " "), "--split-tables-larger-than 50GB") {
+		t.Fatalf("explicit size not passed: %v", p.Args)
+	}
+}

@@ -40,6 +40,7 @@ type classes struct {
 	// "target"), with the error; failedTable is the table being copied.
 	connLost, connLostMsg string
 	failedTable           string
+	failedOID             string
 }
 
 var (
@@ -57,23 +58,33 @@ func (c *classes) note(msg string) {
 	}
 	if m := failedTableRe.FindStringSubmatch(msg); m != nil && c.failedTable == "" {
 		c.failedTable = "table with oid " + m[1]
+		c.failedOID = m[1]
 	}
 }
 
 // rootCause is the reason to show for a failed attempt: a lost connection
 // first, else the first error (with the last one when they differ).
 func (c classes) rootCause() string {
-	switch {
-	case c.connLost != "":
-		during := ""
-		if c.failedTable != "" {
-			during = " while copying " + c.failedTable
-		}
-		return fmt.Sprintf("the connection to the %s was closed under the engine%s (%s). Something between this droplet and the %s (a proxy or load balancer, a failover or a restart) ended it; pgcopydb does not retry a table, so the copy must restart", c.connLost, during, c.connLostMsg, c.connLost)
-	case c.firstError != "" && c.firstError != c.lastError:
+	if c.connLost != "" {
+		return c.connLostSummary("") + ". Something between this droplet and the " + c.connLost + " (a proxy or load balancer, a failover or a restart) ended it; pgcopydb does not retry a table, so the copy must restart"
+	}
+	if c.firstError != "" && c.firstError != c.lastError {
 		return c.firstError + " (later: " + c.lastError + ")"
 	}
 	return c.lastError
+}
+
+// connLostSummary says which connection closed, during which table (table,
+// when given, replaces the oid with its name and size), and the error.
+func (c classes) connLostSummary(table string) string {
+	during := ""
+	if table == "" {
+		table = c.failedTable
+	}
+	if table != "" {
+		during = " while copying " + table
+	}
+	return fmt.Sprintf("the connection to the %s was closed under the engine%s (%s)", c.connLost, during, c.connLostMsg)
 }
 
 type tailer struct {

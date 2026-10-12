@@ -193,7 +193,7 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		// Not during a drain: with an end position set, apply exiting is the
 		// expected end, and the drain step decides what it means.
 		if d.BaseCopyDone && d.EndPos == "" && d.State != DDraining && d.State != DDrained && (classes.fatal || classes.applyGone) && !classes.endposReached {
-			why := firstNonEmpty(classes.lastError, "the apply process exited")
+			why := firstNonEmpty(o.failureReason(ctx, m, d, classes), "the apply process exited")
 			o.Event(ctx, m.ID, d.SourceName, "engine_failed", "critical", fmt.Sprintf("%s: the engine stopped applying changes (%s) while parts of it kept running; stopping the unit and resuming", d.SourceName, why), nil)
 			o.mustStop(ctx, m, d, "engine stopped applying")
 			o.endAttempt(ctx, d, nil, "engine stopped applying: "+why)
@@ -206,10 +206,12 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		}
 		// F10: a failed base copy leaves the run streaming. Detect it from the log.
 		if !d.BaseCopyDone && (classes.baseCopyFailed || classes.errors > 0) {
-			o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", "The base copy of "+d.SourceName+" failed ("+classes.lastError+"); stopping the unit, because pgcopydb keeps streaming after such a failure", nil)
+			// The root cause, not pgcopydb's last error (on the droplet,
+			// "Failed to close snapshot" after a lost target connection, D78).
+			reason := o.failureReason(ctx, m, d, classes)
+			o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", "The base copy of "+d.SourceName+" failed: "+reason+". Stopping the unit, because pgcopydb keeps streaming after such a failure.", nil)
 			o.mustStop(ctx, m, d, "base copy failed")
-			o.endAttempt(ctx, d, nil, "base copy failed: "+classes.lastError)
-			reason := classes.lastError
+			o.endAttempt(ctx, d, nil, "base copy failed: "+reason)
 			if classes.engineLock {
 				reason = engineLockReason + " (" + reason + ")"
 			}
@@ -279,14 +281,14 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	case classes.slotLost:
 		cls, reason = engine.FailSlotLost, classes.lastError
 	case !d.BaseCopyDone:
-		cls, reason = engine.FailBaseCopy, firstNonEmpty(classes.rootCause(), "the engine exited during the base copy")
+		cls, reason = engine.FailBaseCopy, firstNonEmpty(o.failureReason(ctx, m, d, classes), "the engine exited during the base copy")
 		if classes.engineLock {
 			reason = engineLockReason + " (" + reason + ")"
 		}
 	case classes.permanent:
 		cls, reason = engine.FailPermanent, classes.lastError
 	default:
-		cls, reason = engine.FailTransient, firstNonEmpty(classes.rootCause(), "the engine exited unexpectedly")
+		cls, reason = engine.FailTransient, firstNonEmpty(o.failureReason(ctx, m, d, classes), "the engine exited unexpectedly")
 	}
 	if classes.lastError == "" && st.Detail != "" {
 		reason += " (" + st.Detail + ")"
