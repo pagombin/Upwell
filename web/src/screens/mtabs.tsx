@@ -25,7 +25,7 @@ function useRange(def = 30) {
 }
 
 interface Attempt { number: number; kind: string; unit: string; command: string; started_at: number; ended_at?: number; exit_code?: number; end_reason: string }
-interface DBDetail { migration: Migration; database: Database; attempts: Attempt[]; live: Record<string, number>; unit: { active: boolean; main_pid?: number; main_live?: boolean; exit_code?: number } | null; unit_name: string; now: number; copy_progress?: { copies: { table: string; bytes: number; bytes_total: number; tuples: number }[]; indexes: { index: string; phase: string; percent: number }[] } }
+interface DBDetail { migration: Migration; database: Database; attempts: Attempt[]; live: Record<string, number>; unit: { active: boolean; main_pid?: number; main_live?: boolean; exit_code?: number } | null; unit_name: string; now: number; copy_progress?: { copies: { table: string; bytes: number; bytes_total: number; tuples: number; rows_estimate?: number; fraction?: number; source_bytes?: number; parts?: number; target_bytes?: number }[]; indexes: { index: string; phase: string; percent: number }[] } }
 
 export function DatabaseScreen() {
   const { db = "" } = useParams();
@@ -78,13 +78,14 @@ export function DatabaseScreen() {
       </Card>
       {d.data.copy_progress && (
         <Card title="Base copy in progress">
+          <p className="small muted">Tables being copied right now, with indexes being built. Each bar compares the rows copied with the source's estimated row count, so it can stop short of or run past the end by a little; a large table copied in parts compares its size on the target with its size on the source. Finished tables leave the list.</p>
           {d.data.copy_progress.copies.length === 0 && d.data.copy_progress.indexes.length === 0 ? <p className="muted">No COPY or index build is running at this moment.</p> : (
             <div className="stack">
               {d.data.copy_progress.copies.map((c) => (
                 <div key={c.table} className="row" style={{ flexWrap: "nowrap" }}>
-                  <span className="mono" style={{ width: 300, minWidth: 0 }}><Trunc>{c.table}</Trunc></span>
-                  <span style={{ flex: 1 }}><ProgressBar value={c.bytes_total ? c.bytes / c.bytes_total : 0} label={`${c.table} copy`} /></span>
-                  <span className="small muted" style={{ width: 200, textAlign: "right" }}>{bytes(c.bytes)}{c.bytes_total ? ` of ${bytes(c.bytes_total)}` : ""} · {count(c.tuples)} rows</span>
+                  <span className="mono" style={{ width: 300, minWidth: 0 }}><Trunc>{c.parts && c.parts > 1 ? `${c.table} (${c.parts} parts)` : c.table}</Trunc></span>
+                  <span style={{ flex: 1 }}>{c.fraction !== undefined ? <ProgressBar value={c.fraction} label={`${c.table} copy`} /> : <span className="small muted">No row estimate on the source (the table was never analyzed)</span>}</span>
+                  <span className="small muted" style={{ width: 280, textAlign: "right" }} title="Rows copied of the source's estimated row count (pg_class.reltuples), and bytes sent so far; for a table copied in parts, the rows of the parts in progress">{count(c.tuples)}{c.rows_estimate && !(c.parts && c.parts > 1) ? ` of about ${count(c.rows_estimate)}` : ""} rows{c.fraction !== undefined ? ` · ${Math.round(c.fraction * 100)}%` : ""} · {bytes(c.bytes)}</span>
                 </div>
               ))}
               {d.data.copy_progress.indexes.map((c) => (
@@ -101,10 +102,17 @@ export function DatabaseScreen() {
       <Card title="Charts" actions={picker}>
         <CrosshairProvider>
           <div className="grid cols-2">
-            <TimeChart title="Backlog" series={seriesFor(mx.data, "backlog_bytes", x.source_name)} fmt={(n) => bytes(n, 0)} from={from} to={to} />
-            <TimeChart title="Replay rate" series={seriesFor(mx.data, "replay_rate", x.source_name)} fmt={(n) => rate(n)} from={from} to={to} />
-            <TimeChart title="Slot retained WAL" series={seriesFor(mx.data, "slot_retained_bytes", x.source_name)} fmt={(n) => bytes(n, 0)} from={from} to={to} />
-            <TimeChart title="Heartbeat latency" series={seriesFor(mx.data, "heartbeat_latency_s", x.source_name)} fmt={(n) => duration(n * 1000)} from={from} to={to} />
+            <TimeChart title="Copied to the target" series={seriesFor(mx.data, "target_size_bytes", x.source_name)} fmt={(n) => bytes(n, 0)} from={from} to={to}
+              threshold={live.source_size_bytes ? { v: live.source_size_bytes, label: `Source size ${bytes(live.source_size_bytes, 0)}` } : undefined}
+              empty="Size of the target database, sampled every 30 seconds; it grows during the base copy (indexes are built at the end, so it can pass the source's size)." />
+            <TimeChart title="Slot retained WAL" series={seriesFor(mx.data, "slot_retained_bytes", x.source_name)} fmt={(n) => bytes(n, 0)} from={from} to={to}
+              empty="WAL the source keeps for this database's replication slot, sampled every 10 seconds once the slot exists." />
+            <TimeChart title="Backlog" series={seriesFor(mx.data, "backlog_bytes", x.source_name)} fmt={(n) => bytes(n, 0)} from={from} to={to}
+              empty="How far the target is behind the source. Measured once the base copy has finished and the engine applies changes." />
+            <TimeChart title="Replay rate" series={seriesFor(mx.data, "replay_rate", x.source_name)} fmt={(n) => rate(n)} from={from} to={to}
+              empty="How fast changes are applied to the target. Measured once the base copy has finished and the engine applies changes." />
+            <TimeChart title="Heartbeat latency" series={seriesFor(mx.data, "heartbeat_latency_s", x.source_name)} fmt={(n) => duration(n * 1000)} from={from} to={to}
+              empty="Time for a row written to the source to arrive on the target. Measured once the base copy has finished (and only with the heartbeat on)." />
           </div>
         </CrosshairProvider>
       </Card>
@@ -145,9 +153,9 @@ export function ReplicationTab() {
       <Card title="CDC across all databases" actions={picker}>
         <CrosshairProvider>
           <div className="grid cols-2">
-            <TimeChart title="Backlog per database" series={seriesFor(mx.data, "backlog_bytes")} fmt={(n) => bytes(n, 0)} from={from} to={to} />
-            <TimeChart title="Replay rate per database" series={seriesFor(mx.data, "replay_rate")} fmt={(n) => rate(n)} from={from} to={to} />
-            <TimeChart title="Slot retained WAL per database" series={seriesFor(mx.data, "slot_retained_bytes")} fmt={(n) => bytes(n, 0)} from={from} to={to} />
+            <TimeChart title="Backlog per database" series={seriesFor(mx.data, "backlog_bytes")} fmt={(n) => bytes(n, 0)} from={from} to={to} empty="How far each target is behind its source. Measured once a database has finished its base copy." />
+            <TimeChart title="Replay rate per database" series={seriesFor(mx.data, "replay_rate")} fmt={(n) => rate(n)} from={from} to={to} empty="How fast changes are applied to each target. Measured once a database has finished its base copy." />
+            <TimeChart title="Slot retained WAL per database" series={seriesFor(mx.data, "slot_retained_bytes")} fmt={(n) => bytes(n, 0)} from={from} to={to} empty="WAL the source keeps for each replication slot, sampled every 10 seconds once the slots exist." />
             <TimeChart title="Source WAL rate" series={seriesFor(mx.data, "src_wal_rate", "")} fmt={(n) => rate(n)} from={from} to={to} />
           </div>
         </CrosshairProvider>

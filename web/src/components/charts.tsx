@@ -75,13 +75,14 @@ export function TimeChart({ series, height = 180, fmt, title, from, to, empty, t
   const tipLeft = inRange ? Math.min(width - 200, Math.max(0, x(ts!) + 12)) : 0;
   return (
     <div className="stack" style={{ gap: 6 }}>
+      <h3 className="charttitle">{title}</h3>
       <div className="legend" aria-hidden={series.length === 0}>
         {series.map((s, i) => <span key={s.name} title={s.name}><i style={{ background: color(i) }} /><span className="trunc">{s.name}</span></span>)}
         {threshold && <span><i style={{ background: "var(--crit)" }} />{threshold.label}</span>}
       </div>
       <div className="chartbox" ref={ref} style={{ height }}>
         {all.length === 0 ? (
-          <div className="empty" style={{ height }}><h3>No data yet</h3><p>{empty || "Samples appear here once the collector records them."}</p></div>
+          <div className="empty" style={{ height }}><h4>No data yet</h4><p>{empty || "Samples appear here once the collector records them."}</p></div>
         ) : (
           <svg className="chart" width={width} height={height} role="img" aria-label={title} onMouseMove={onMove} onMouseLeave={() => setTs(null)}>
             {ticks.map((v) => <g key={v}><line className="gridline" x1={padL} x2={padL + iw} y1={y(v)} y2={y(v)} /><text x={padL - 6} y={y(v) + 4} textAnchor="end">{fmt(v)}</text></g>)}

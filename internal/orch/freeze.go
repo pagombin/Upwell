@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pagombin/upwell/internal/audit"
@@ -166,7 +167,17 @@ func (o *Orchestrator) UndoFreeze(ctx context.Context, a audit.Actor, id string)
 // undoFreeze restores every frozen database. It is idempotent; a failure
 // keeps the freeze marked as applied, raises a critical alert and is retried
 // by supervision.
+// freezeLocks serializes undoing a migration's freeze (migration id ->
+// *sync.Mutex): an abort and the cutover it cancels both undo it, and two
+// concurrent ALTER DATABASE ... SET on the same database fail with "tuple
+// concurrently deleted", which left the freeze recorded as applied (D78).
+var freezeLocks sync.Map
+
 func (o *Orchestrator) undoFreeze(ctx context.Context, migID, by, reason string) error {
+	mu, _ := freezeLocks.LoadOrStore(migID, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+	// Read after taking the lock: an undo that just finished is seen as done.
 	m, err := o.GetMigration(ctx, migID)
 	if err != nil {
 		return err

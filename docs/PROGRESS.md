@@ -1,5 +1,39 @@
 # Upwell overnight build: progress
 
+## Base copy lost its target connection again (2026-10-12), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| The failure showed pgcopydb's last error ("Failed to close snapshot") instead of the lost target connection | done (D78) | `TestBaseCopyTargetConnectionClosed` failed before ("Sub-process ... exited with code 12") and passes |
+| Whether the target restarted was unknown | done (D78) | `TestBaseCopyTargetRestarted`, `TestBaseCopyTargetConnectionClosed` |
+| `split_tables_larger_than = auto` documented but never applied | done (D78) | `TestAutoSplit`, `TestPlanSplitResume`, `TestSplitTablesGO`, `TestCopyProgressSplitTable` |
+| A concurrent freeze undo (abort and the cancelled cutover) left the freeze recorded as applied | done (D79) | `TestWriteFreezeAbortAndRestart`: 2 of 4 runs failed before ("tuple concurrently deleted"), 6 of 6 pass after |
+| Full integration suite (PG14, 15, 16, 18) | pass | clean run: 64 passed, 2 skipped (`TestApplyThroughput`, an opt-in measurement; `TestCollationFallbackWarned`, whose PostgreSQL 18 cluster had stopped), and 1 failure, a timing problem in the new `TestBaseCopyTargetConnectionClosed` (it waited for one table's COPY); fixed, and both connection tests then passed on their own; `TestVersionMatrix` (14, 15, 16, 18) and `TestCollationFallbackWarned` passed after the stopped clusters were restarted. The diagnosis now retries the connection for 30 s, because the failure is often seen while the cluster is still coming back |
+| Why the Advanced target closed the connection on the droplet | needs the target's logs | the cluster's metrics and logs around 2026-10-12 18:09:17 UTC and 2026-10-11 00:51:16 UTC |
+
+## Base copy display and architecture (2026-10-12), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Per-table base copy progress bars were empty | done (D77) | `TestCopyProgressHasAFraction` (bytes_total 0 for COPY FROM STDIN; fraction from the source's reltuples); browser "database page during a base copy" |
+| Charts had no visible titles; empty charts did not say what or when | done (D77) | every `TimeChart` shows its title; database and Replication charts explain when they start; new "Copied to the target" chart |
+| Architecture diagram in the README | done | `docs/architecture.png` from `docs/architecture/architecture.html` (`dev/render-architecture.sh`) |
+| Where data is staged on the droplet | answered in the README | measured locally with pgcopydb 0.18: the base copy writes only the schema dump; changes are staged in `clone/cdc/*-output.db` and `*-replay.db` (274 MB for 120 MB of new rows) and kept until Clean up |
+| README review | done | removed the `overnight-build` checkout, F1 wording updated with the droplet result, disk guard numbers, integration timeout, version matrix clusters, architecture section |
+
+## Droplet restart failure (2026-10-12), branch `claude/new-session-agkd2d`
+
+Restart from zero of `migration_db` failed in pg_restore: the source database gained DigitalOcean Standard's `aiven_extras` extension after the first launch, and the grants on its functions could not be restored on the target. Fixed by D76: a provider's management extension is left out of the copy (pgcopydb filters, kept for resume), an extension the target cannot provide stops the launch with its name, and one it can provide is created (schema first). **Status: done.**
+
+| Evidence | Result |
+| --- | --- |
+| Local reproduction (stand-in extension shaped like aiven_extras) | the droplet's exact pg_restore errors before; clone succeeds with the schema left out |
+| `TestProviderExtensionLeftOut` | failed before ("The base copy failed: Terminating all processes in our process group"); passes: In sync, no schema on the target, event, stop and resume, cutover GO |
+| `TestUnavailableExtensionRefusedAtLaunch` | failed before (reached In sync with the extension silently missing); passes with a reason naming it |
+| `TestExtensionInOwnSchemaCreated`, `TestPlanExcludeSchemas` | pass |
+| Full integration suite (PG14, 15, 16, 18) | pass: 61 tests, 0 failures, 1 skipped (`TestApplyThroughput`, opt-in measurement), 79 min |
+| go vet, staticcheck, golangci-lint, `go test -race ./...` | clean |
+
 ## Final regression (bug bash 12), 2026-10-11
 
 Run from a fresh clone of `origin/overnight-build-2` at `ed3470b` (the only later commit changes one README line), by `regress.sh`: every step must pass, and the clusters are checked for leftovers afterwards. **Overall: pass (exit 0).**

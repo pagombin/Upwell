@@ -42,3 +42,25 @@ func normalize(v any) any {
 	}
 	return v
 }
+
+// D78: auto splits only when the largest table is 10 GB or more, into parts
+// of the largest divided by the table jobs (whole GB, at least 1 GB).
+func TestAutoSplit(t *testing.T) {
+	const gb = int64(1) << 30
+	for _, c := range []struct {
+		largest int64
+		jobs    int
+		want    string
+	}{
+		{0, 8, ""},
+		{9*gb + gb/2, 8, ""},
+		{10 * gb, 8, "1GB"},
+		{60 * gb, 8, "7GB"},
+		{60 * gb, 0, "60GB"},
+		{12 * gb, 16, "1GB"},
+	} {
+		if got := AutoSplit(c.largest, c.jobs); got != c.want {
+			t.Errorf("AutoSplit(%d GB, %d) = %q, want %q", c.largest/gb, c.jobs, got, c.want)
+		}
+	}
+}

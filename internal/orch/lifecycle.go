@@ -715,6 +715,25 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 			o.Event(ctx, m.ID, d.SourceName, "db_properties", "warning", "Not copied to the target (set them by hand if needed): "+strings.Join(skipped, "; "), nil)
 		}
 	}
+	if spec.SplitLarger == "auto" {
+		// Same-table parallel copy for large tables (D78): a single COPY of a
+		// large table runs for hours and is lost whole if its connection
+		// closes, since a base copy cannot resume.
+		spec.SplitLarger = ""
+		if c, err := pg.Connect(ctx, src.WithDB(d.SourceName), 30*time.Second); err == nil {
+			var largest int64
+			var name string
+			if pg.QueryRow(ctx, c, `SELECT COALESCE(max(pg_table_size(c.oid)), 0), COALESCE((array_agg(format('%I.%I', n.nspname, c.relname) ORDER BY pg_table_size(c.oid) DESC))[1], '')
+				FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%'`).Scan(&largest, &name) == nil {
+				if spec.SplitLarger = settings.AutoSplit(largest, spec.TableJobs); spec.SplitLarger != "" {
+					o.Event(ctx, m.ID, d.SourceName, "split_tables", "info", fmt.Sprintf("Tables larger than %s are copied in parts by up to %d workers at once (the largest, %s, is %s)", spec.SplitLarger, spec.TableJobs, name, humanSize(largest)),
+						map[string]any{"split_tables_larger_than": spec.SplitLarger, "largest": largest, "table": name})
+				}
+			}
+			c.Close(ctx)
+		}
+	}
 	os.RemoveAll(spec.RunDir)
 	plan, err := o.eng.Plan(spec, false)
 	if err != nil {
@@ -1178,6 +1197,7 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 		return m, uerr("cutover_running", "End positions are already set; the cutover cannot be aborted now.", "Wait for the verdict.")
 	}
 	if cancel, ok := cutoverCancels.Load(cutOp); ok && cutOp != "" {
+		cutoverCancelReasons.Store(cutOp, "the migration was aborted")
 		cancel.(context.CancelFunc)()
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)

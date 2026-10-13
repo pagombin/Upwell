@@ -50,7 +50,7 @@ var Catalog = []Def{
 	enum("mode", "online", []string{"online", "offline"}, "migration", "Migration defaults", "Online copies and then streams changes until cutover; offline is a one-time copy with writes stopped first (confirmed, or the write freeze), then verified."),
 	def("table_jobs", "int", 0, 0, 64, "migration", "Migration defaults", "workers", "Parallel COPY workers per database. 0 means automatic: CPU count (4 to 16) divided by the number of databases, at least 2."),
 	def("index_jobs", "int", 0, 0, 32, "migration", "Migration defaults", "workers", "Parallel CREATE INDEX workers per database. 0 means automatic: half the CPU count (2 to 8) divided by databases, at least 1."),
-	{Key: "split_tables_larger_than", Type: "string", Default: "auto", Scope: "migration", Group: "Migration defaults", Description: "Same-table parallel copy: auto (largest table divided by table jobs when that is 10 GB or more), off, or a size such as 50GB."},
+	{Key: "split_tables_larger_than", Type: "string", Default: "auto", Scope: "migration", Group: "Migration defaults", Description: "Same-table parallel copy: auto (when the largest table is 10 GB or more, tables larger than the largest divided by the table jobs, at least 1 GB, are copied in parts by several workers at once), off, or a size such as 50GB."},
 	enum("decoding_plugin", "auto", []string{"auto", "pgoutput", "test_decoding", "wal2json"}, "migration", "Migration defaults", "Logical decoding plugin. Auto uses pgoutput and switches a database to test_decoding when pgoutput cannot work there."),
 	boolean("create_target_databases", true, "migration", "Migration defaults", "Create missing target databases with the source's encoding and locale."),
 	boolean("copy_roles", true, "migration", "Migration defaults", "Copy cluster roles once before the first database starts."),
@@ -336,6 +336,19 @@ func Jobs(v Values, concurrent int) (table, index int) {
 		index = max(c/concurrent, 1)
 	}
 	return
+}
+
+// AutoSplit resolves split_tables_larger_than = auto for a database whose
+// largest table has largest bytes: "" (no splitting) below 10 GB, otherwise
+// the largest table divided by the table jobs, rounded down to whole GB and
+// at least 1 GB, so the largest table is copied by every worker at once and
+// no single COPY runs for the whole base copy (D78).
+func AutoSplit(largest int64, tableJobs int) string {
+	const gb = int64(1) << 30
+	if largest < 10*gb {
+		return ""
+	}
+	return fmt.Sprintf("%dGB", max(largest/int64(max(tableJobs, 1))/gb, 1))
 }
 
 // Defaults returns every setting at its default value.

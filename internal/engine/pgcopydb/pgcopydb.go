@@ -72,7 +72,10 @@ func (e *Engine) Capabilities() engine.Capabilities {
 		CopiesRoles: true, CopiesExtensions: true}
 }
 
-const filtersFile = "filters.ini"
+const (
+	filtersFile = "filters.ini"
+	splitFile   = "split-tables-larger-than"
+)
 
 var plainName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$]*$`)
 
@@ -131,8 +134,16 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	} else if _, err := os.Stat(filters); err == nil && resume {
 		args = append(args, "--filters", filters)
 	}
-	if d.SplitLarger != "" && d.SplitLarger != "off" && d.SplitLarger != "auto" {
-		args = append(args, "--split-tables-larger-than", d.SplitLarger)
+	split := d.SplitLarger
+	if resume && (split == "auto" || split == "") {
+		// The launch resolved auto; a resume passes the same value, kept in
+		// the run directory (D78).
+		if b, err := os.ReadFile(filepath.Join(d.RunDir, splitFile)); err == nil {
+			split = strings.TrimSpace(string(b))
+		}
+	}
+	if split != "" && split != "off" && split != "auto" {
+		args = append(args, "--split-tables-larger-than", split)
 	}
 	if e.supports("--skip-ext-comments") {
 		args = append(args, "--skip-ext-comments")
@@ -174,6 +185,11 @@ func (e *Engine) Start(ctx context.Context, p engine.RunPlan, d engine.DatabaseS
 	}
 	if err := writeFilters(p.RunDir, d.ExcludeSchemas); err != nil {
 		return err
+	}
+	if !p.Resume && d.SplitLarger != "" && d.SplitLarger != "off" && d.SplitLarger != "auto" {
+		if err := os.WriteFile(filepath.Join(p.RunDir, splitFile), []byte(d.SplitLarger+"\n"), 0o640); err != nil {
+			return err
+		}
 	}
 	return e.Runner.Start(ctx, runner.Spec{Instance: p.Instance, Binary: p.Binary, Args: p.Args, Env: p.Env, RunDir: p.RunDir, LogFile: p.LogFile})
 }

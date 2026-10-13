@@ -180,6 +180,19 @@ type CutoverParams struct {
 
 var cutoverCancels sync.Map // op id -> context.CancelFunc
 
+// cutoverCancelReasons: why a running cutover was cancelled, recorded before
+// the cancel so the cutover's own stop (which can run first) records the same
+// reason as the abort (op id -> string).
+var cutoverCancelReasons sync.Map
+
+// cancelReason is the error a cancelled cutover stops with.
+func cancelReason(opID string) error {
+	if r, ok := cutoverCancelReasons.Load(opID); ok {
+		return errors.New(r.(string))
+	}
+	return errors.New("cutover cancelled")
+}
+
 // StartCutover runs the coordinated cutover as an operation.
 // cutoverStartMu serialises cutover starts and re-verifications, so two
 // requests cannot both pass the "already running" check.
@@ -280,6 +293,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	go func() {
 		defer cancel()
 		defer cutoverCancels.Delete(op.ID)
+		defer cutoverCancelReasons.Delete(op.ID)
 		defer func() {
 			if r := recover(); r != nil {
 				o.logf("error", "orchestrator", m.ID, "", op.ID, "cutover worker crashed: %v", r)
@@ -388,7 +402,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		op.StepDetail("writers", fmt.Sprintf("sampling row changes for %d s", secs), 0.3)
 		select {
 		case <-ctx.Done():
-			fail("writers", errors.New("cutover cancelled"))
+			fail("writers", cancelReason(op.ID))
 			return
 		case <-time.After(time.Duration(secs) * time.Second):
 		}
@@ -491,7 +505,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		lastNudge := time.Now().Add(-4 * time.Second)
 		for len(pending) > 0 {
 			if ctx.Err() != nil {
-				fail("await", errors.New("cutover cancelled"))
+				fail("await", cancelReason(op.ID))
 				return
 			}
 			for name, d := range pending {
@@ -939,6 +953,7 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 		return uerr("too_late", "End positions are set; the cutover cannot be aborted now.", "Wait for the verdict.")
 	}
 	if cancel, ok := cutoverCancels.Load(c.OpID); ok {
+		cutoverCancelReasons.Store(c.OpID, "the cutover was aborted by "+a.Username)
 		cancel.(context.CancelFunc)()
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
