@@ -25,7 +25,7 @@ function useRange(def = 30) {
 }
 
 interface Attempt { number: number; kind: string; unit: string; command: string; started_at: number; ended_at?: number; exit_code?: number; end_reason: string }
-interface DBDetail { migration: Migration; database: Database; attempts: Attempt[]; live: Record<string, number>; unit: { active: boolean; main_pid?: number; main_live?: boolean; exit_code?: number } | null; unit_name: string; now: number; copy_progress?: { copies: { table: string; bytes: number; bytes_total: number; tuples: number; rows_estimate?: number; fraction?: number; source_bytes?: number; parts?: number; target_bytes?: number }[]; indexes: { index: string; phase: string; percent: number }[] } }
+interface DBDetail { migration: Migration; database: Database; attempts: Attempt[]; live: Record<string, number>; unit: { active: boolean; main_pid?: number; main_live?: boolean; exit_code?: number } | null; unit_name: string; now: number; copy_progress?: { copies: { table: string; bytes: number; bytes_total: number; tuples: number; rows_estimate?: number; fraction?: number; source_bytes?: number; parts?: number; target_bytes?: number }[]; indexes: { index: string; phase: string; percent: number }[]; at?: number; error?: string; pending?: boolean } }
 
 export function DatabaseScreen() {
   const { db = "" } = useParams();
@@ -79,7 +79,9 @@ export function DatabaseScreen() {
       {d.data.copy_progress && (
         <Card title="Base copy in progress">
           <p className="small muted">Tables being copied right now, with indexes being built. Each bar compares the rows copied with the source's estimated row count, so it can stop short of or run past the end by a little; a large table copied in parts compares its size on the target with its size on the source. Finished tables leave the list.</p>
-          {d.data.copy_progress.copies.length === 0 && d.data.copy_progress.indexes.length === 0 ? <p className="muted">No COPY or index build is running at this moment.</p> : (
+          {d.data.copy_progress.error && <div className="callout warn"><div className="body"><strong>Upwell could not read the progress from the target</strong><span className="wrapany">{d.data.copy_progress.error}</span><span className="small">The copy itself is not affected; Upwell tries again every 15 seconds.</span></div></div>}
+          {d.data.copy_progress.at && <p className="small muted">Read from the target {ago(d.data.copy_progress.at, now)}; refreshed every 15 seconds.</p>}
+          {d.data.copy_progress.pending ? <p className="muted">Reading the progress from the target…</p> : d.data.copy_progress.error ? null : d.data.copy_progress.copies.length === 0 && d.data.copy_progress.indexes.length === 0 ? <p className="muted">No COPY or index build was running when the target was last read.</p> : (
             <div className="stack">
               {d.data.copy_progress.copies.map((c) => (
                 <div key={c.table} className="row" style={{ flexWrap: "nowrap" }}>

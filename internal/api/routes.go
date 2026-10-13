@@ -1255,11 +1255,14 @@ func (s *Server) getDB(w http.ResponseWriter, r *http.Request) error {
 	}
 	unit, _ := s.Orch.Runner().Status(ctx, d.Instance)
 	detail := map[string]any{"migration": m, "database": d, "attempts": attempts, "live": live, "unit": unit, "unit_name": s.Orch.Runner().UnitName(d.Instance), "now": store.Now()}
-	// Active COPY and index builds on the target (cheap, timeout-bounded).
-	if src, dst, err := s.Orch.Conns(ctx, m); err == nil && d.State == orch.DBaseCopy {
-		cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-		defer cancel()
-		detail["copy_progress"] = pgpack.CopyProgress(cctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
+	// Active COPY and index builds on the target, read by the collector in
+	// the background every 15 s (D80): the page never waits on the target.
+	if d.State == orch.DBaseCopy {
+		if p, ok := s.Orch.CopyProgress(d.ID); ok {
+			detail["copy_progress"] = p
+		} else {
+			detail["copy_progress"] = map[string]any{"copies": []any{}, "indexes": []any{}, "pending": true}
+		}
 	}
 	return writeJSON(w, 200, detail)
 }
