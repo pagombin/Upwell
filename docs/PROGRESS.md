@@ -1,5 +1,13 @@
 # Upwell overnight build: progress
 
+## Slot held after a failed base copy; crash detection (2026-10-13), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| A failed base copy kept its slot (74.4 GiB of source WAL on the droplet) until Restart from zero | done (D81) | the three `TestBaseCopyTarget*` tests: slot still there after 2 minutes before, dropped after |
+| A crashed or killed server process was reported as "did not restart" | done (D81) | `TestBaseCopyTargetBackendCrashed` failed before, passes |
+| Why the target closed the connection on the droplet (now 3 h 34 min in, `public.order_line5`) | needs the target's logs | see the diagnosis prompt given to the operator |
+
 ## Base copy progress empty while the copy ran (2026-10-13), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |

@@ -124,6 +124,12 @@ func (o *Orchestrator) superviseMigration(ctx context.Context, m Migration) {
 			break
 		}
 		timed("engine status of "+d.SourceName, func() { o.superviseDB(ctx, m, d) })
+		// A failed base copy's slot only keeps source WAL until someone
+		// restarts it from zero, which creates a new slot (D81). Also covers a
+		// database that failed before this release.
+		if d.State == DRestartRequired && d.ErrorClass == engine.FailBaseCopy && o.metrics.due(d.ID+"|failslot", 5*time.Minute) {
+			go o.releaseFailedCopySlot(context.WithoutCancel(ctx), m, d)
+		}
 	}
 	if !m.Flags.Aborted && !m.Flags.Paused {
 		timed("scheduling", func() {
@@ -362,6 +368,7 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 		}
 		o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "last_error": "The base copy failed: " + reason})
 		o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", d.SourceName+": the base copy failed ("+reason+"). Restart it from zero; resuming a base copy cannot guarantee consistency.", nil)
+		go o.releaseFailedCopySlot(context.WithoutCancel(ctx), m, d)
 	case engine.FailPermanent:
 		o.setDB(ctx, d.ID, map[string]any{"state": DFailed, "error_class": cls, "last_error": reason})
 		o.Event(ctx, m.ID, d.SourceName, "failed", "critical", d.SourceName+" failed: "+reason, nil)

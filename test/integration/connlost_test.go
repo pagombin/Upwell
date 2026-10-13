@@ -45,6 +45,15 @@ func baseCopyWithLostTarget(t *testing.T, name string, cut func(t *testing.T, db
 			t.Fatalf("the reason lacks %q: %s", want, d.LastError)
 		}
 	}
+	// D81: the failed copy's slot is useless (a restart from zero creates a
+	// new one at a new snapshot) and would keep source WAL until then.
+	e.waitFor(2*time.Minute, "the failed copy's slot to be dropped", func() bool {
+		return q(t, srcConn, "defaultdb", `SELECT count(*) FROM pg_replication_slots WHERE database = '`+db+`'`) == "0"
+	})
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/restart", map[string]any{"confirm": db}, nil, 200)
+	if d := e.waitDBState(id, db, 3*time.Minute, orch.DInSync, orch.DRestartRequired, orch.DFailed); d.State != orch.DInSync {
+		t.Fatalf("restart from zero after the slot was dropped ended %s: %s", d.State, d.LastError)
+	}
 	e.abortAndClean(id, name)
 	return d
 }
@@ -108,4 +117,19 @@ func TestSplitTablesGO(t *testing.T) {
 		t.Fatalf("verdict %s after a split copy", v)
 	}
 	e.cleanup(id, "Split tables")
+}
+
+// D81: one server process killed (as the out-of-memory killer does) makes
+// PostgreSQL end every connection and reinitialize, without changing
+// pg_postmaster_start_time(); the checkpointer's start shows it.
+func TestBaseCopyTargetBackendCrashed(t *testing.T) {
+	d := baseCopyWithLostTarget(t, "Target backend crashed", func(t *testing.T, db string) {
+		pid := superSQL(t, dstPort, db, `SELECT pid FROM pg_stat_progress_copy LIMIT 1`)
+		if out, err := exec.Command("kill", "-9", pid).CombinedOutput(); err != nil {
+			t.Fatalf("killing the COPY backend %s: %v: %s", pid, err, out)
+		}
+	})
+	if !strings.Contains(d.LastError, "crashed") {
+		t.Fatalf("the reason does not say a server process crashed: %s", d.LastError)
+	}
 }
