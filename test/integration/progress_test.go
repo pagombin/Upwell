@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pagombin/upwell/internal/orch"
 	"github.com/pagombin/upwell/internal/pg"
 	"github.com/pagombin/upwell/internal/pgpack"
 )
@@ -53,6 +54,12 @@ func TestCopyProgressHasAFraction(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	defer func() { cancel(); <-done; conn.Close(context.Background()) }()
+	// As pgcopydb copies a table that is not split: TRUNCATE and COPY in one
+	// transaction, so the COPY holds an AccessExclusiveLock on the table
+	// (D80: reading its size waited behind that lock for hours).
+	if _, err := conn.Exec(context.Background(), "BEGIN; TRUNCATE ONLY big"); err != nil {
+		t.Fatal(err)
+	}
 	go func() {
 		defer close(done)
 		_, _ = conn.PgConn().CopyFrom(ctx, &slowText{max: 20000, pause: 5 * time.Millisecond}, "COPY big(id, v) FROM STDIN")
@@ -61,7 +68,13 @@ func TestCopyProgressHasAFraction(t *testing.T) {
 	var got map[string]any
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		p := pgpack.CopyProgress(context.Background(), srcConn.WithDB(db), dstConn.WithDB(db))
+		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		t0 := time.Now()
+		p := pgpack.CopyProgress(rctx, srcConn.WithDB(db), dstConn.WithDB(db))
+		rcancel()
+		if e, _ := p["error"].(string); e != "" {
+			t.Fatalf("reading the progress failed after %s: %s", time.Since(t0).Round(time.Millisecond), e)
+		}
 		if cs, _ := p["copies"].([]map[string]any); len(cs) > 0 {
 			if n, _ := cs[0]["tuples"].(int64); n > 0 {
 				got = cs[0]
@@ -138,4 +151,50 @@ func TestCopyProgressSplitTable(t *testing.T) {
 	if f := got["fraction"].(float64); f >= 1 {
 		t.Fatalf("fraction %v", f)
 	}
+}
+
+// The droplet (2026-10-13): during a base copy that kept growing the target
+// for hours, "Base copy in progress" nearly always said that no COPY was
+// running. The progress was read inside the page's request, with 3 s to
+// connect to a target that was slow to answer, and any failure produced an
+// empty list. It is now read by the collector in the background, every
+// 15 s, with its time and its error, and a failed read says so.
+func TestCopyProgressFailureShown(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_progfail")
+	// Large enough, with one COPY worker, that the copy outlasts a few of
+	// the collector's 15 s reads.
+	seedDB(t, db, 12000000)
+	id := e.defineMigration("Progress failure", []string{db}, map[string]any{"table_jobs": 1, "split_tables_larger_than": "off"})
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	e.waitDBState(id, db, time.Minute, orch.DBaseCopy)
+	type detail struct {
+		CopyProgress *struct {
+			Copies []map[string]any `json:"copies"`
+			Error  string           `json:"error"`
+			At     int64            `json:"at"`
+		} `json:"copy_progress"`
+	}
+	var seen bool
+	e.waitFor(2*time.Minute, "copy progress with a table", func() bool {
+		var v detail
+		e.do("GET", "/api/v1/migrations/"+id+"/databases/"+db, nil, &v, 200)
+		seen = v.CopyProgress != nil && len(v.CopyProgress.Copies) > 0 && v.CopyProgress.At > 0
+		return seen
+	})
+	restore := pg.SetFaultHook(func(sql string) error {
+		if strings.Contains(sql, "pg_stat_progress_copy") {
+			return fmt.Errorf("injected: canceling statement due to statement timeout")
+		}
+		return nil
+	})
+	defer restore()
+	e.waitFor(time.Minute, "the failed read to be reported", func() bool {
+		var v detail
+		e.do("GET", "/api/v1/migrations/"+id+"/databases/"+db, nil, &v, 200)
+		return v.CopyProgress != nil && strings.Contains(v.CopyProgress.Error, "injected")
+	})
+	restore()
+	e.abortAndClean(id, "Progress failure")
 }

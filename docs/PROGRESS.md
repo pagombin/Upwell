@@ -1,5 +1,13 @@
 # Upwell overnight build: progress
 
+## Base copy progress empty while the copy ran (2026-10-13), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| The progress query waited behind pgcopydb's AccessExclusiveLock (regression from D78) | done (D80) | `TestCopyProgressHasAFraction` copying as pgcopydb does: timed out after 10 s before, passes after |
+| A failed progress read showed as "No COPY or index build is running" | done (D80) | `TestCopyProgressFailureShown`; browser "a failed progress read is shown as such" |
+| The read ran inside the page's request with 3 s to connect | done (D80) | now in the collector every 15 s, with its time |
+
 ## Base copy lost its target connection again (2026-10-12), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |

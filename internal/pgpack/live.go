@@ -16,9 +16,11 @@ import (
 // estimate can be low.
 func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 	out := map[string]any{"copies": []any{}, "indexes": []any{}}
-	conn, err := pg.Connect(ctx, c, 3*time.Second)
+	// Read in the background (D80): a busy target can take seconds to accept
+	// a connection, and a failed read is reported, never shown as idle.
+	conn, err := pg.Connect(ctx, c, 20*time.Second)
 	if err != nil {
-		out["error"] = err.Error()
+		out["error"] = "connecting to the target: " + err.Error()
 		return out
 	}
 	defer conn.Close(ctx)
@@ -28,20 +30,48 @@ func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 	// once, each a part of it, so their rows and bytes are summed; parts that
 	// already finished are no longer listed, so a split table's fraction comes
 	// from its size on the target against its size on the source instead.
-	rows, err := pg.Query(ctx, conn, `SELECT COALESCE(p.relid::regclass::text, '?'), sum(p.bytes_processed)::bigint, sum(p.bytes_total)::bigint, sum(p.tuples_processed)::bigint, count(*), COALESCE(max(pg_table_size(p.relid)), 0)
+	// Never wait on a lock: pgcopydb truncates a table and copies it in one
+	// transaction, holding an AccessExclusiveLock on it until the COPY ends
+	// (hours for a large table), so anything that opens the table, such as
+	// pg_table_size, waits that long (D80). Reading the progress view and
+	// casting an oid to regclass take no lock on the table.
+	if _, err := pg.Exec(ctx, conn, `SET lock_timeout = '1s'`); err != nil {
+		out["error"] = "configuring the progress read on the target: " + err.Error()
+		return out
+	}
+	rows, err := pg.Query(ctx, conn, `SELECT COALESCE(p.relid::regclass::text, '?'), sum(p.bytes_processed)::bigint, sum(p.bytes_total)::bigint, sum(p.tuples_processed)::bigint, count(*), min(p.relid::bigint)
 		FROM pg_stat_progress_copy p WHERE p.datname=current_database() GROUP BY 1 ORDER BY 1`)
+	split := map[string]int64{}
 	if err == nil {
 		for rows.Next() {
 			var rel string
-			var done, total, tuples, parts, tsize int64
-			_ = rows.Scan(&rel, &done, &total, &tuples, &parts, &tsize)
-			copies = append(copies, map[string]any{"table": rel, "bytes": done, "bytes_total": total, "tuples": tuples, "parts": parts, "target_bytes": tsize})
+			var done, total, tuples, parts, relid int64
+			_ = rows.Scan(&rel, &done, &total, &tuples, &parts, &relid)
+			copies = append(copies, map[string]any{"table": rel, "bytes": done, "bytes_total": total, "tuples": tuples, "parts": parts})
 			names = append(names, rel)
+			if parts > 1 {
+				split[rel] = relid
+			}
 		}
 		rows.Close()
+		err = rows.Err()
+	}
+	if err != nil {
+		out["error"] = "reading pg_stat_progress_copy on the target: " + err.Error()
+		return out
+	}
+	// A table copied in parts is not truncated in the COPYs' transactions, so
+	// its size can be read; lock_timeout still bounds the wait.
+	for _, cp := range copies {
+		if relid, ok := split[cp["table"].(string)]; ok {
+			var size int64
+			if pg.QueryRow(ctx, conn, `SELECT pg_table_size($1::oid)`, relid).Scan(&size) == nil {
+				cp["target_bytes"] = size
+			}
+		}
 	}
 	if len(names) > 0 {
-		if sc, err := pg.Connect(ctx, src, 3*time.Second); err == nil {
+		if sc, err := pg.Connect(ctx, src, 20*time.Second); err == nil {
 			est := map[string][2]int64{}
 			if r, err := pg.Query(ctx, sc, `SELECT c.oid::regclass::text, c.reltuples::bigint, pg_table_size(c.oid) FROM pg_class c WHERE c.oid::regclass::text = ANY($1)`, names); err == nil {
 				for r.Next() {
@@ -61,8 +91,8 @@ func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 				}
 				cp["source_bytes"] = e[1]
 				if cp["parts"].(int64) > 1 {
-					if e[1] > 0 {
-						cp["fraction"] = min(float64(cp["target_bytes"].(int64))/float64(e[1]), 0.99)
+					if tb, ok := cp["target_bytes"].(int64); ok && e[1] > 0 {
+						cp["fraction"] = min(float64(tb)/float64(e[1]), 0.99)
 					}
 					if e[0] > 0 {
 						cp["rows_estimate"] = e[0]
@@ -92,6 +122,10 @@ func CopyProgress(ctx context.Context, src, c pg.Conn) map[string]any {
 			idx = append(idx, map[string]any{"index": rel, "phase": phase, "percent": pct})
 		}
 		rows.Close()
+		err = rows.Err()
+	}
+	if err != nil {
+		out["error"] = "reading pg_stat_progress_create_index on the target: " + err.Error()
 	}
 	out["copies"], out["indexes"] = copies, idx
 	return out

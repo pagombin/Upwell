@@ -263,3 +263,21 @@ test("database page during a base copy: per-table progress and named charts", as
   }
   await expect(page.getByText("Measured once the base copy has finished and the engine applies changes.").first()).toBeVisible();
 });
+
+test("database page during a base copy: a failed progress read is shown as such", async ({ page }) => {
+  // D80: a read that failed was shown as "No COPY or index build is running".
+  const I = await ids(page.request);
+  const db = I.db;
+  await page.route((u) => u.pathname.startsWith("/api/v1/migrations/") && u.pathname.endsWith(`/databases/${db}`), async (r) => {
+    const real = await (await r.fetch()).json();
+    real.database.state = "base_copy";
+    real.copy_progress = { copies: [], indexes: [], at: Date.now() - 20_000, error: "connecting to the target: timeout: context deadline exceeded" };
+    await r.fulfill({ json: real });
+  });
+  await page.goto(`/migrations/${I.mig}/databases/${db}`);
+  const card = page.locator(".card", { has: page.getByRole("heading", { name: "Base copy in progress" }) });
+  await expect(card.getByText("Upwell could not read the progress from the target")).toBeVisible();
+  await expect(card.getByText("context deadline exceeded", { exact: false })).toBeVisible();
+  await expect(card.getByText("No COPY or index build")).toHaveCount(0);
+  await expect(card.getByText(/Read from the target .* ago/)).toBeVisible();
+});

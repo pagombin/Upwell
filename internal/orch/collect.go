@@ -37,6 +37,17 @@ type collector struct {
 	netTx     uint64
 	netAt     time.Time
 	lastAt    map[string]time.Time // when each series was last sampled
+	// copyProg: the latest read of each base-copying database's COPY and
+	// index progress on the target, taken in the background (D80);
+	// copyBusy: a read in flight.
+	copyProg map[string]copyProgSample
+	copyBusy map[string]bool
+}
+
+// copyProgSample is one read of a database's base-copy progress.
+type copyProgSample struct {
+	data map[string]any
+	at   time.Time
 }
 
 // driftSample is one schema comparison: its differences, or the error that
@@ -53,7 +64,7 @@ type prevSample struct {
 }
 
 func newCollector(o *Orchestrator) *collector {
-	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, apply: map[string]applyWatch{}, lastAt: map[string]time.Time{}}
+	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, apply: map[string]applyWatch{}, lastAt: map[string]time.Time{}, copyProg: map[string]copyProgSample{}, copyBusy: map[string]bool{}}
 }
 
 func (c *collector) seriesID(ctx context.Context, mig, db, name string) int64 {
@@ -245,6 +256,11 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 				}
 				s.Close(ctx)
 			}
+		}
+		if d.State == DBaseCopy && c.due(d.ID+"|copyprog", 15*time.Second) {
+			// Off the sampling path and the page's request: on a busy target
+			// connecting alone can take seconds (D80).
+			c.readCopyProgress(context.WithoutCancel(ctx), m, d, src, dst)
 		}
 		if d.BaseCopyDone && activeDB[d.State] && c.due(d.ID+"|watch", time.Minute) {
 			// Exact counts take a scan: off the sampling path.
@@ -785,6 +801,47 @@ func (c *collector) DriftSample(dbID string) (diff []string, at time.Time, lastE
 	defer c.mu.Unlock()
 	x := c.drift[dbID]
 	return append([]string(nil), x.diff...), x.at, x.err
+}
+
+// readCopyProgress starts a background read of a database's base-copy
+// progress unless one is still running.
+func (c *collector) readCopyProgress(ctx context.Context, m Migration, d Database, src, dst pg.Conn) {
+	c.mu.Lock()
+	if c.copyBusy[d.ID] {
+		c.mu.Unlock()
+		return
+	}
+	c.copyBusy[d.ID] = true
+	c.mu.Unlock()
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		p := pgpack.CopyProgress(rctx, src.WithDB(d.SourceName), dst.WithDB(d.TargetName))
+		if e, ok := p["error"].(string); ok && e != "" {
+			c.o.logf("warn", "collector", m.ID, d.SourceName, "", "reading the base copy progress from the target: %s", e)
+		}
+		c.mu.Lock()
+		c.copyProg[d.ID] = copyProgSample{data: p, at: time.Now()}
+		c.copyBusy[d.ID] = false
+		c.mu.Unlock()
+	}()
+}
+
+// CopyProgress returns the latest base-copy progress read for a database,
+// with "at" (when it was read); false until the first read finished.
+func (o *Orchestrator) CopyProgress(dbID string) (map[string]any, bool) {
+	c := o.metrics
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	x, ok := c.copyProg[dbID]
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"at": x.at.UnixMilli()}
+	for k, v := range x.data {
+		out[k] = v
+	}
+	return out, true
 }
 
 func limitStrings(s []string, n int) []string {
