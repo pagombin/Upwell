@@ -29,15 +29,87 @@ type FreezeSession struct {
 
 // FreezeTarget is what the write freeze would do to one source database.
 type FreezeTarget struct {
-	Database      string          `json:"database"`
-	Owner         bool            `json:"owner"`
-	SignalBackend bool            `json:"pg_signal_backend"`
-	Available     bool            `json:"available"`
-	Reason        string          `json:"reason,omitempty"`
-	Prior         string          `json:"prior,omitempty"` // the database's own default_transaction_read_only, if set
-	Sessions      []FreezeSession `json:"sessions"`
-	ApplySQL      []string        `json:"apply_sql"`
-	UndoSQL       []string        `json:"undo_sql"`
+	Database      string `json:"database"`
+	Owner         bool   `json:"owner"`
+	SignalBackend bool   `json:"pg_signal_backend"`
+	Available     bool   `json:"available"`
+	Reason        string `json:"reason,omitempty"`
+	Prior         string `json:"prior,omitempty"` // the database's own default_transaction_read_only, if set
+	// Roles whose own default_transaction_read_only (ALTER ROLE ... SET, or
+	// ALTER ROLE ... IN DATABASE ... SET) would override the database's: the
+	// freeze sets it for them in this database too (D83).
+	Roles    []RoleFreeze    `json:"roles"`
+	Sessions []FreezeSession `json:"sessions"`
+	ApplySQL []string        `json:"apply_sql"`
+	UndoSQL  []string        `json:"undo_sql"`
+}
+
+// RoleFreeze is a login role whose own setting would let its sessions write
+// through the database-level freeze.
+type RoleFreeze struct {
+	Role string `json:"role"`
+	// Effective is the setting its sessions would get; Prior is its
+	// role-in-database setting before the freeze ("" when it had none), which
+	// the undo restores.
+	Effective string `json:"effective"`
+	Prior     string `json:"prior,omitempty"`
+	CanAlter  bool   `json:"can_alter"`
+	Applied   bool   `json:"applied,omitempty"`
+}
+
+// readOnlyOn reports whether a default_transaction_read_only value means on.
+func readOnlyOn(v string) bool {
+	switch strings.ToLower(strings.Trim(strings.TrimSpace(v), `"'`)) {
+	case "on", "true", "yes", "1", "t", "y":
+		return true
+	}
+	return false
+}
+
+// roleOverrides lists the login roles whose role-wide or role-in-database
+// default_transaction_read_only is not on, and whether this user may change
+// their setting in this database (superuser; before PostgreSQL 16, CREATEROLE
+// for a non-superuser role; from 16, CREATEROLE with ADMIN OPTION on it).
+func roleOverrides(ctx context.Context, conn *pgx.Conn) ([]RoleFreeze, error) {
+	rows, err := pg.Query(ctx, conn, `WITH s AS (
+			SELECT r.rolname::text AS role, r.rolsuper, s.setdatabase <> 0 AS indb, split_part(c, '=', 2) AS v
+			FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole, unnest(s.setconfig) c
+			WHERE s.setrole <> 0 AND r.rolcanlogin AND c LIKE 'default_transaction_read_only=%'
+			  AND s.setdatabase IN (0, (SELECT oid FROM pg_database WHERE datname = current_database())))
+		SELECT role, bool_or(rolsuper),
+			COALESCE(max(v) FILTER (WHERE indb), max(v) FILTER (WHERE NOT indb)),
+			COALESCE(max(v) FILTER (WHERE indb), ''),
+			(SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+			  OR (NOT bool_or(rolsuper) AND (SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user)
+			      AND (current_setting('server_version_num')::int < 160000 OR pg_has_role(role, 'MEMBER WITH ADMIN OPTION')))
+		FROM s GROUP BY role ORDER BY role`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RoleFreeze
+	for rows.Next() {
+		var r RoleFreeze
+		var super bool
+		if err := rows.Scan(&r.Role, &super, &r.Effective, &r.Prior, &r.CanAlter); err != nil {
+			return nil, err
+		}
+		if !readOnlyOn(r.Effective) {
+			out = append(out, r)
+		}
+	}
+	return out, rows.Err()
+}
+
+func roleFreezeSQL(role, db string) string {
+	return "ALTER ROLE " + pg.QuoteIdent(role) + " IN DATABASE " + pg.QuoteIdent(db) + " SET default_transaction_read_only = on;"
+}
+
+func roleUndoSQL(role, db, prior string) string {
+	if prior == "" {
+		return "ALTER ROLE " + pg.QuoteIdent(role) + " IN DATABASE " + pg.QuoteIdent(db) + " RESET default_transaction_read_only;"
+	}
+	return "ALTER ROLE " + pg.QuoteIdent(role) + " IN DATABASE " + pg.QuoteIdent(db) + " SET default_transaction_read_only = " + pg.QuoteLiteral(prior) + ";"
 }
 
 // InspectFreeze reads, without changing anything, what freezing the
@@ -57,6 +129,12 @@ func InspectFreeze(ctx context.Context, c pg.Conn) (FreezeTarget, error) {
 		return t, err
 	}
 	t.Prior = prior
+	if t.Roles, err = roleOverrides(ctx, conn); err != nil {
+		return t, err
+	}
+	if t.Roles == nil {
+		t.Roles = []RoleFreeze{}
+	}
 	rows, err := pg.Query(ctx, conn, `SELECT pid, usename::text, COALESCE(application_name,''), COALESCE(client_addr::text,'local'), COALESCE(state,''), backend_xid IS NOT NULL
 		FROM pg_stat_activity WHERE `+ClientSessionsWhere+` ORDER BY pid`)
 	if err != nil {
@@ -74,20 +152,34 @@ func InspectFreeze(ctx context.Context, c pg.Conn) (FreezeTarget, error) {
 	if err := rows.Err(); err != nil {
 		return t, err
 	}
+	var locked []string
+	for _, r := range t.Roles {
+		if !r.CanAlter {
+			locked = append(locked, r.Role)
+		}
+	}
 	switch {
 	case !t.Owner:
 		t.Reason = c.User + " does not own " + c.DBName + ", and ALTER DATABASE requires ownership"
 	case !t.SignalBackend:
 		t.Reason = c.User + " is not a member of pg_signal_backend, so it cannot end other roles' sessions"
+	case len(locked) > 0:
+		// Freezing the database but not these roles would leave them writing.
+		t.Reason = "these roles have their own default_transaction_read_only = off, which overrides the freeze, and " + c.User + " may not change it for them: " + strings.Join(locked, ", ") + " (it needs CREATEROLE with ADMIN OPTION on each)"
 	default:
 		t.Available = true
 	}
 	db := pg.QuoteIdent(c.DBName)
-	t.ApplySQL = []string{
-		"ALTER DATABASE " + db + " SET default_transaction_read_only = on;",
-		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE " + ClientSessionsWhere + ";",
+	t.ApplySQL = []string{"ALTER DATABASE " + db + " SET default_transaction_read_only = on;"}
+	for _, r := range t.Roles {
+		t.ApplySQL = append(t.ApplySQL, roleFreezeSQL(r.Role, c.DBName))
 	}
-	t.UndoSQL = []string{undoStatement(c.DBName, t.Prior), "-- and end the client sessions opened while the freeze was applied (they stay read-only until they reconnect)"}
+	t.ApplySQL = append(t.ApplySQL, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE "+ClientSessionsWhere+";")
+	t.UndoSQL = []string{undoStatement(c.DBName, t.Prior)}
+	for _, r := range t.Roles {
+		t.UndoSQL = append(t.UndoSQL, roleUndoSQL(r.Role, c.DBName, r.Prior))
+	}
+	t.UndoSQL = append(t.UndoSQL, "-- and end the client sessions opened while the freeze was applied (they stay read-only until they reconnect)")
 	return t, nil
 }
 
@@ -112,18 +204,19 @@ func undoStatement(db, prior string) string {
 
 // FreezeResult is what applying the freeze did to one database.
 type FreezeResult struct {
-	Database      string   `json:"database"`
-	Prior         string   `json:"prior,omitempty"`
-	Terminated    int      `json:"terminated"`
-	NotTerminated []string `json:"not_terminated,omitempty"`
+	Database      string       `json:"database"`
+	Prior         string       `json:"prior,omitempty"`
+	Roles         []RoleFreeze `json:"roles,omitempty"`
+	Terminated    int          `json:"terminated"`
+	NotTerminated []string     `json:"not_terminated,omitempty"`
 }
 
 // ApplyFreeze makes new sessions in the database read-only by default and
 // ends the client sessions other than Upwell's and the engine's. A session
 // can still turn read-only off for itself: the writers check stays the
 // proof that writes stopped.
-func ApplyFreeze(ctx context.Context, c pg.Conn, prior string) (FreezeResult, error) {
-	r := FreezeResult{Database: c.DBName, Prior: prior}
+func ApplyFreeze(ctx context.Context, c pg.Conn, prior string, roles []RoleFreeze) (FreezeResult, error) {
+	r := FreezeResult{Database: c.DBName, Prior: prior, Roles: roles}
 	conn, err := pg.Connect(ctx, c, 30*time.Second)
 	if err != nil {
 		return r, err
@@ -136,6 +229,14 @@ func ApplyFreeze(ctx context.Context, c pg.Conn, prior string) (FreezeResult, er
 	if _, err := pg.Exec(ctx, conn, `ALTER DATABASE `+pg.QuoteIdent(c.DBName)+` SET default_transaction_read_only = on`); err != nil {
 		return r, fmt.Errorf("ALTER DATABASE %s: %w", c.DBName, err)
 	}
+	// Roles whose own setting would override the database's (D83), before the
+	// sessions are ended so that they reconnect read-only.
+	for i := range r.Roles {
+		if _, err := pg.Exec(ctx, conn, strings.TrimSuffix(roleFreezeSQL(r.Roles[i].Role, c.DBName), ";")); err != nil {
+			return r, fmt.Errorf("freezing role %s in %s: %w", r.Roles[i].Role, c.DBName, err)
+		}
+		r.Roles[i].Applied = true
+	}
 	r.Terminated, r.NotTerminated, err = endSessions(ctx, conn, "")
 	return r, err
 }
@@ -143,7 +244,7 @@ func ApplyFreeze(ctx context.Context, c pg.Conn, prior string) (FreezeResult, er
 // UndoFreeze restores the database's setting and ends the client sessions
 // that connected while the freeze was applied, which stay read-only until
 // they reconnect. since is when the freeze was applied.
-func UndoFreeze(ctx context.Context, c pg.Conn, prior string, since time.Time) (int, error) {
+func UndoFreeze(ctx context.Context, c pg.Conn, prior string, roles []RoleFreeze, since time.Time) (int, error) {
 	conn, err := pg.Connect(ctx, c, 30*time.Second)
 	if err != nil {
 		return 0, err
@@ -155,6 +256,14 @@ func UndoFreeze(ctx context.Context, c pg.Conn, prior string, since time.Time) (
 	}
 	if _, err := pg.Exec(ctx, conn, strings.TrimSuffix(undoStatement(c.DBName, prior), ";")); err != nil {
 		return 0, fmt.Errorf("undoing the freeze on %s: %w", c.DBName, err)
+	}
+	for _, r := range roles {
+		if !r.Applied {
+			continue
+		}
+		if _, err := pg.Exec(ctx, conn, strings.TrimSuffix(roleUndoSQL(r.Role, c.DBName, r.Prior), ";")); err != nil {
+			return 0, fmt.Errorf("restoring role %s's setting in %s: %w", r.Role, c.DBName, err)
+		}
 	}
 	n, _, err := endSessions(ctx, conn, since.UTC().Format(time.RFC3339Nano))
 	return n, err
@@ -256,4 +365,25 @@ func CopyDBProperties(ctx context.Context, src, dst pg.Conn) (set, skipped []str
 		set = append(set, x.k+" = "+x.v)
 	}
 	return set, skipped, nil
+}
+
+// sourceReadOnlySQL reads whether new sessions in the current database are
+// read-only, and the database-level setting (as a write freeze leaves it).
+const sourceReadOnlySQL = `SELECT current_setting('default_transaction_read_only'), COALESCE((SELECT max(split_part(s, '=', 2)) FROM pg_db_role_setting r, unnest(r.setconfig) s
+	WHERE r.setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database()) AND r.setrole = 0 AND s LIKE 'default_transaction_read_only=%'), '')`
+
+// SourceReadOnly reports why new sessions of this user in the connected
+// database refuse writes ("" when they accept them).
+func SourceReadOnly(ctx context.Context, c *pgx.Conn) (string, error) {
+	var ro, dbSetting string
+	if err := c.QueryRow(ctx, sourceReadOnlySQL).Scan(&ro, &dbSetting); err != nil {
+		return "", err
+	}
+	switch {
+	case !readOnlyOn(ro):
+		return "", nil
+	case readOnlyOn(dbSetting):
+		return "the database is set read-only for new sessions (ALTER DATABASE ... SET default_transaction_read_only = on), as a write freeze leaves it", nil
+	}
+	return "its new sessions are read-only (default_transaction_read_only = " + ro + ")", nil
 }

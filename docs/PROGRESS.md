@@ -1,5 +1,21 @@
 # Upwell overnight build: progress
 
+## Freeze and verification review; pgcopydb overlapping-transaction loss (2026-10-14), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| "Writes frozen" while sysbench kept running | explained | sysbench targeted another cluster (`aiven-30g-small-…`), not the migration's source (`standard-migration-poc-cluster-…`) |
+| pgcopydb lost transactions that overlapped another one (upstream 0.18 and main) | fixed in Upwell's build (D84) | `TestOverlappingTransactionsReachTarget`: unfixed engine 10 of 20 rows and NO-GO; fixed 20 of 20 and GO |
+| Installer builds pgcopydb 0.18+upwell.1; online migrations refuse other builds | done (D84) | `TestEngineCommitOrderFixed`; preflight `engine_commit_order`; launch check |
+| Role settings overrode the freeze (F1) | done (D83) | `TestWriteFreezeRoleOverride` |
+| Prepared transactions invisible to the writes checks (F2) | done (D83) | `TestPreparedTransactionStopsCutover` |
+| TRUNCATE, rewrites, setval, large objects invisible; final resample of every database (F3) | done (D83) | `TestInvisibleWritesAfterVerificationNoGo` |
+| Unreadable sequence read as unused (F4); checksum wording for count mismatches | done (D83) | unit tests; review |
+| Janitor undo after GO (F5), abort racing end positions (F6), prior setting on a second freeze (F7) | done (D83) | check-and-set under the freeze and flag locks |
+| Source left read-only by an earlier GO broke the next copy (F9, the droplet's `migration_poc`) | done (D83) | `TestReadOnlySourceBlocked` |
+| Sessions the freeze could not end only in the operation log (F10) | done (D83) | event with their names |
+| Pooled 16-connection load through a freeze | pass | `TestWriteFreezeStopsPooledLoad`: no write after the freeze, GO, same rows |
+
 ## Slot held after a failed base copy; crash detection (2026-10-13), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |

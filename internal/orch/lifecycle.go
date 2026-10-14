@@ -678,6 +678,25 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 					". pgcopydb would apply no changes and still report success (finding F2), so Upwell will not start it."+why+" Run the grant script in that database (it is in the target_apply_privileges evidence) and restart it from zero.")
 			}
 		}
+		// D84: the engine may have been swapped since preflight.
+		if ver, err := o.eng.Version(ctx); err == nil && !pgpack.EngineCommitOrderFixed(ver) {
+			done("failed: engine build")
+			return o.dbFailed(ctx, m, d, engine.FailPermanent, "pgcopydb "+ver+" loses transactions that overlap another one (D84), so Upwell did not start it for an online migration. Run install.sh again to build pgcopydb "+pgpack.EngineBuildRequired+", then restart it from zero.")
+		}
+		// D83: checked at every launch, as preflight may predate a write
+		// freeze (another migration's, kept after its GO). pgcopydb would fail
+		// creating its publication ("cannot execute CREATE PUBLICATION in a
+		// read-only transaction") after the target's schema was reset.
+		if sc, err := pg.Connect(ctx, src.WithDB(d.SourceName), 30*time.Second); err == nil {
+			why, rerr := pgpack.SourceReadOnly(ctx, sc)
+			sc.Close(ctx)
+			if rerr == nil && why != "" {
+				done("failed: source read-only")
+				return o.dbFailed(ctx, m, d, engine.FailPermanent, "Source database "+d.SourceName+" refuses writes: "+why+
+					". The engine cannot create its publication and replication slot there, so Upwell did not start it. If a write freeze is still applied (this migration's or an earlier one's), undo it from that migration's cutover console; otherwise run ALTER DATABASE "+pg.QuoteIdent(d.SourceName)+
+					" RESET default_transaction_read_only on the source. Then restart it from zero.")
+			}
+		}
 		if v.Bool("heartbeat") {
 			if err := pgpack.EnsureHeartbeat(ctx, src.WithDB(d.SourceName)); err != nil {
 				done("failed: " + err.Error())

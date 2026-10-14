@@ -58,6 +58,7 @@ var Catalog = []check.Definition{
 	cd("customer_permission", check.ScopeMigration, "Customer permission recorded", "hard"),
 	cd("tools", check.ScopeHost, "Engine and client tools installed", "hard"),
 	cd("engine_version", check.ScopeHost, "Engine version supports this migration", "hard"),
+	cd("engine_commit_order", check.ScopeHost, "Engine applies overlapping transactions", "hard"),
 	cd("client_version", check.ScopeHost, "PostgreSQL client version", "hard"),
 	cd("host_resources", check.ScopeHost, "Droplet size", "warning"),
 	cd("clock_sync", check.ScopeHost, "System clock synchronized", "warning"),
@@ -111,6 +112,7 @@ var Catalog = []check.Definition{
 	cd("publication_exists", check.ScopeDatabase, "No leftover publication", "hard"),
 	cd("target_apply_privileges", check.ScopeDatabase, "Target allows the engine to apply changes", "hard"),
 	cd("heartbeat_possible", check.ScopeDatabase, "Heartbeat table can be created", "hard"),
+	cd("source_writable", check.ScopeDatabase, "Source database accepts the engine's writes", "hard"),
 	cd("write_freeze_available", check.ScopeDatabase, "Write freeze available", "info"),
 }
 
@@ -142,8 +144,8 @@ var streamingOnly = map[string]bool{
 	"staging_space": true, "apply_rate": true, "cdc_throughput": true, "wal_level": true, "repl_slots": true, "wal_senders": true,
 	"repl_privilege": true, "prepared_xacts": true, "long_transactions": true, "slot_wal_cap": true, "repl_protocol": true,
 	"publication_privs": true, "replica_identity": true, "identity_full_types": true, "identity_full_duplicates": true,
-	"slot_exists": true, "origin_exists": true, "publication_exists": true, "target_apply_privileges": true, "heartbeat_possible": true,
-	"unlogged_tables": true, "large_objects": true,
+	"slot_exists": true, "origin_exists": true, "publication_exists": true, "target_apply_privileges": true, "heartbeat_possible": true, "source_writable": true,
+	"unlogged_tables": true, "large_objects": true, "engine_commit_order": true,
 }
 
 func (r *Runner) emit(id, scope, db, level string, hard bool, msg, remediation string, ev map[string]any, start time.Time) {
@@ -287,6 +289,13 @@ func (r *Runner) hostChecks(ctx context.Context) {
 			r.emit("engine_version", "", "", check.Blocker, true, "pgcopydb "+e.EngineVersion+" has a known change-apply bug (exit 12) and cannot run online migrations.", "Install pgcopydb 0.18 or later with install.sh.", ev, t)
 		} else {
 			ok(r, "engine_version", "", "", "pgcopydb "+e.EngineVersion+" supports online migrations up to PostgreSQL 18.", ev, t)
+		}
+		ev = map[string]any{"version": e.EngineVersion, "required": EngineBuildRequired}
+		if !EngineCommitOrderFixed(e.EngineVersion) {
+			r.emit("engine_commit_order", "", "", check.Blocker, true, "pgcopydb "+e.EngineVersion+" loses transactions that overlap another one (it takes them in BEGIN order, D84): with concurrent writers, committed changes never reach the target. Online migrations need Upwell's build, "+EngineBuildRequired+".",
+				"Run install.sh again; it builds pgcopydb "+EngineBuildRequired+" from the v0.18 tag with the fixes in deploy/pgcopydb.", ev, t)
+		} else {
+			ok(r, "engine_commit_order", "", "", "pgcopydb "+e.EngineVersion+" applies transactions in commit order.", ev, t)
 		}
 	}
 	t = time.Now()
@@ -947,6 +956,25 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		ok(r, "target_apply_privileges", "", d.Source, "The target user can manage replication origins and set session_replication_role.", ap.EvidenceFor(e.Target.User, r.dstVer), t)
 	}
 
+	// A database left read-only for new sessions (a write freeze still
+	// applied, for example after an earlier migration ended GO) refuses the
+	// engine's publication and slot (D83: the droplet's "cannot execute CREATE
+	// PUBLICATION in a read-only transaction").
+	p = r.probe(ctx, "source_writable", "", d.Source)
+	var ro, dbSetting string
+	p.row(sc, sourceReadOnlySQL).Scan(&ro, &dbSetting)
+	ev = map[string]any{"default_transaction_read_only": ro, "database_setting": dbSetting}
+	if readOnlyOn(ro) {
+		why := "its new sessions are read-only (default_transaction_read_only = " + ro + ")"
+		if readOnlyOn(dbSetting) {
+			why = "the database is set read-only for new sessions (ALTER DATABASE ... SET default_transaction_read_only = on), as a write freeze leaves it"
+		}
+		p.emit(check.Blocker, true, "Source database "+d.Source+" refuses writes: "+why+". The engine cannot create its publication and replication slot there.",
+			"If an earlier migration's write freeze is still applied, undo it from that migration's cutover console; otherwise run ALTER DATABASE "+pg.QuoteIdent(d.Source)+" RESET default_transaction_read_only on the source.", ev)
+	} else {
+		p.ok("The source database accepts writes for the engine's publication and slot.", ev)
+	}
+
 	p = r.probe(ctx, "heartbeat_possible", "", d.Source)
 	var canCreate, hbExists bool
 	p.row(sc, `SELECT has_database_privilege(current_database(),'CREATE')`).Scan(&canCreate)
@@ -1288,6 +1316,24 @@ func settingMillis(v string) int64 {
 }
 
 var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
+
+// EngineBuildRequired is the pgcopydb build deploy/install.sh makes: the
+// v0.18 tag with the patches in deploy/pgcopydb.
+const EngineBuildRequired = "0.18+upwell.1"
+
+var enginePatchRe = regexp.MustCompile(`\+upwell\.(\d+)`)
+
+// EngineCommitOrderFixed reports whether a pgcopydb version is Upwell's
+// build with the commit-order fix (D84): upstream 0.18 and its main branch
+// skip transactions whose BEGIN precedes the previous one's COMMIT.
+func EngineCommitOrderFixed(v string) bool {
+	m := enginePatchRe.FindStringSubmatch(v)
+	if m == nil {
+		return false
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n >= 1
+}
 
 // EngineMajorMinor reads the leading major.minor of a pgcopydb version as
 // packages report it: "0.18", "0.18.1", or the PGDG package's

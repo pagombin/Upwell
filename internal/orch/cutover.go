@@ -411,6 +411,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		// transaction ID. Either one means writes have not stopped.
 		var changing []string
 		baseline := map[string]int64{}
+		fingerprint := map[string]string{}
 		for _, d := range dbs {
 			act, err := pgpack.WriteActivity(bg, src.WithDB(d.SourceName))
 			if err != nil {
@@ -418,11 +419,15 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 				return
 			}
 			baseline[d.SourceName] = act.Changes
+			fingerprint[d.SourceName] = act.Fingerprint
 			if n := act.Changes - first[d.SourceName].Changes; n != 0 {
 				changing = append(changing, fmt.Sprintf("%s (%d row changes in %d s)", d.SourceName, n, secs))
 			}
+			if act.Fingerprint != first[d.SourceName].Fingerprint {
+				changing = append(changing, d.SourceName+" (a table was truncated or rewritten, or a sequence or large object changed)")
+			}
 			if len(act.OpenWriters) > 0 {
-				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
+				changing = append(changing, fmt.Sprintf("%s (%d open or prepared write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
 			}
 		}
 		override := false
@@ -440,7 +445,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			op.Log("warn", "Admin %s overrode detected writes: %s", a.Username, strings.Join(changing, ", "))
 		}
 		for _, d := range dbs {
-			o.setDB(bg, d.ID, map[string]any{"writes_baseline": baseline[d.SourceName]})
+			o.setDB(bg, d.ID, map[string]any{"writes_baseline": baseline[d.SourceName], "writes_fingerprint": fingerprint[d.SourceName]})
 		}
 		now := store.Now()
 		o.updateFlags(bg, m.ID, func(f *Flags) {
@@ -857,6 +862,29 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		}
 		o.setDB(ctx, d.ID, map[string]any{"state": state, "verdict": verdict, "last_error": store.NullString(lastErr)})
 	}
+	// Each database was resampled right after its own comparison; a write to
+	// one of them while another was being compared would not be. Resample
+	// every database once more, last, before the verdict (D83).
+	if len(inc) > 1 {
+		op.StepDetail("verify", "resampling writes on every database", 1)
+		for _, d := range inc {
+			cur, err := o.GetDatabase(ctx, m.ID, d.ID)
+			if err != nil || cur.Verdict != "GO" {
+				continue
+			}
+			wr := o.writesSinceWritersStep(ctx, m, src.WithDB(d.SourceName), cur)
+			if wr.Level != check.Blocker {
+				continue
+			}
+			wr.CheckID, wr.Title = "writes_stopped_final", "No writes on the source before the verdict"
+			if _, err := o.st.DB.ExecContext(ctx, `INSERT INTO verifications(id,migration_id,database,run_id,check_id,result,title,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
+				store.NewID(), m.ID, d.SourceName, runID, wr.CheckID, wr.Level, wr.Title, toJSON(map[string]any{"message": wr.Message, "evidence": wr.Evidence}), store.Now()); err != nil {
+				op.LogDB("error", d.SourceName, "verification results could not be recorded: %v", err)
+			}
+			op.LogDB("error", d.SourceName, "%s: %s", wr.Title, wr.Message)
+			o.setDB(ctx, d.ID, map[string]any{"state": DFailed, "verdict": "NO-GO", "last_error": "NO-GO: " + wr.Title})
+		}
+	}
 	op.StepEnd("verify", "done", "")
 	o.finishCutover(ctx, m, op, a, nil)
 }
@@ -949,18 +977,35 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 	if c == nil || c.EndedAt != 0 {
 		return uerr("no_cutover", "No cutover is in progress.", "")
 	}
-	if c.Phase != "readiness" && c.Phase != "writers" && c.Phase != "heartbeat" && c.Phase != "await" {
+	preEndpos := func(c *CutoverState) bool {
+		return c.Phase == "readiness" || c.Phase == "writers" || c.Phase == "heartbeat" || c.Phase == "await"
+	}
+	if !preEndpos(c) {
 		return uerr("too_late", "End positions are set; the cutover cannot be aborted now.", "Wait for the verdict.")
 	}
-	if cancel, ok := cutoverCancels.Load(c.OpID); ok {
-		cutoverCancelReasons.Store(c.OpID, "the cutover was aborted by "+a.Username)
-		cancel.(context.CancelFunc)()
+	// F6: check-and-set under the flag lock, as the cutover moves past the
+	// point of no return (it checks its context there under the same lock):
+	// either the abort cancels it before end positions, or it is refused.
+	aborted := false
+	o.updateFlags(ctx, m.ID, func(f *Flags) {
+		cur := f.Cutover
+		if cur == nil || cur.EndedAt != 0 || cur.OpID != c.OpID || !preEndpos(cur) {
+			return
+		}
+		if cancel, ok := cutoverCancels.Load(c.OpID); ok {
+			cutoverCancelReasons.Store(c.OpID, "the cutover was aborted by "+a.Username)
+			cancel.(context.CancelFunc)()
+		}
+		f.Cutover = nil
+		aborted = true
+	})
+	if !aborted {
+		return uerr("too_late", "End positions were set while the abort was requested; the cutover cannot be aborted now.", "Wait for the verdict.")
 	}
 	dbs, _ := o.ListDatabases(ctx, m.ID)
 	for _, d := range dbs {
 		o.setDB(ctx, d.ID, map[string]any{"hb_token": nil, "hb_before_lsn": nil, "writes_baseline": nil})
 	}
-	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Cutover = nil })
 	o.audit.Append(ctx, a, "cutover.abort", m.ID, nil, nil)
 	if err := o.undoFreeze(ctx, m.ID, a.Username, "the cutover was aborted"); err != nil {
 		o.Event(ctx, m.ID, "", "write_freeze", "critical", err.Error(), nil)
@@ -1086,7 +1131,7 @@ func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, 
 	// Statistics reach pg_stat_user_tables about a second after a transaction ends.
 	time.Sleep(1500 * time.Millisecond)
 	act, err := pgpack.WriteActivity(ctx, src)
-	res.Evidence = map[string]any{"baseline": *d.WritesBaseline, "now": act.Changes, "open_writers": act.OpenWriters, "override": override}
+	res.Evidence = map[string]any{"baseline": *d.WritesBaseline, "now": act.Changes, "open_writers": act.OpenWriters, "override": override, "fingerprint_checked": d.WritesFingerprint != ""}
 	switch {
 	case err != nil:
 		res.Level = check.Blocker
@@ -1094,9 +1139,12 @@ func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, 
 	case act.Changes != *d.WritesBaseline:
 		res.Level = check.Blocker
 		res.Message = fmt.Sprintf("Rows changed on the source after the writers step confirmed writes stopped (%d row changes since then); those changes are not on the target.%s", act.Changes-*d.WritesBaseline, overrideNote)
+	case d.WritesFingerprint != "" && act.Fingerprint != d.WritesFingerprint:
+		res.Level = check.Blocker
+		res.Message = "Since the writers step a table on the source was truncated or rewritten, or a sequence or large object changed; the row counter does not show those, and the target may not have them." + overrideNote
 	case len(act.OpenWriters) > 0:
 		res.Level = check.Blocker
-		res.Message = fmt.Sprintf("%d session(s) hold an open write transaction on the source (%s): when they commit, their changes will be missing on the target.%s", len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; "), overrideNote)
+		res.Message = fmt.Sprintf("%d open or prepared write transaction(s) on the source (%s): when they commit, their changes will be missing on the target.%s", len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; "), overrideNote)
 	default:
 		res.Level = check.OK
 		res.Message = "No row changes on the source since writers were confirmed stopped, and no open write transaction."

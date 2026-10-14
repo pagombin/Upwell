@@ -296,7 +296,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	sort.Slice(tables, func(i, j int) bool { return tables[i].Bytes < tables[j].Bytes })
 	deadline := time.Now().Add(in.ChecksumBudget)
 	var countFail, sumFail, notSummed, estOnly []string
-	exactN, summedN := 0, 0
+	exactN, summedN, countDiffSummed := 0, 0, 0
 	type pair struct {
 		n   int64
 		sum string
@@ -319,11 +319,15 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 				continue
 			}
 			exactN++
-			summedN++
 			if a.n != b.n {
+				// Contents not compared: the counts already differ.
 				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)", t.Name, a.n, b.n))
-			} else if a.sum != b.sum {
-				sumFail = append(sumFail, t.Name)
+				countDiffSummed++
+			} else {
+				summedN++
+				if a.sum != b.sum {
+					sumFail = append(sumFail, t.Name)
+				}
 			}
 			continue
 		}
@@ -358,12 +362,20 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	if len(estOnly) > 0 {
 		add(vres("row_estimates", db, check.Warning, "Large tables not counted", fmt.Sprintf("%d table(s) above the exact-count limit and outside the checksum window were not counted; only their size on disk was compared, which catches an empty or truncated table but not missing rows. Raise exact_count_max_mb or verify_checksum_budget_seconds to compare them fully.", len(estOnly)), map[string]any{"tables": limitList(estOnly, 50)}))
 	}
-	ev = map[string]any{"checksummed": summedN, "mismatches": sumFail, "not_checksummed": limitList(notSummed, 100)}
+	// summedN counts only tables whose contents were compared: one whose
+	// counts differ is reported under row counts, never as a match.
+	ev = map[string]any{"checksummed": summedN, "mismatches": sumFail, "not_checksummed": limitList(notSummed, 100), "counts_differ": countDiffSummed}
+	also := ""
+	if countDiffSummed > 0 {
+		also = fmt.Sprintf(" %d table(s) with different row counts were not compared (see row counts).", countDiffSummed)
+	}
 	switch {
 	case len(sumFail) > 0:
-		add(vres("checksums", db, check.Blocker, "Row checksums match", fmt.Sprintf("%d table(s) have the same row count but different contents: %s.", len(sumFail), strings.Join(limitList(sumFail, 5), ", ")), ev))
+		add(vres("checksums", db, check.Blocker, "Row checksums match", fmt.Sprintf("%d table(s) have the same row count but different contents: %s.%s", len(sumFail), strings.Join(limitList(sumFail, 5), ", "), also), ev))
 	case len(notSummed) > 0:
-		add(vres("checksums", db, check.Warning, "Row checksums match", fmt.Sprintf("Checksums match for %d table(s); %d table(s) did not fit in the verification window and were not checksummed.", summedN, len(notSummed)), ev))
+		add(vres("checksums", db, check.Warning, "Row checksums match", fmt.Sprintf("Checksums match for %d table(s); %d table(s) did not fit in the verification window and were not checksummed.%s", summedN, len(notSummed), also), ev))
+	case countDiffSummed > 0:
+		add(vres("checksums", db, check.Blocker, "Row checksums match", fmt.Sprintf("Checksums match for %d table(s).%s", summedN, also), ev))
 	default:
 		add(vres("checksums", db, check.OK, "Row checksums match", fmt.Sprintf("Checksums match for all %d table(s).", summedN), ev))
 	}
@@ -452,19 +464,27 @@ type seqVal struct {
 }
 
 func sequenceValues(ctx context.Context, c *pgx.Conn) (map[string]seqVal, error) {
-	rows, err := pg.Query(ctx, c, `SELECT format('%I.%I', schemaname, sequencename), last_value, start_value, increment_by < 0 FROM pg_sequences WHERE schemaname <> 'upwell'`)
+	// pg_sequences shows last_value NULL both for a sequence never called
+	// and for one the user may not read (F4): the second is not "unused".
+	rows, err := pg.Query(ctx, c, `SELECT format('%I.%I', schemaname, sequencename), last_value, start_value, increment_by < 0,
+		has_sequence_privilege(format('%I.%I', schemaname, sequencename), 'SELECT,USAGE') FROM pg_sequences WHERE schemaname <> 'upwell'`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := map[string]seqVal{}
+	var unreadable []string
 	for rows.Next() {
 		var n string
 		var last *int64
 		var start int64
-		var desc bool
-		if err := rows.Scan(&n, &last, &start, &desc); err != nil {
+		var desc, readable bool
+		if err := rows.Scan(&n, &last, &start, &desc, &readable); err != nil {
 			return nil, err
+		}
+		if !readable {
+			unreadable = append(unreadable, n)
+			continue
 		}
 		// Never called: the next value is the start, one step "before" it.
 		var v int64
@@ -478,7 +498,14 @@ func sequenceValues(ctx context.Context, c *pgx.Conn) (map[string]seqVal, error)
 		}
 		out[n] = seqVal{v, desc}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(unreadable) > 0 {
+		sort.Strings(unreadable)
+		return nil, fmt.Errorf("the user may not read %d sequence(s), so their values are unknown: %s; grant it SELECT on them", len(unreadable), strings.Join(limitList(unreadable, 5), ", "))
+	}
+	return out, nil
 }
 
 // behind reports whether target t would hand out a value the source already
@@ -501,8 +528,10 @@ func compareSequences(ctx context.Context, src, dst *pgx.Conn) ([]string, int, e
 	}
 	var diff []string
 	for n, v := range s {
-		if dv, ok := d[n]; !ok || behind(v, dv) {
-			diff = append(diff, fmt.Sprintf("%s (source %d, target %d)", n, v.v, d[n].v))
+		if dv, ok := d[n]; !ok {
+			diff = append(diff, fmt.Sprintf("%s (source %d, missing on the target)", n, v.v))
+		} else if behind(v, dv) {
+			diff = append(diff, fmt.Sprintf("%s (source %d, target %d)", n, v.v, dv.v))
 		}
 	}
 	sort.Strings(diff)
@@ -549,6 +578,9 @@ type Activity struct {
 	// Changes is the row-change counter (inserts, updates and deletes in
 	// user tables). PostgreSQL adds a transaction's changes when it ends.
 	Changes int64
+	// Fingerprint changes when a table is truncated or rewritten, a sequence
+	// moves, or a large object is created or removed (D83).
+	Fingerprint string
 	// OpenWriters are client sessions inside a transaction that has written
 	// (it holds a transaction ID): invisible to Changes until they commit.
 	OpenWriters []string
@@ -573,6 +605,25 @@ func WriteActivity(ctx context.Context, c pg.Conn) (Activity, error) {
 	if a.OpenWriters, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' pid '||pid||' ('||COALESCE(application_name,'')||', '||state||', open '||
 		COALESCE(extract(epoch FROM now()-xact_start)::int,0)||' s)' FROM pg_stat_activity WHERE `+others+` AND backend_xid IS NOT NULL ORDER BY 1 LIMIT 50`); err != nil {
 		return a, fmt.Errorf("listing open write transactions: %w", err)
+	}
+	// A prepared transaction holds writes that any session can commit later
+	// and has no session, so pg_stat_activity does not show it (D83).
+	prepared, err := pg.QueryStrings(ctx, conn, `SELECT 'prepared transaction '||quote_literal(gid)||' by '||owner||' since '||to_char(prepared, 'YYYY-MM-DD HH24:MI:SS TZ')
+		FROM pg_prepared_xacts WHERE database = current_database() ORDER BY prepared LIMIT 50`)
+	if err != nil {
+		return a, fmt.Errorf("listing prepared transactions: %w", err)
+	}
+	a.OpenWriters = append(a.OpenWriters, prepared...)
+	// What the row counter does not see: TRUNCATE and table rewrites (a new
+	// storage file), sequences moved by setval or nextval, large objects
+	// created or removed (D83).
+	if err := pg.QueryRow(ctx, conn, `SELECT md5(
+			COALESCE((SELECT string_agg(c.oid::text||':'||c.relfilenode::text, ',' ORDER BY c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE c.relkind IN ('r','m') AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'), '')
+			||'|'||COALESCE((SELECT string_agg(quote_ident(schemaname)||'.'||quote_ident(sequencename)||'='||COALESCE(last_value::text, 'unread'), ',' ORDER BY schemaname, sequencename)
+				FROM pg_sequences WHERE schemaname <> 'upwell'), '')
+			||'|'||(SELECT count(*)::text||':'||COALESCE(max(oid)::text, '') FROM pg_largeobject_metadata))`).Scan(&a.Fingerprint); err != nil {
+		return a, fmt.Errorf("reading tables, sequences and large objects: %w", err)
 	}
 	if a.Sessions, err = pg.QueryStrings(ctx, conn, `SELECT usename||'@'||COALESCE(client_addr::text,'local')||' ('||COALESCE(application_name,'')||', '||state||')' FROM pg_stat_activity
 		WHERE `+others+` ORDER BY 1 LIMIT 50`); err != nil {

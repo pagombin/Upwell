@@ -16,6 +16,10 @@ set -Eeuo pipefail
 
 PGCOPYDB_PIN="0.18"
 PGCOPYDB_TAG="v0.18"
+# The v0.18 tag plus deploy/pgcopydb/*.patch (D84: without them pgcopydb
+# loses transactions that overlap another one). Upwell refuses online
+# migrations with an engine that does not report this build.
+PGCOPYDB_BUILD="0.18+upwell.1"
 GO_VERSION="1.24.4"
 PORT_DEFAULT=443
 
@@ -176,39 +180,32 @@ pgcopydb_version() {
   local b
   b=$(command -v /usr/local/bin/pgcopydb || command -v pgcopydb || true)
   [[ -n $b ]] || return 0
-  "$b" --version 2>&1 | grep -oE 'pgcopydb version [0-9.]+' | awk '{print $3}' | head -1
+  "$b" --version 2>&1 | grep -oE 'pgcopydb version [^ ]+' | awk '{print $3}' | head -1
 }
 vge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
 cur=$(pgcopydb_version || true)
-if [[ -n $cur ]] && vge "$cur" "$PGCOPYDB_PIN"; then say "pgcopydb" "unchanged ($cur)"
-elif [[ $(engines_active) -gt 0 ]]; then fail "pgcopydb needs an update but engine units are running; finish or pause the migrations first (the engine is never swapped under a running copy)"
-elif check; then would "pgcopydb" "install $PGCOPYDB_PIN (found ${cur:-none})"
+if [[ $cur == "$PGCOPYDB_BUILD" ]]; then say "pgcopydb" "unchanged ($cur)"
+elif [[ $(engines_active) -gt 0 ]]; then fail "pgcopydb needs an update ($PGCOPYDB_BUILD, found ${cur:-none}) but engine units are running; finish or pause the migrations first (the engine is never swapped under a running copy)"
+elif check; then would "pgcopydb" "build $PGCOPYDB_BUILD (found ${cur:-none})"
 else
-  cand=$(apt-cache policy pgcopydb 2>/dev/null | awk '/Candidate:/ {print $2}' | grep -oE '^[0-9]+\.[0-9]+' || true)
-  if [[ -n $cand ]] && vge "$cand" "$PGCOPYDB_PIN"; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pgcopydb >>"$LOGFILE" 2>&1 || fail "installing the pgcopydb package failed"
-    # Link the package's own binary explicitly: an older pgcopydb left in
-    # /usr/local/bin (a source build) would otherwise shadow it.
-    pkgbin=$(dpkg -L pgcopydb 2>/dev/null | grep -E '/s?bin/pgcopydb$' | sort | head -1 || true)
-    [[ -n $pkgbin ]] || pkgbin=/usr/bin/pgcopydb
-    [[ -x $pkgbin ]] || fail "the pgcopydb package is installed but its binary is not at $pkgbin"
-    if [[ $pkgbin != /usr/local/bin/pgcopydb ]]; then
-      rm -f /usr/local/bin/pgcopydb || fail "could not remove the old /usr/local/bin/pgcopydb"
-      ln -s "$pkgbin" /usr/local/bin/pgcopydb || fail "could not link /usr/local/bin/pgcopydb to $pkgbin"
-    fi
-    got=$(pgcopydb_version || true)
-    { [[ -n $got ]] && vge "$got" "$PGCOPYDB_PIN"; } || fail "/usr/local/bin/pgcopydb reports version ${got:-unknown}, not $PGCOPYDB_PIN or newer"
-    say "pgcopydb" "installed package $cand ($pkgbin)"
-  else
-    say "pgcopydb" "building $PGCOPYDB_TAG from source (the package is ${cand:-unavailable})"
-    dev=$(client_major); dev=${dev:-16}
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git build-essential "postgresql-server-dev-$dev" libpq-dev libgc-dev libncurses-dev libedit-dev libssl-dev libkrb5-dev zlib1g-dev liblz4-dev libzstd-dev libxslt1-dev libselinux1-dev libpam0g-dev libsqlite3-dev >>"$LOGFILE" 2>&1 || fail "installing build dependencies for pgcopydb failed"
-    src=/usr/local/src/pgcopydb-$PGCOPYDB_PIN
-    [[ -d $src ]] || git clone -q --depth 1 --branch "$PGCOPYDB_TAG" https://github.com/dimitri/pgcopydb "$src" >>"$LOGFILE" 2>&1 || fail "cloning pgcopydb failed"
-    make -C "$src" -j"$(nproc)" >>"$LOGFILE" 2>&1 || fail "building pgcopydb failed (see $LOGFILE)"
-    install -m 0755 "$src/src/bin/pgcopydb/pgcopydb" /usr/local/bin/pgcopydb
-    say "pgcopydb" "installed $(pgcopydb_version) from source"
-  fi
+  # Always built from source: the packages (PGDG included) lack the fixes
+  # in deploy/pgcopydb.
+  say "pgcopydb" "building $PGCOPYDB_BUILD from source (found ${cur:-none})"
+  dev=$(client_major); dev=${dev:-16}
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git build-essential "postgresql-server-dev-$dev" libpq-dev libgc-dev libncurses-dev libedit-dev libssl-dev libkrb5-dev zlib1g-dev liblz4-dev libzstd-dev libxslt1-dev libselinux1-dev libpam0g-dev libsqlite3-dev >>"$LOGFILE" 2>&1 || fail "installing build dependencies for pgcopydb failed"
+  src=/usr/local/src/pgcopydb-$PGCOPYDB_BUILD
+  rm -rf "$src"
+  git clone -q --depth 1 --branch "$PGCOPYDB_TAG" https://github.com/dimitri/pgcopydb "$src" >>"$LOGFILE" 2>&1 || fail "cloning pgcopydb failed"
+  for p in "$SELF_DIR"/pgcopydb/*.patch; do
+    git -C "$src" apply "$p" >>"$LOGFILE" 2>&1 || fail "applying $(basename "$p") to pgcopydb $PGCOPYDB_TAG failed"
+  done
+  VERSION="$PGCOPYDB_BUILD" make -C "$src" -j"$(nproc)" >>"$LOGFILE" 2>&1 || fail "building pgcopydb failed (see $LOGFILE)"
+  # Replace a link to a package's binary too (rm first: install would write through it).
+  rm -f /usr/local/bin/pgcopydb
+  install -m 0755 "$src/src/bin/pgcopydb/pgcopydb" /usr/local/bin/pgcopydb
+  got=$(pgcopydb_version || true)
+  [[ $got == "$PGCOPYDB_BUILD" ]] || fail "/usr/local/bin/pgcopydb reports version ${got:-unknown}, not $PGCOPYDB_BUILD"
+  say "pgcopydb" "installed $got from source"
   CHANGED=1
 fi
 # The config names /usr/local/bin/pgcopydb; a pgcopydb that was already

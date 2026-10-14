@@ -98,6 +98,15 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()
+		// UPWELL_IT_KEEP: a directory where each test's store and engine
+		// logs are kept after it ends, for diagnosis.
+		if keep := os.Getenv("UPWELL_IT_KEEP"); keep != "" {
+			d, err := os.MkdirTemp(keep, strings.ReplaceAll(t.Name(), "/", "_")+"-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir = d
+		}
 	}
 	cfg := config.Default()
 	cfg.DataDir = filepath.Join(dir, "data")
@@ -128,7 +137,7 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 		t.Fatal(err)
 	}
 	au := &audit.Log{Store: st}
-	o := orch.New(orch.Deps{Config: cfg, Store: st, Vault: vault, Engine: pgcopydb.New("pgcopydb", r), Runner: r, Logger: lg, Bus: b, Audit: au, Settings: set})
+	o := orch.New(orch.Deps{Config: cfg, Store: st, Vault: vault, Engine: pgcopydb.New(envStr("UPWELL_IT_PGCOPYDB", "pgcopydb"), r), Runner: r, Logger: lg, Bus: b, Audit: au, Settings: set})
 	o.SetTestHooks(hooks)
 	as := auth.NewService(st)
 	as.Vault = vault
