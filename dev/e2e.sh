@@ -56,7 +56,7 @@ cleanup_all() {
       sleep 8
     fi
     stop_server
-    pgrep -x pgcopydb >/dev/null && pgrep -x pgcopydb | xargs kill -9 2>/dev/null || true
+    pgrep -f "^[^ ]*pgcopydb .*$DATA/" | xargs -r kill -9 2>/dev/null || true  # only this suite's engines
   fi
 }
 trap cleanup_all EXIT
@@ -109,7 +109,7 @@ psql_su $SRC_PORT postgres -c "SELECT 1" >/dev/null
 
 log "Fresh server on $PORT"
 stop_server
-pgrep -x pgcopydb >/dev/null && pgrep -x pgcopydb | xargs kill -9 2>/dev/null || true
+pgrep -f "^[^ ]*pgcopydb .*$DATA/" | xargs -r kill -9 2>/dev/null || true  # only this suite's engines
 rm -rf $DATA/data $DATA/logs $DATA/setup-token $DATA/master.key $DATA/tls
 cat > $DATA/config.yaml <<EOF
 listen_address: 127.0.0.1
