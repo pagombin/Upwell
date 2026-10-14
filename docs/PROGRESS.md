@@ -14,6 +14,22 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | general | Store unreadable from the drain on | `TestCutoverStoreReadFailureNeverGO` | pgoutput | pass after fix | D93: was GO with the old code (proven by reverting) |
 | general | Cleanup's existence checks failing | `TestEngineCleanupCheckFailureNotSuccess` | n/a | pass after fix | D93: cleanup reported success with the slot left (proven by reverting) |
 
+### Part 2: enhancements
+
+Out of scope by the request: DigitalOcean API discovery, notifications, SSO, update checks and a self-serve mode.
+
+| Enhancement | Why | Status |
+| --- | --- | --- |
+| Name the sessions a base copy waits for (slot creation held by open transactions) | one idle-in-transaction session anywhere on the source holds the copy back silently; found by the Part 1 run | done (D94): event, migration view, database page, overview "needs attention", `upwell_snapshot_wait_seconds` |
+| Preflight: xml columns on a target without XML support | the base copy failed only after copying (scenario 16) | done (D94) |
+| Resume checks the slot first | a lost slot read "failed (permanent)" instead of "restart from zero" | done (D95) |
+| Await step names why the target could not be read | the failure said only that the heartbeat never arrived | done (D94) |
+| Metrics scrape fails on an unreadable database list | an empty scrape looked like "no databases" | done |
+| Engine patch: apply a REPLICA IDENTITY FULL delete or update to one row only (by ctid) | identical rows in a table without a key are all changed on the target; today this ends NO-GO (scenario 8b) | not done: an engine change on the apply path needs its own review and a long soak; preflight warns and verification catches it |
+| Slot failover for PostgreSQL 17+ sources (`failover = true` slots synced to the standby) | a source failover would no longer force a restart from zero | not done: needs a PostgreSQL 17 source with a standby and pgcopydb support for creating failover slots |
+| Verification ETA for the full comparison | the chunked comparison shows "range i of n" but no time left | not done: low value until measured on a real 300 GB table |
+| Cutover rehearsal (every step up to verification, without end positions) | lets the customer see the write pause in advance | not done: would need a second path through the cutover; risk outweighs value tonight |
+
 ## Freeze and verification review; pgcopydb overlapping-transaction loss (2026-10-14), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |
