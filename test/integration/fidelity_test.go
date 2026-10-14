@@ -252,6 +252,12 @@ func tableFingerprints(t *testing.T, c pg.Conn, db string) map[string]string {
 		t.Fatal(err)
 	}
 	defer conn.Close(ctx)
+	// The same row must print the same on both servers, whatever the role's settings.
+	for _, s := range []string{"SET TimeZone = 'UTC'", "SET DateStyle = 'ISO, YMD'", "SET IntervalStyle = 'postgres'", "SET extra_float_digits = 3", "SET bytea_output = 'hex'", "SET statement_timeout = 0"} {
+		if _, err := conn.Exec(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
 	rows, err := conn.Query(ctx, `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY 1`)
 	if err != nil {
@@ -324,13 +330,18 @@ func compareDatabase(t *testing.T, db string) (tables int, mismatches []string) 
 			mismatches = append(mismatches, fmt.Sprintf("%s sequence %s: source %d, target %d", db, n, v, ds[n]))
 		}
 	}
+	return len(src), mismatches
+}
+
+// fidelityGhosts: rolled-back work of the fidelity workload never reaches the target.
+func fidelityGhosts(t *testing.T, db string) (mismatches []string) {
 	if g := q(t, dstConn, db, "SELECT count(*)::text FROM ghosts"); g != "0" {
 		mismatches = append(mismatches, fmt.Sprintf("%s: %s rolled-back row(s) reached the target", db, g))
 	}
 	if g := q(t, dstConn, db, "SELECT count(*)::text FROM customers WHERE name = 'GHOST'"); g != "0" {
 		mismatches = append(mismatches, fmt.Sprintf("%s: a rolled-back update reached the target", db))
 	}
-	return len(src), mismatches
+	return mismatches
 }
 
 func runFidelity(t *testing.T, plugin string) {
@@ -417,6 +428,7 @@ func runFidelity(t *testing.T, plugin string) {
 		n, mm := compareDatabase(t, db)
 		total += n
 		all = append(all, mm...)
+		all = append(all, fidelityGhosts(t, db)...)
 	}
 	if len(all) > 0 {
 		t.Fatalf("source and target differ:\n%s", strings.Join(all, "\n"))

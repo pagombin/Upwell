@@ -53,6 +53,9 @@ type tableInfo struct {
 	Bytes   int64
 	Est     int64
 	Columns string
+	// FullNoKey: REPLICA IDENTITY FULL and no unique index, so identical
+	// rows cannot be told apart by the engine's apply.
+	FullNoKey bool
 }
 
 func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) {
@@ -64,7 +67,8 @@ func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) 
 		GREATEST(c.reltuples,0)::bigint,
 		c.relkind::text || '|' || COALESCE((SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod)||CASE WHEN a.attnotnull THEN ' not null' ELSE '' END||
 			CASE WHEN a.attidentity<>'' THEN ' identity '||a.attidentity::text ELSE '' END||CASE WHEN a.attgenerated<>'' THEN ' generated '||COALESCE(pg_get_expr(d.adbin,d.adrelid),'') ELSE '' END,
-			',' ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),'')
+			',' ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),''),
+		c.relreplident = 'f' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisunique AND i.indpred IS NULL)
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND c.relpersistence<>'t' AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND NOT c.relispartition`)
 	if err != nil {
@@ -74,7 +78,7 @@ func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) 
 	out := map[string]tableInfo{}
 	for rows.Next() {
 		var t tableInfo
-		if err := rows.Scan(&t.Name, &t.Bytes, &t.Est, &t.Columns); err != nil {
+		if err := rows.Scan(&t.Name, &t.Bytes, &t.Est, &t.Columns, &t.FullNoKey); err != nil {
 			return nil, err
 		}
 		out[t.Name] = t
@@ -329,7 +333,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			exactN++
 			if a.n != b.n {
 				// Contents not compared: the counts already differ.
-				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)", t.Name, a.n, b.n))
+				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)%s", t.Name, a.n, b.n, fullNoKeyWhy(t)))
 				countDiffSummed++
 			} else {
 				summedN++
@@ -352,8 +356,10 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			go func() { defer wg.Done(); b.n, b.err = exactCount(ctx, dst, t.Name) }()
 			wg.Wait()
 			exactN++
-			if a.err != nil || b.err != nil || a.n != b.n {
-				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)", t.Name, a.n, b.n))
+			if a.err != nil || b.err != nil {
+				countFail = append(countFail, fmt.Sprintf("%s (could not count: source %v, target %v)", t.Name, a.err, b.err))
+			} else if a.n != b.n {
+				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)%s", t.Name, a.n, b.n, fullNoKeyWhy(t)))
 			}
 		} else {
 			estOnly = append(estOnly, t.Name)
@@ -794,4 +800,13 @@ func EndStaleEngineSessions(ctx context.Context, c *pgx.Conn) ([]string, error) 
 		}
 	}
 	return out, rows.Err()
+}
+
+// fullNoKeyWhy names the likely cause of a count difference on a table whose
+// identical rows the engine cannot tell apart (Part 1, scenario 8).
+func fullNoKeyWhy(t tableInfo) string {
+	if !t.FullNoKey {
+		return ""
+	}
+	return ": REPLICA IDENTITY FULL without a unique key, so an UPDATE or DELETE of one of several identical rows was applied to all of them on the target (preflight identity_full_duplicates); add a primary key and restart this database from zero"
 }
