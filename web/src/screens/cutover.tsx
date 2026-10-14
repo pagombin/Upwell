@@ -34,14 +34,20 @@ export function CutoverTab() {
   const op = useApi<Operation>(c?.op_id ? `/api/v1/operations/${c.op_id}` : null);
   const { can, me } = useSession();
   const ops = useOps();
-  const { run, busy } = useAction();
+  const { run, must, busy } = useAction();
   const now = useNow(1000);
   const running = !!c && !c.ended_at;
+  // U2: the operation can still be finishing its verdict step after the
+  // cutover records its end, so poll until the operation itself ends.
+  const opRunning = op.data?.state === "running";
+  // U1: a cutover whose operation ended without ending the cutover (the
+  // console restarted mid-way) can only be continued.
+  const interrupted = running && !!op.data && !opRunning;
   useEffect(() => {
-    if (!running) return;
+    if (!running && !opRunning) return;
     const t = setInterval(() => { op.refresh(); }, 1000);
     return () => clearInterval(t);
-  }, [running, op.refresh]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [running, opRunning, op.refresh]); // eslint-disable-line react-hooks/exhaustive-deps
   const [start, setStart] = useState(false);
   const [method, setMethod] = useState<"manual" | "freeze">("manual");
   const admin = me?.user.role === "admin";
@@ -50,14 +56,34 @@ export function CutoverTab() {
   const inc = v.databases.filter((d) => d.include);
   const endposSet = inc.some((d) => d.endpos);
   const pauseStart = c?.writes_stopped_at || c?.started_at;
-  const pauseMs = pauseStart ? (c?.ended_at || now) - pauseStart : 0;
+  // U11: the timer runs on the server's clock (the times it compares are
+  // the server's), corrected by how far this browser's clock is off.
+  const skew = v.now && view.updatedAt ? v.now - view.updatedAt : 0;
+  const pauseMs = pauseStart ? Math.max(0, (c?.ended_at || now + skew) - pauseStart) : 0;
   const retryable = m.flags.verdict === "NO-GO" && !endposSet;
   const offline = v.settings_effective?.mode === "offline";
   const canStart = !offline && can("operator") && !m.fixture && !m.flags.cleaned_up && !m.flags.aborted && (!c || retryable) && (!m.flags.verdict || retryable);
   return (
     <div className="stack" style={{ gap: 24 }}>
+      {/* U12: readiness and the running step, announced as they change. */}
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {ready.data ? (ready.data.ready ? "Cutover readiness: ready." : `Cutover readiness: not ready, ${ready.data.conditions.filter((x) => !x.ok).length} condition(s) failing.`) : ""}
+        {(() => { const st = op.data?.steps.find((x) => x.state === "running"); return st ? ` Cutover step running: ${st.title}.` : ""; })()}
+        {m.flags.verdict ? ` Verdict ${m.flags.verdict}.` : ""}
+      </div>
       <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
-      {m.flags.freeze && <FreezeBanner mig={id} f={m.flags.freeze} canUndo={can("operator") && !m.fixture} onDone={view.refresh} />}
+      {m.flags.freeze && <FreezeBanner mig={id} f={m.flags.freeze} host={v.source ? `${v.source.host}:${v.source.port}` : ""} go={m.flags.verdict === "GO"} canUndo={can("operator") && !m.fixture} onDone={view.refresh} />}
+      {interrupted && (
+        <div className="callout crit" role="alert">
+          <div className="body">
+            <strong>The cutover was interrupted</strong>
+            <span>Its operation ended ({op.data?.state}{op.data?.error ? `: ${op.data.error}` : ""}) before the cutover finished, for example because the console restarted. Writes must stay stopped. Continue it from where it stopped{!endposSet ? ", or abort it to keep every database streaming" : ""}.</span>
+            {can("operator") && !m.fixture && <div className="row">
+              <button className="cutover" disabled={!!busy} onClick={() => run("continue", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/cutover`, {}), "Cutover continued").then((r) => { if (r?.operation_id) ops.open(r.operation_id, "Cutover"); view.refresh(); })}>Continue the cutover</button>
+            </div>}
+          </div>
+        </div>
+      )}
       {offline && <div className="callout info"><div className="body"><strong>Offline migration</strong><span>Writes stopped before the copy (confirmed, or the write freeze); Upwell copies each database once, then syncs sequences and verifies, and the verdict below decides. There is no separate cutover.{!m.flags.started && !c ? " Start it from the plan review." : ""}</span></div></div>}
       <div className="grid cols-2" style={offline ? { display: "none" } : undefined}>
         <Card title="Readiness" actions={ready.data ? <Pill kind={ready.data.ready ? "ok" : "warn"} text={ready.data.ready ? "Ready" : "Not ready"} /> : undefined}>
@@ -140,7 +166,7 @@ export function CutoverTab() {
       {start && method === "manual" && <StartCutoverDialog mig={id} name={m.name} admin={admin} onClose={() => setStart(false)} onStarted={(opId) => { ops.open(opId, "Cutover"); view.refresh(); }} />}
       {abort && (
         <ConfirmDialog title="Abort the cutover" danger confirmLabel="Abort the cutover" onClose={() => setAbort(false)}
-          onConfirm={async () => { await run("abort", () => api.post(`/api/v1/migrations/${id}/cutover/abort`), "Cutover aborted; databases keep streaming"); view.refresh(); }}>
+          onConfirm={async () => { await must("abort", () => api.post(`/api/v1/migrations/${id}/cutover/abort`), "Cutover aborted; databases keep streaming"); view.refresh(); }}>
           <p>The cutover stops before end positions are set. Every database keeps streaming. Applications may write to the source again.</p>
         </ConfirmDialog>
       )}
@@ -154,24 +180,29 @@ export function CutoverTab() {
   );
 }
 
-function FreezeBanner({ mig, f, canUndo, onDone }: { mig: string; f: FreezeState; canUndo: boolean; onDone: () => void }) {
-  const { run, busy } = useAction();
+function FreezeBanner({ mig, f, host, go, canUndo, onDone }: { mig: string; f: FreezeState; host: string; go: boolean; canUndo: boolean; onDone: () => void }) {
+  const { must, busy } = useAction();
   const [confirm, setConfirm] = useState(false);
   if (f.state === "undone") {
     return <p className="small muted" data-testid="freeze-undone">Write freeze undone {f.undone_at ? time(f.undone_at) : ""} by {f.undone_by} ({f.undo_reason}).</p>;
   }
   const names = f.databases.map((d) => d.name).join(", ");
+  const roles = Array.from(new Set(f.databases.flatMap((d) => (d.roles || []).filter((r) => r.applied !== false).map((r) => r.role))));
+  const stuck = f.databases.flatMap((d) => (d.not_terminated || []).map((s) => `${d.name}: ${s}`));
   return (
     <div className={`callout ${f.undo_error ? "crit" : "warn"}`} role="status" data-testid="freeze-banner">
       <div className="body">
-        <strong>Write freeze applied on {names}</strong>
-        <span>Applied by {f.by} {time(f.applied_at)}. New sessions on the source are read-only; {f.databases.reduce((n, d) => n + d.terminated, 0)} client session(s) were ended. It is undone automatically if the cutover does not end GO.</span>
+        <strong>Write freeze applied on {names}{host && <> on <span className="mono">{host}</span></>}</strong>
+        <span>Applied by {f.by} {time(f.applied_at)}. New sessions on this source cluster are read-only; {f.databases.reduce((n, d) => n + d.terminated, 0)} client session(s) were ended. Only this cluster is frozen: a load pointed at another host keeps writing there.{" "}
+          {go ? "The cutover ended GO, so the freeze is kept: applications cannot write to the old source by mistake. Undo it before migrating these databases again." : "It is undone automatically if the cutover does not end GO."}</span>
+        {roles.length > 0 && <span>Also frozen for {roles.length} role(s) whose own setting would override it: <span className="mono">{roles.join(", ")}</span>.</span>}
+        {stuck.length > 0 && <span><strong>{stuck.length} session(s) could not be ended</strong> and can still write until they disconnect: <span className="mono">{stuck.slice(0, 5).join("; ")}{stuck.length > 5 ? "; …" : ""}</span>. Any write they make ends the cutover NO-GO.</span>}
         {f.undo_error && <span>Undo failed and is retried: {f.undo_error}</span>}
         {canUndo && <div><button disabled={!!busy} onClick={() => setConfirm(true)}>Undo write freeze</button></div>}
       </div>
       {confirm && (
         <ConfirmDialog title="Undo the write freeze" confirmLabel="Undo write freeze" onClose={() => setConfirm(false)}
-          onConfirm={async () => { await run("unfreeze", () => api.post(`/api/v1/migrations/${mig}/cutover/unfreeze`), "Write freeze undone; the source accepts writes"); onDone(); }}>
+          onConfirm={async () => { await must("unfreeze", () => api.post(`/api/v1/migrations/${mig}/cutover/unfreeze`), "Write freeze undone; the source accepts writes"); onDone(); }}>
           <p>Restores each database's setting and ends the client sessions opened during the freeze, so applications reconnect read-write. During a cutover, any write from now on ends NO-GO.</p>
         </ConfirmDialog>
       )}
@@ -260,11 +291,13 @@ function useVerification(id: string) {
 function VerificationSummary() {
   const { id } = useMig();
   const ver = useVerification(id);
-  if (!ver.data) return <Skeleton />;
+  if (ver.error && !ver.data) return <Card title="Verification"><ErrorState error={ver.error} retry={ver.refresh} /></Card>;
+  if (!ver.data) return <Card title="Verification"><Skeleton /></Card>;
   const fails = ver.data.results.filter((r) => r.result === "blocker");
+  const warns = ver.data.results.filter((r) => r.result === "warning");
   return (
     <Card title="Verification" actions={<Link to="../verification">Details</Link>}>
-      {fails.length === 0 ? <p>{ver.data.results.length} checks passed across every database.</p> : (
+      {fails.length === 0 ? <p>{ver.data.results.length} checks across every database, none failed{warns.length ? `; ${warns.length} warning(s) to read (for example tables too large to count exactly)` : ""}.</p> : (
         <ul className="stack" style={{ margin: 0, paddingLeft: 18 }}>{fails.map((f) => <li key={f.database + f.check_id}><span className="mono">{f.database}</span>: <strong>{f.title}</strong> {f.detail?.message}</li>)}</ul>
       )}
     </Card>

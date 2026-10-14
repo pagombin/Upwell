@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { Link, NavLink, Outlet, useNavigate, useParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api } from "../lib/api";
-import { copyEtaMs, dbCopyFraction, lifecycleIndex, overallProgress, rateFrom, readyForCutover } from "../lib/derive";
+import { backlogKnown, copyEtaMs, dbCopyEtaMs, dbCopyFraction, lifecycleBad, lifecycleIndex, overallProgress, rateFrom, readyForCutover } from "../lib/derive";
 import { ago, bytes, count, duration, pct, rate, time } from "../lib/format";
 import { type Loaded, useApi, useNow, useStream } from "../lib/hooks";
 import { useSession } from "../lib/session";
@@ -26,6 +26,7 @@ function useWindow(minutes: number) {
 
 export function MigrationLayout() {
   const { id = "" } = useParams();
+  const location = useLocation();
   const view = useApi<MigrationView>(`/api/v1/migrations/${id}`, 10000);
   const from = useWindow(30);
   const metrics = useApi<Series[]>(`/api/v1/migrations/${id}/metrics?names=backlog_bytes,replay_rate,target_size_bytes,slot_retained_bytes,slot_headroom_bytes,heartbeat_latency_s&from=${from}`, 30000);
@@ -57,12 +58,23 @@ export function MigrationLayout() {
               <span>{connected ? "Live" : "Reconnecting…"}</span>
               <StaleBadge updatedAt={view.updatedAt} now={now} />
             </div>
+            {(v.source || v.target) && (
+              <div className="row small muted hosts" aria-label="Clusters">
+                <span>Source <Trunc className="mono">{v.source ? `${v.source.host}:${v.source.port}` : "—"}</Trunc></span>
+                <span aria-hidden="true">→</span>
+                <span>Target <Trunc className="mono">{v.target ? `${v.target.host}:${v.target.port}` : "—"}</Trunc></span>
+                {m.flags.freeze && m.flags.freeze.state !== "undone" && <span className="pill warn">Source writes frozen</span>}
+              </div>
+            )}
           </div>
           <MigrationActions v={v} refresh={view.refresh} />
         </div>
         <nav className="tabs" aria-label="Migration sections">
           {MIG_TABS.map((t) => <NavLink key={t.to} className="tab" end={t.to === ""} to={`/migrations/${m.short_id}${t.to ? "/" + t.to : ""}`}>{t.label}</NavLink>)}
         </nav>
+        {m.state === "needs_attention" && !location.pathname.endsWith(`/${m.short_id}`) && (
+          <div className="callout crit" role="alert" style={{ marginBottom: 16 }}><div className="body"><strong>Needs attention</strong><span>{v.databases.filter((d) => d.include && ["failed", "degraded", "restart_required"].includes(d.state)).map((d) => `${d.source_name}: ${d.last_error || d.state}`).join(" · ") || "Open the overview to see what happened."}</span></div></div>
+        )}
         <div className={stale ? "stale" : ""}><Outlet /></div>
       </div>
     </Ctx.Provider>
@@ -142,10 +154,10 @@ export function OverviewTab() {
     return { db: d.source_name, growth: r, hoursLeft: r && r > 0 && head ? head / r / 3600 : undefined };
   }).filter((f) => f.hoursLeft !== undefined).sort((a, b) => a.hoursLeft! - b.hoursLeft!);
   const inSync = v.state_counts["in_sync"] || 0;
-  const backlog = inc.reduce((a, d) => a + (d.backlog_bytes || 0), 0);
+  const backlog = inc.reduce((a, d) => a + (backlogKnown(d) || 0), 0);
   return (
     <div className="stack" style={{ gap: 24 }}>
-      <Card><Stepper index={lifecycleIndex(v)} bad={m.state === "needs_attention"} /></Card>
+      <Card><Stepper index={lifecycleIndex(v)} bad={lifecycleBad(v)} /></Card>
       {m.state === "needs_attention" && (
         <div className="callout crit" role="alert"><div className="body"><strong>Needs attention</strong><span>{inc.filter((d) => ["failed", "degraded", "restart_required"].includes(d.state)).map((d) => `${d.source_name}: ${d.last_error || d.state}`).join(" · ") || "Open a database below to see what happened."}</span></div></div>
       )}
@@ -167,7 +179,8 @@ export function OverviewTab() {
             { key: "size", label: "Size", num: true, sort: (d) => d.size_bytes, render: (d) => <span title={`${d.size_bytes.toLocaleString("en-US")} bytes`}>{bytes(d.size_bytes)}</span> },
             { key: "progress", label: "Copied", width: 130, sort: (d) => dbCopyFraction(d, v.live?.[d.source_name]), render: (d) => { const f = dbCopyFraction(d, v.live?.[d.source_name]); return <span className="row" style={{ gap: 6, flexWrap: "nowrap" }}><ProgressBar value={f} label={`${d.source_name} copied`} /><span className="small" style={{ width: 36, textAlign: "right" }}>{pct(f * 100)}</span></span>; } },
             { key: "rows", label: "Rows", num: true, optional: true, sort: (d) => d.rows_estimate, render: (d) => <span title={d.rows_estimate.toLocaleString("en-US")}>{count(d.rows_estimate)}</span> },
-            { key: "backlog", label: "Backlog", num: true, sort: (d) => d.backlog_bytes ?? -1, render: (d) => d.backlog_bytes === undefined || d.backlog_bytes === null ? "—" : <span title={`${d.backlog_bytes.toLocaleString("en-US")} bytes`}>{bytes(d.backlog_bytes)}</span> },
+            { key: "eta", label: "Copy ETA", num: true, sort: (d) => dbCopyEtaMs(d, v.live?.[d.source_name], metrics.data) ?? (d.state === "base_copy" ? Infinity : -1), render: (d) => { const e = dbCopyEtaMs(d, v.live?.[d.source_name], metrics.data); return e ? <span title={`around ${time(Date.now() + e, false)}`}>{duration(e)}</span> : d.state === "base_copy" ? <span className="muted">Measuring</span> : "—"; } },
+            { key: "backlog", label: "Backlog", num: true, sort: (d) => backlogKnown(d) ?? -1, render: (d) => { const b = backlogKnown(d); return b === undefined ? "—" : <span title={`${b.toLocaleString("en-US")} bytes`}>{bytes(b)}</span>; } },
             { key: "trend", label: "Trend", optional: true, render: (d) => <Sparkline points={last(metrics.data, "backlog_bytes", d.source_name).map((p) => p.v).slice(-60)} label={`${d.source_name} backlog trend`} /> },
             { key: "replay", label: "Replay", num: true, optional: true, sort: (d) => v.live?.[d.source_name]?.replay_rate ?? -1, render: (d) => rate(v.live?.[d.source_name]?.replay_rate) },
             { key: "slot", label: "Slot", optional: true, sort: (d) => v.live?.[d.source_name]?.slot_retained_bytes ?? -1, render: (d) => { const l = v.live?.[d.source_name] || {}; const ws = ["reserved", "extended", "unreserved", "lost"][l.slot_wal_status ?? -1]; return l.slot_retained_bytes === undefined ? <span className="faint">—</span> : <span className="small" title={`WAL status ${ws || "unknown"}; headroom ${bytes(l.slot_headroom_bytes)}`}>{bytes(l.slot_retained_bytes)} held{ws && ws !== "reserved" ? ` · ${ws}` : ""}</span>; } },

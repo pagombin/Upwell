@@ -214,7 +214,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	continuing := m.Flags.Cutover != nil && m.Flags.Cutover.EndedAt == 0
 	if continuing {
 		if prev, err := o.GetOperation(ctx, m.Flags.Cutover.OpID); err == nil && prev.State == "running" {
-			if key != "" && prev.Key == key {
+			if key != "" && prev.Key == opKey(m.ID, key) {
 				return prev, ErrDuplicate
 			}
 			return prev, uerr("cutover_running", "A cutover is already running.", "")
@@ -222,7 +222,7 @@ func (o *Orchestrator) StartCutover(ctx context.Context, a audit.Actor, role, id
 	} else {
 		if key != "" {
 			var existing string
-			if o.st.DB.QueryRowContext(ctx, `SELECT id FROM operations WHERE operation_key=?`, key).Scan(&existing) == nil {
+			if o.st.DB.QueryRowContext(ctx, `SELECT id FROM operations WHERE operation_key=?`, opKey(m.ID, key)).Scan(&existing) == nil {
 				op, _ := o.GetOperation(ctx, existing)
 				return op, ErrDuplicate
 			}
@@ -695,7 +695,7 @@ func (o *Orchestrator) stopUndrained(ctx context.Context, m Migration, dbs []Dat
 			continue
 		}
 		out[d.SourceName] = true
-		if st, _ := o.run.Status(ctx, d.Instance); st.Active {
+		if st, err := o.run.Status(ctx, d.Instance); err != nil || st.Active {
 			o.mustStop(ctx, m, d, "did not reach its end position during the cutover")
 		}
 	}

@@ -254,7 +254,7 @@ table.data tr.clickable { cursor: pointer; }
 
 /* ---------- logs */
 .logview { font-family: var(--font-mono); font-size: 12px; background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; position: relative; }
-.logrow { display: grid; grid-template-columns: 96px 48px 96px 150px minmax(0, 1fr); gap: var(--s2); padding: 0 var(--s3); height: 22px; align-items: center; white-space: nowrap; }
+.logrow { display: grid; grid-template-columns: 124px 48px 96px 150px minmax(0, 1fr); gap: var(--s2); padding: 0 var(--s3); height: 22px; align-items: center; white-space: nowrap; }
 .logrow > span { overflow: hidden; text-overflow: ellipsis; }
 .logrow.warn { background: color-mix(in srgb, var(--warn-bg) 70%, transparent); }
 .logrow.error, .logrow.fatal { background: color-mix(in srgb, var(--crit-bg) 80%, transparent); }
@@ -262,6 +262,8 @@ table.data tr.clickable { cursor: pointer; }
 .logrow .lv-error, .logrow .lv-fatal { color: var(--crit); }
 .logrow .lv-debug, .logrow .lv-trace { color: var(--faint); }
 .logrow.hl { box-shadow: inset 3px 0 0 var(--info); }
+.logrow.newday { border-top: 1px dashed var(--border-strong, var(--border)); }
+.logrow mark { background: color-mix(in srgb, var(--info) 35%, transparent); color: inherit; border-radius: 2px; }
 
 /* ---------- overlays */
 .overlay { position: fixed; inset: 0; background: rgba(5, 9, 13, 0.6); display: grid; place-items: center; z-index: 50; padding: var(--s5); }

@@ -178,7 +178,7 @@ func (o *Orchestrator) measureApply(ctx context.Context, op *Operation, spec eng
 		if pr.Phase == engine.PhaseCDC {
 			break
 		}
-		if st, _ := o.run.Status(ctx, spec.Instance); !st.Active {
+		if st, serr := o.run.Status(ctx, spec.Instance); serr == nil && !st.Active {
 			err = fmt.Errorf("the engine stopped before streaming (log: %s)", plan.LogFile)
 		} else if time.Now().After(deadline) {
 			err = fmt.Errorf("the engine was not streaming after %s", rateReadyAfter)

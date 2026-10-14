@@ -25,6 +25,7 @@ import (
 // Holder serves the current certificate and swaps it.
 type Holder struct {
 	mu       sync.RWMutex
+	opMu     sync.Mutex // A5: one install or rollback at a time
 	cert     *tls.Certificate
 	leaf     *x509.Certificate
 	baseCert string
@@ -39,6 +40,15 @@ func NewHolder(baseCert, baseKey, dataDir string) (*Holder, error) {
 	if c, err := tls.LoadX509KeyPair(h.path("current", "crt"), h.path("current", "key")); err == nil {
 		h.set(&c, "uploaded")
 		return h, nil
+	}
+	// A5: the key and certificate are two files; a crash between their
+	// writes leaves a current pair that does not match. The previous pair is
+	// what was served before that install.
+	if _, err := os.Stat(h.path("current", "crt")); err == nil {
+		if c, err := tls.LoadX509KeyPair(h.path("previous", "crt"), h.path("previous", "key")); err == nil {
+			h.set(&c, "uploaded")
+			return h, nil
+		}
 	}
 	c, err := tls.LoadX509KeyPair(baseCert, baseKey)
 	if err != nil {
@@ -223,6 +233,8 @@ func writeFileAtomic(path string, b []byte, mode os.FileMode) error {
 // Install validates and installs a pair, keeps the current one as the
 // previous pair, and starts serving the new one.
 func (h *Holder) Install(certPEM, keyPEM, chainPEM []byte, now time.Time) (Validation, error) {
+	h.opMu.Lock()
+	defer h.opMu.Unlock()
 	v, full, err := Validate(certPEM, keyPEM, chainPEM, now)
 	if err != nil {
 		return v, err
@@ -263,6 +275,8 @@ func (h *Holder) Install(certPEM, keyPEM, chainPEM []byte, now time.Time) (Valid
 // Rollback serves the previous pair again; the replaced pair becomes the
 // previous one, so a second rollback undoes the first.
 func (h *Holder) Rollback() (Info, error) {
+	h.opMu.Lock()
+	defer h.opMu.Unlock()
 	pc, err1 := os.ReadFile(h.path("previous", "crt"))
 	pk, err2 := os.ReadFile(h.path("previous", "key"))
 	if err1 != nil || err2 != nil {

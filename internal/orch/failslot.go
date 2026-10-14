@@ -57,7 +57,7 @@ func (o *Orchestrator) releaseFailedCopySlot(ctx context.Context, m Migration, d
 	}
 	still := false
 	for _, x := range dbs {
-		if x.ID == d.ID && x.State == DRestartRequired {
+		if x.ID == d.ID && x.State == DRestartRequired && !x.BaseCopyDone {
 			still = true
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -165,7 +166,16 @@ func (o *Orchestrator) RemoveWatched(ctx context.Context, a audit.Actor, migID, 
 
 // countWatched counts each watched table of a database on both sides; a
 // failed count is stored as such, never as zero. Called from the collector.
+// watchBusy holds the databases whose watched tables are being counted (O6:
+// a count slower than the collector's interval would otherwise pile up
+// full-table scans on both clusters).
+var watchBusy sync.Map
+
 func (o *Orchestrator) countWatched(ctx context.Context, m Migration, d Database, src, dst pg.Conn) {
+	if _, busy := watchBusy.LoadOrStore(d.ID, true); busy {
+		return
+	}
+	defer watchBusy.Delete(d.ID)
 	ws, err := o.ListWatched(ctx, m.ID, d.SourceName)
 	if err != nil || len(ws) == 0 {
 		return

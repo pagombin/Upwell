@@ -40,6 +40,9 @@ const (
 func (s *Server) register() {
 	pub := func(r *route) { r.public = true }
 	noIdem := func(r *route) { r.noIdem = true }
+	// A1: a response carrying a secret (a TOTP secret, recovery codes, an API
+	// token) is never stored for replay.
+	secretOnce := func(r *route) *route { r.secretOnce = true; return r }
 	pub(s.add("GET", "/healthz", "", "Liveness", s.healthz))
 	pub(s.add("GET", "/readyz", "", "Readiness", s.readyz))
 	pub(s.add("GET", "/api/v1/openapi.json", "", "OpenAPI document", s.openapi))
@@ -55,10 +58,10 @@ func (s *Server) register() {
 	noIdem(lo)
 	s.add("GET", "/api/v1/auth/me", viewer, "Current user and CSRF token", s.me).mfaExempt = true
 	pub(s.add("GET", "/api/v1/auth/session", "", "Session status without an error when signed out", s.sessionStatus))
-	s.add("POST", "/api/v1/auth/totp/enroll", viewer, "Start setting up the second factor (TOTP)", s.totpEnroll).mfaExempt = true
-	s.add("POST", "/api/v1/auth/totp/confirm", viewer, "Turn the second factor on with a code", s.totpConfirm).mfaExempt = true
+	secretOnce(s.add("POST", "/api/v1/auth/totp/enroll", viewer, "Start setting up the second factor (TOTP)", s.totpEnroll)).mfaExempt = true
+	secretOnce(s.add("POST", "/api/v1/auth/totp/confirm", viewer, "Turn the second factor on with a code", s.totpConfirm)).mfaExempt = true
 	s.add("POST", "/api/v1/auth/totp/disable", viewer, "Turn the second factor off", s.totpDisable)
-	s.add("POST", "/api/v1/auth/totp/recovery-codes", viewer, "Replace your recovery codes", s.totpRecoveryCodes)
+	secretOnce(s.add("POST", "/api/v1/auth/totp/recovery-codes", viewer, "Replace your recovery codes", s.totpRecoveryCodes))
 	s.add("POST", "/api/v1/users/{id}/totp/reset", admin, "Turn off another user's second factor (lost device)", s.totpReset)
 	s.add("POST", "/api/v1/auth/password", viewer, "Change own password", s.changePassword)
 
@@ -67,7 +70,7 @@ func (s *Server) register() {
 	s.add("PATCH", "/api/v1/users/{id}", admin, "Change a user's role or disable them", s.updateUser)
 	s.add("DELETE", "/api/v1/users/{id}", admin, "Delete a user", s.deleteUser)
 	s.add("GET", "/api/v1/api-tokens", admin, "API tokens", s.listTokens)
-	s.add("POST", "/api/v1/api-tokens", admin, "Create an API token (shown once)", s.createToken)
+	secretOnce(s.add("POST", "/api/v1/api-tokens", admin, "Create an API token (shown once)", s.createToken))
 	s.add("DELETE", "/api/v1/api-tokens/{id}", admin, "Revoke an API token", s.revokeToken)
 
 	s.add("GET", "/api/v1/settings", viewer, "Settings catalog with values", s.getSettings)
@@ -233,6 +236,10 @@ func (s *Server) setupCreate(w http.ResponseWriter, r *http.Request) error {
 		return badRequest(err.Error())
 	}
 	if in.TimeZone != "" {
+		// A9: an unknown zone would break every time shown in the UI.
+		if _, err := time.LoadLocation(in.TimeZone); err != nil || len(in.TimeZone) > 64 {
+			in.TimeZone = "UTC"
+		}
 		s.Store.DB.ExecContext(r.Context(), `INSERT OR REPLACE INTO settings(key,value,updated_by,updated_at) VALUES ('_time_zone',?,?,?)`, strconv.Quote(in.TimeZone), u.Username, store.Now())
 	}
 	os.Remove(s.Cfg.SetupToken)
@@ -271,7 +278,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 			return apiErr(401, "bad_otp", err.Error(), "Check your authenticator app's clock, or use a recovery code.")
 		}
 		if errors.Is(err, auth.ErrBadCredentials) || errors.Is(err, auth.ErrLocked) || errors.Is(err, auth.ErrDisabled) {
-			return apiErr(401, "bad_credentials", err.Error(), "")
+			// A8: one answer for all three, so the sign-in form does not tell
+			// which usernames exist (only an existing account is locked or
+			// disabled). The audit log keeps the actual reason.
+			return apiErr(401, "bad_credentials", "The username or password is not correct, or the account is locked or disabled.", "After 10 failed sign-ins an account is locked for 15 minutes; an Admin can unlock or enable it.")
 		}
 		return err
 	}
@@ -315,6 +325,9 @@ func (s *Server) totpConfirm(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &in); err != nil {
 		return err
 	}
+	if err := s.userAttempt(r); err != nil {
+		return err
+	}
 	codes, err := s.Auth.TOTPConfirm(r.Context(), session(r).User.ID, in.Code)
 	switch {
 	case errors.Is(err, auth.ErrBadOTP):
@@ -329,7 +342,19 @@ func (s *Server) totpConfirm(w http.ResponseWriter, r *http.Request) error {
 }
 
 // checkOwnOTP checks the caller's current code or a recovery code.
+// userAttempt spends one of the signed-in user's code or password checks
+// (A3: a stolen session could otherwise try every 6-digit code).
+func (s *Server) userAttempt(r *http.Request) error {
+	if s.userLimit != nil && !s.userLimit.Allow(session(r).User.ID) {
+		return apiErr(429, "too_many_attempts", "Too many attempts. Wait a minute and try again.", "")
+	}
+	return nil
+}
+
 func (s *Server) checkOwnOTP(r *http.Request, code string) error {
+	if err := s.userAttempt(r); err != nil {
+		return err
+	}
 	ok, rec, err := s.Auth.CheckSecondFactor(r.Context(), session(r).User.ID, code)
 	if errors.Is(err, auth.ErrTOTPNotSet) {
 		return apiErr(409, "totp_state", err.Error(), "")
@@ -757,6 +782,9 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) error {
 	if err := auth.ValidatePassword(in.New); err != nil {
 		return badRequest(err.Error())
 	}
+	if err := s.userAttempt(r); err != nil {
+		return err
+	}
 	ok, err := s.Auth.VerifyUserPassword(r.Context(), sess.User.ID, in.Current)
 	if err != nil {
 		return err
@@ -890,6 +918,19 @@ func (s *Server) patchSettings(w http.ResponseWriter, r *http.Request) error {
 	for _, k := range keys {
 		if _, err := settings.Validate(k, in[k]); err != nil {
 			return badRequest(err.Error())
+		}
+	}
+	// A6: settings that only make sense together, checked against the
+	// values they will have after this change, before any is applied.
+	if g, err := s.Settings.Global(r.Context()); err == nil {
+		after := func(k string) float64 {
+			if v, ok := in[k].(float64); ok {
+				return v
+			}
+			return float64(g.Int(k))
+		}
+		if after("alert_disk_warn_pct") >= after("alert_disk_crit_pct") {
+			return badRequest("alert_disk_warn_pct must be lower than alert_disk_crit_pct.")
 		}
 	}
 	for _, k := range keys {

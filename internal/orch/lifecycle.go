@@ -436,6 +436,9 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 			}
 		}
 	}
+	// O7: run directories are per database instance (and the roles copy's),
+	// not one per migration.
+	dbs, _ := o.ListDatabases(ctx, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM queue_entries WHERE migration_id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM migrations WHERE id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM logs WHERE migration_id=?`, m.ID)
@@ -444,7 +447,12 @@ func (o *Orchestrator) DeleteMigration(ctx context.Context, a audit.Actor, id st
 	o.st.DB.ExecContext(ctx, `DELETE FROM metric_rollups_1m WHERE series_id IN (SELECT id FROM metric_series WHERE migration_id=?)`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM metric_series WHERE migration_id=?`, m.ID)
 	o.st.DB.ExecContext(ctx, `DELETE FROM alerts WHERE migration_id=?`, m.ID)
-	os.RemoveAll(filepath.Join(o.cfg.RunsDir(), m.ShortID))
+	for _, d := range dbs {
+		if d.Instance != "" && !strings.ContainsAny(d.Instance, "/\\") {
+			os.RemoveAll(filepath.Join(o.cfg.RunsDir(), d.Instance))
+		}
+	}
+	os.RemoveAll(filepath.Join(o.cfg.RunsDir(), m.ShortID+"-roles"))
 	o.audit.Append(ctx, a, "migration.delete", m.ID, map[string]any{"name": m.Name}, nil)
 	return nil
 }
@@ -593,7 +601,13 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 	// A restart from zero: the reset keeps the target's own objects, so the
 	// earlier attempt's other objects (types, functions, the publication
 	// pgcopydb copies from the source) may still be there.
-	spec.DropIfExists = o.attemptNumber(ctx, d.ID) > 0
+	// O9: an unreadable attempt count must not pass for a first attempt.
+	var attempts int
+	if err := o.st.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(number),0) FROM attempts WHERE database_id=?`, d.ID).Scan(&attempts); err != nil {
+		o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "could not read earlier attempts (%v); the target's earlier objects are dropped if they exist", err)
+		attempts = 1
+	}
+	spec.DropIfExists = attempts > 0
 	v := o.Settings(ctx, m)
 	src, dst := spec.SourceConn, spec.TargetConn
 	// Roles once per migration, best effort.
@@ -778,7 +792,10 @@ func trimErr(err error) string {
 }
 
 func (o *Orchestrator) startAttempt(ctx context.Context, m Migration, d Database, spec engine.DatabaseSpec, plan engine.RunPlan, kind string) error {
-	if st, _ := o.run.Status(ctx, d.Instance); st.Active {
+	// O1: a unit whose state cannot be read may be running.
+	if st, err := o.run.Status(ctx, d.Instance); err != nil {
+		return fmt.Errorf("could not confirm that unit %s is stopped: %w", plan.Unit, err)
+	} else if st.Active {
 		return fmt.Errorf("unit %s is still running", plan.Unit)
 	}
 	if err := os.MkdirAll(plan.RunDir, 0o750); err != nil {
@@ -827,7 +844,7 @@ func (o *Orchestrator) resumeDB(ctx context.Context, m Migration, d Database, wh
 		done("failed: " + err.Error())
 		return err
 	}
-	if st, _ := o.run.Status(ctx, d.Instance); st.Active {
+	if st, serr := o.run.Status(ctx, d.Instance); serr != nil || st.Active {
 		if _, err := o.eng.Stop(ctx, plan, spec); err != nil {
 			done("failed: " + err.Error())
 			return err
@@ -1223,7 +1240,11 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 	for _, d := range included(dbs) {
 		if activeDB[d.State] || d.NextRetryAt != nil {
 			if _, err := o.stopUnit(ctx, m, d); err != nil {
-				o.Event(ctx, m.ID, d.SourceName, "stop", "critical", "Could not stop "+d.SourceName+": "+err.Error(), nil)
+				// O8: not Stopped: its engine may still be running. Clean up
+				// stops it again before dropping anything.
+				o.Event(ctx, m.ID, d.SourceName, "stop", "critical", "Could not stop "+d.SourceName+": "+err.Error()+". Its engine may still be running; Clean up stops it before removing anything.", nil)
+				o.setDB(ctx, d.ID, map[string]any{"state": DDegraded, "next_retry_at": nil, "last_error": "Aborted, but the engine could not be stopped: " + trimErr(err)})
+				continue
 			}
 			o.endAttempt(ctx, d, nil, "aborted by "+a.Username)
 			o.setDB(ctx, d.ID, map[string]any{"state": DStopped, "next_retry_at": nil})

@@ -52,6 +52,8 @@ type Server struct {
 	static fs.FS
 	// loginLimit bounds sign-in and setup attempts per client IP.
 	loginLimit *auth.RateLimiter
+	// userLimit limits code and password checks per signed-in user (A3).
+	userLimit *auth.RateLimiter
 }
 
 // Sign-in attempts allowed per client IP: a burst of 10, refilled over a minute.
@@ -73,6 +75,7 @@ type route struct {
 	h                           handlerFunc
 	public                      bool
 	noIdem                      bool
+	secretOnce                  bool
 	mfaExempt                   bool // allowed for an Admin who must still set up the second factor
 }
 
@@ -105,6 +108,7 @@ func New(s *Server) *Server {
 	s.static = webui.FS()
 	if s.loginLimit == nil {
 		s.loginLimit = auth.NewRateLimiter(loginBurst, loginPeriod)
+		s.userLimit = auth.NewRateLimiter(loginBurst, loginPeriod)
 	}
 	s.register()
 	return s
@@ -323,6 +327,10 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 				writeErr(w, apiErr(422, "idempotency_key_reused", "This Idempotency-Key was already used for a different request.", "Send a new key for a new request."))
 				return
 			}
+			if err == nil && rt.secretOnce {
+				writeErr(w, apiErr(409, "secret_not_replayed", "This request already ran, and the secret it returned is shown only once.", "Start again to get a new one."))
+				return
+			}
 			if err == nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Idempotent-Replay", "true")
@@ -335,6 +343,9 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 		err := rt.h(cw, r)
 		if err != nil {
 			writeErr(cw, err)
+			if cw.status >= 500 {
+				s.Log.Write(logx.Record{Level: "error", Component: "api", Msg: fmt.Sprintf("%s %s failed: %v", r.Method, r.URL.Path, err)})
+			}
 		}
 		// 5xx answers are not stored: a retry (or a waiting duplicate) runs
 		// the request again rather than replaying a failure.
@@ -343,7 +354,7 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			// The key's lock is held and no live row exists, so replacing
 			// only ever overwrites an expired row.
 			s.Store.DB.ExecContext(context.Background(), `INSERT OR REPLACE INTO idempotency(key,user_id,method,path,status,response,created_at,body_hash) VALUES (?,?,?,?,?,?,?,?)`,
-				scoped, session(r).User.ID, r.Method, r.URL.Path, cw.status, cw.buf.String(), store.Now(), bodyHash)
+				scoped, session(r).User.ID, r.Method, r.URL.Path, cw.status, storedResponse(rt, cw.buf.String()), store.Now(), bodyHash)
 		}
 		if !strings.Contains(rt.Path, "/stream/") {
 			lvl := "debug"
@@ -353,6 +364,15 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 			s.Log.Write(logx.Record{Level: lvl, Component: "api", Msg: fmt.Sprintf("%s %s %d %s", r.Method, r.URL.Path, cw.status, time.Since(start).Round(time.Millisecond))})
 		}
 	}
+}
+
+// storedResponse is what the idempotency table keeps of a response: nothing
+// of one that carries a secret (A1), only that the request ran.
+func storedResponse(rt route, body string) string {
+	if rt.secretOnce {
+		return ""
+	}
+	return body
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) error {
@@ -380,7 +400,9 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		ae = &APIError{Status: 404, Code: "not_found", Message: "That item does not exist."}
 	default:
-		ae = &APIError{Status: 500, Code: "internal", Message: err.Error()}
+		// A4: the text helps an operator (a connection refused, a timeout),
+		// but never carries a secret; the request log keeps the full error.
+		ae = &APIError{Status: 500, Code: "internal", Message: logx.Redact(err.Error())}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(ae.Status)
