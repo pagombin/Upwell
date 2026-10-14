@@ -19,6 +19,7 @@
 | Logs tab and migration pages (U1 to U13, per-database copy ETA, hosts in the header) | done (D86) | browser suite |
 | Full integration suite with pgcopydb 0.18+upwell.1 (PostgreSQL 14, 15, 16, 18) | pass | 72 passed, 1 skipped (opt-in), 3 failed and fixed (D85: PostgreSQL 14 collation query; two tests' wording and fault), then passed on a rerun |
 | Browser suite (`dev/e2e.sh --update`) | pass | 229 + 4 + 15 passed; screenshots and visual baseline refreshed |
+| `migration_db` base copy failed: "the engine's internal catalog was locked" | fixed in Upwell's build (D87) | `TestBaseCopyCatalogLockHeld`: catalog locked 15 s; upwell.1 failed the copy, upwell.2 reached In sync |
 | How the overall base copy figure is computed with databases of very different sizes | answered | weighted by source size (`overallProgress`); per-database ETA added |
 
 ## Slot held after a failed base copy; crash detection (2026-10-13), branch `claude/new-session-agkd2d`

@@ -3,13 +3,17 @@
 package integration
 
 import (
+	"database/sql"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/pagombin/upwell/internal/orch"
+
+	_ "modernc.org/sqlite"
 )
 
 // The droplet (2026-10-11 and 2026-10-12): the base copy failed twice when
@@ -132,4 +136,49 @@ func TestBaseCopyTargetBackendCrashed(t *testing.T) {
 	if !strings.Contains(d.LastError, "crashed") {
 		t.Fatalf("the reason does not say a server process crashed: %s", d.LastError)
 	}
+}
+
+// D87, the droplet (2026-10-14): the base copy of migration_db failed with
+// "the engine's internal catalog was locked": an index worker could not
+// record the index it had built ("update summary set done_time_epoch ...")
+// because pgcopydb retried its SQLite catalog for only 5 s. Here a writer
+// holds that catalog for 15 s in the middle of the copy; with Upwell's build
+// (0.18+upwell.2) the workers wait and the copy reaches In sync.
+func TestBaseCopyCatalogLockHeld(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_catlock")
+	seedDB(t, db, 1500000)
+	id := e.defineMigration("Catalog lock", []string{db}, nil)
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	d := e.waitDBState(id, db, time.Minute, orch.DBaseCopy)
+	catalog := filepath.Join(e.Cfg.RunsDir(), d.Instance, "clone", "schema", "source.db")
+	e.waitFor(2*time.Minute, "the engine's catalog and a COPY on the target", func() bool {
+		if _, err := os.Stat(catalog); err != nil {
+			matches, _ := filepath.Glob(filepath.Join(e.Cfg.RunsDir(), d.Instance, "*", "schema", "source.db"))
+			if len(matches) == 0 {
+				return false
+			}
+			catalog = matches[0]
+		}
+		return q(t, dstConn, db, `SELECT count(*) FROM pg_stat_progress_copy`) != "0"
+	})
+	lock, err := sql.Open("sqlite", "file:"+catalog+"?_pragma=busy_timeout(60000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	lock.SetMaxOpenConns(1)
+	if _, err := lock.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("locking the engine's catalog %s: %v", catalog, err)
+	}
+	t.Logf("holding the write lock on %s for 15 s", catalog)
+	time.Sleep(15 * time.Second)
+	if _, err := lock.Exec("COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	if d := e.waitDBState(id, db, 5*time.Minute, orch.DInSync, orch.DRestartRequired, orch.DFailed); d.State != orch.DInSync || d.AutoRestarts > 0 {
+		t.Fatalf("with the catalog locked for 15 s the copy ended %s (automatic restarts %d): %s", d.State, d.AutoRestarts, d.LastError)
+	}
+	e.abortAndClean(id, "Catalog lock")
 }
