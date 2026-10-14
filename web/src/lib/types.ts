@@ -35,7 +35,10 @@ export interface MigrationView {
   migration: Migration; databases: Database[]; included: number; state_counts: Record<string, number>; total_bytes: number;
   permission?: Permission | null; source?: Connection; target?: Connection; settings_effective?: Record<string, unknown>;
   preflight?: PreflightRun | null; live?: Record<string, Record<string, number>>; cluster?: Record<string, number>; now?: number;
+  snapshot_waits?: Record<string, SnapshotWait>;
 }
+export interface SnapshotBlocker { pid: number; database: string; user: string; application: string; client: string; state: string; open_seconds: number }
+export interface SnapshotWait { since: number; at: number; blockers: SnapshotBlocker[] }
 export interface CheckResult {
   id: string; check_id: string; version: number; scope: string; database?: string; level: "ok" | "info" | "warning" | "blocker"; hard: boolean;
   title: string; message: string; evidence: Record<string, unknown>; evidence_hash: string; remediation: string; duration_ms: number;

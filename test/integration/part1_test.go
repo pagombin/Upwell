@@ -555,7 +555,7 @@ func TestP1CrossVersionHashing(t *testing.T) {
 				decode(md5(g::text), 'hex'), ARRAY[g / 3.0, 1e-300, 'NaN', '-Infinity']::float8[], g, 'ab', g % 2 = 0
 			FROM generate_series(1, 3000) g;`,
 		streaming: func(t *testing.T, e *Env, id, db string) func() {
-			exec1(t, srcConn, db, `UPDATE x SET f4 = f4 * 1.1, f8 = 'Infinity', iv = iv * 1.5, m = m + 0.01 WHERE id % 10 = 0;
+			exec1(t, srcConn, db, `UPDATE x SET f4 = f4 * 1.1, f8 = 'Infinity', iv = iv * 1.5, m = m + 0.01::money WHERE id % 10 = 0;
 				INSERT INTO x(id, f4, f8, n, j, tv) VALUES (100001, 'NaN', '-0', 'NaN', '{"deep": {"x": [null, true, 1e400]}}', '');
 				DELETE FROM x WHERE id % 97 = 0`)
 			return nil
@@ -660,4 +660,79 @@ func TestP1HeartbeatNeverThenLate(t *testing.T) {
 			e.cleanup(id, name)
 		})
 	}
+}
+
+// TestSnapshotWaitShown (Part 2, D94): a transaction left open on the source
+// (in another database) holds the slot creation, so the base copy cannot
+// start. Upwell names the session on the migration view and in an event, and
+// the copy starts by itself once it ends.
+func TestSnapshotWaitShown(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_snapwait")
+	seedDB(t, db, 1000)
+	other := uniq("it_snapwait_other")
+	dropDB(t, other)
+	exec1(t, srcConn, "defaultdb", "CREATE DATABASE "+other)
+	t.Cleanup(func() { dropDB(t, other) })
+	exec1(t, srcConn, other, "CREATE TABLE t(i int)")
+	ctx := context.Background()
+	w, err := pgx.Connect(ctx, fmt.Sprintf("postgres://doadmin:%s@127.0.0.1:%d/%s?sslmode=disable&application_name=batch-report", password, srcPort, other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close(ctx)
+	if _, err := w.Exec(ctx, "BEGIN; INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	w.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid)
+	id := e.defineMigration("Snapshot wait", []string{db}, nil)
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	var view struct {
+		Waits map[string]struct {
+			Since    int64 `json:"since"`
+			Blockers []struct {
+				PID int    `json:"pid"`
+				App string `json:"application"`
+			} `json:"blockers"`
+		} `json:"snapshot_waits"`
+	}
+	e.waitFor(2*time.Minute, "the snapshot wait on the migration view", func() bool {
+		view.Waits = nil
+		e.do("GET", "/api/v1/migrations/"+id, nil, &view, 200)
+		sw, ok := view.Waits[db]
+		return ok && len(sw.Blockers) > 0 && sw.Blockers[0].PID == pid && sw.Blockers[0].App == "batch-report"
+	})
+	if !hasEvent(t, e, id, "snapshot_wait", fmt.Sprintf("PID %d (batch-report)", pid)) {
+		t.Fatal("no event naming the session the slot creation waits for")
+	}
+	if _, err := w.Exec(ctx, "COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
+	view.Waits = nil // decoding into a map merges
+	e.do("GET", "/api/v1/migrations/"+id, nil, &view, 200)
+	if _, ok := view.Waits[db]; ok {
+		t.Fatal("the wait is still shown after the copy started")
+	}
+	if !hasEvent(t, e, id, "snapshot_wait", "the base copy can start") {
+		t.Fatal("no event saying the wait ended")
+	}
+	e.abortAndClean(id, "Snapshot wait")
+}
+
+func hasEvent(t *testing.T, e *Env, id, typ, contains string) bool {
+	t.Helper()
+	var ev []struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	e.do("GET", "/api/v1/migrations/"+id+"/events?limit=500", nil, &ev, 200)
+	for _, x := range ev {
+		if x.Type == typ && strings.Contains(x.Message, contains) {
+			return true
+		}
+	}
+	return false
 }

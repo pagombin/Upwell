@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 import { dbCopyEtaMs, readyForCutover } from "../lib/derive";
 import { bytes, duration, rate, time } from "../lib/format";
-import type { Database, MigrationView, Series } from "../lib/types";
+import type { Database, MigrationView, Series, SnapshotBlocker } from "../lib/types";
 import { CrosshairProvider, seriesFor, TimeChart } from "./charts";
 import { Card, label } from "./ui";
 
@@ -82,6 +82,11 @@ export function safetySignals(v: MigrationView, now: number): Signal[] {
   return out;
 }
 
+// blockerText names one session a slot creation waits for.
+export function blockerText(b: SnapshotBlocker): string {
+  return `PID ${b.pid}${b.application ? ` (${b.application})` : ""}, ${b.user} in ${b.database}, transaction open ${duration(b.open_seconds * 1000)}${b.state ? `, ${b.state}` : ""}${b.client ? `, from ${b.client}` : ""}`;
+}
+
 export interface Summary { state: string; tone: Tone; actions: { db: string; text: string; to: string }[]; next: string }
 
 export function statusSummary(v: MigrationView, metrics: Series[] | undefined, now: number): Summary {
@@ -98,6 +103,14 @@ export function statusSummary(v: MigrationView, metrics: Series[] | undefined, n
     to: base + encodeURIComponent(d.source_name),
     text: d.state === "restart_required" ? "needs a restart from zero" : d.state === "stopped" ? "is stopped: resume it" : `${label(d.state).toLowerCase()}: open it to see why and resume`,
   }));
+  // A base copy that cannot start: the slot creation waits for open transactions.
+  for (const d of inc) {
+    const w = v.snapshot_waits?.[d.source_name];
+    if (!w || attention.includes(d)) continue;
+    const b = w.blockers[0];
+    actions.push({ db: d.source_name, to: base + encodeURIComponent(d.source_name),
+      text: `cannot start its base copy: the slot creation has waited ${duration(now - w.since)} for ${w.blockers.length} open transaction${w.blockers.length === 1 ? "" : "s"}${b ? ` (oldest: ${blockerText(b)})` : ""}. Ask the customer to end ${w.blockers.length === 1 ? "it" : "them"}.` });
+  }
   let state = "", tone: Tone = "ok", next = "";
   const c = m.flags.cutover;
   if (!m.flags.started) {
@@ -123,7 +136,7 @@ export function statusSummary(v: MigrationView, metrics: Series[] | undefined, n
     if (catching) parts.push(`${catching} catching up`);
     if (attention.length) parts.push(`${attention.length} need${attention.length === 1 ? "s" : ""} attention`);
     state = `${n} database${n === 1 ? "" : "s"}: ${parts.join(", ") || label(m.state)}`;
-    tone = attention.length ? "crit" : "ok";
+    tone = attention.length ? "crit" : actions.length ? "warn" : "ok";
     if (readyForCutover(v)) {
       next = "Every database is in sync: the cutover can start when the customer is ready (Cutover tab).";
     } else if (copying.length) {
