@@ -46,6 +46,23 @@ func (c Conn) URI() string {
 	return u.String()
 }
 
+// EngineURI is URI with tcp_user_timeout for the engine's long-lived
+// connections (D90): on the droplet a stalled connection to the target
+// went unnoticed for 33 minutes, because TCP keepalives only probe an idle
+// connection, not one waiting for its sent data to be acknowledged. With
+// it, the kernel ends such a connection after 2 minutes. A slow query is
+// unaffected (nothing is waiting for an acknowledgement).
+func (c Conn) EngineURI() string {
+	u, err := url.Parse(c.URI())
+	if err != nil {
+		return c.URI()
+	}
+	q := u.Query()
+	q.Set("tcp_user_timeout", "120000")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // connString includes the password, for pgx only.
 func (c Conn) connString() string {
 	u := url.URL{Scheme: "postgres", User: url.UserPassword(c.User, c.Password), Host: fmt.Sprintf("%s:%d", c.Host, c.Port), Path: "/" + c.DBName}

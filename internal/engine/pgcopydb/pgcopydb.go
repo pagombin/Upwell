@@ -102,8 +102,8 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 		return engine.RunPlan{}, fmt.Errorf("an offline copy cannot be resumed; restart it from zero")
 	}
 	args := []string{"clone", "--follow",
-		"--source", d.SourceConn.WithDB(d.Source).URI(),
-		"--target", d.TargetConn.WithDB(d.Target).URI(),
+		"--source", d.SourceConn.WithDB(d.Source).EngineURI(),
+		"--target", d.TargetConn.WithDB(d.Target).EngineURI(),
 		"--dir", work,
 		"--slot-name", d.SlotName,
 		"--origin", d.OriginName,

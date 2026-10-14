@@ -108,3 +108,65 @@ func TestResumeEndsStaleApplySession(t *testing.T) {
 	})
 	e.abortAndClean(id, "Stale apply session")
 }
+
+// D90, the droplet (2026-10-14): migration_poc applied nothing for 33
+// minutes (its connection to the target had died on the way) before the
+// engine noticed. Upwell now restarts a streaming database's engine after
+// apply_stall_restart_seconds without progress. Here a lock on the target
+// holds the apply.
+func TestApplyStallRestartsEngine(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	e.do("PATCH", "/api/v1/settings", map[string]any{"apply_stall_seconds": 10, "apply_stall_restart_seconds": 40}, nil, 200)
+	db := uniq("it_stallrestart")
+	id := streamingMigration(t, e, "Apply stall restart", db)
+	ctx := context.Background()
+	blocker, err := pg.Connect(ctx, dstConn.WithDB(db), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close(ctx)
+	if _, err := blocker.Exec(ctx, "BEGIN; LOCK TABLE orders IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // the source keeps changing, as the watchdog requires
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(2 * time.Second):
+			}
+			if c, err := pg.Connect(ctx, srcConn.WithDB(db), 10*time.Second); err == nil {
+				c.Exec(ctx, `INSERT INTO orders(customer, amount, note) VALUES (8, 8, 'during stall')`)
+				c.Close(ctx)
+			}
+		}
+	}()
+	var evs []struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	e.waitFor(4*time.Minute, "the engine to be restarted for the stalled apply", func() bool {
+		e.do("GET", "/api/v1/migrations/"+id+"/events?limit=200", nil, &evs, 200)
+		for _, ev := range evs {
+			if ev.Type == "apply_stalled_restart" {
+				t.Logf("event: %s", ev.Message)
+				return true
+			}
+		}
+		return false
+	})
+	if _, err := blocker.Exec(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	stop <- struct{}{}
+	if d := e.waitDBState(id, db, 3*time.Minute, orch.DInSync, orch.DFailed, orch.DRestartRequired); d.State != orch.DInSync {
+		t.Fatalf("after the stall the database ended %s: %s", d.State, d.LastError)
+	}
+	src := q(t, srcConn, db, `SELECT count(*) FROM orders WHERE note = 'during stall'`)
+	e.waitFor(3*time.Minute, "every row written during the stall to reach the target", func() bool {
+		return q(t, dstConn, db, `SELECT count(*) FROM orders WHERE note = 'during stall'`) == src
+	})
+	e.abortAndClean(id, "Apply stall restart")
+}
