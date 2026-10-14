@@ -820,16 +820,33 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 			probeT := sortProbe(p, tc)
 			tc.Close(ctx)
 			ev := map[string]any{"source": srcCollate, "target": dstCollate, "source_version": srcCollVer, "target_version": dstCollVer, "sort_match": probeS == probeT}
-			if NormalizeLocale(srcCollate) != NormalizeLocale(dstCollate) || probeS != probeT || (srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer) {
-				p.emit(check.Blocker, false, fmt.Sprintf("Collations differ (source %s, target %s), so text indexes may sort differently.", srcCollate, dstCollate), "Recreate the target database with the source's locale, or accept the risk and reindex text indexes after cutover.", ev)
-			} else {
+			// Say which part differs (D82): the droplet's blocker named two
+			// spellings of one locale and never said the cause.
+			switch {
+			case NormalizeLocale(srcCollate) != NormalizeLocale(dstCollate):
+				p.emit(check.Blocker, false, fmt.Sprintf("Collations differ (source %s, target %s), so text sorts differently on the target.", srcCollate, dstCollate), "Recreate the target database with the source's locale, or accept the risk and review ORDER BY results on text after cutover.", ev)
+			case probeS != probeT:
+				p.emit(check.Blocker, false, fmt.Sprintf("Both databases use %s, but a sample of strings sorts differently (source %s, target %s).", srcCollate, probeS, probeT), "The clusters' collation libraries differ; accept the risk and review ORDER BY results on text after cutover, or use a target with the same library.", ev)
+			case srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer:
+				p.emit(check.Warning, false, collationVersionMessage(srcCollate, srcCollVer, dstCollVer), collationVersionAdvice, ev)
+			default:
 				p.ok("Same collation ("+srcCollate+") and sort order.", ev)
 			}
 		}
 	} else if p.err != nil {
 		p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
 	} else {
-		p.ok("The target database will be created with collation "+srcCollate+".", map[string]any{"source": srcCollate})
+		// The new database takes template1's collation version (D82).
+		p.row(sc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&srcCollVer)
+		p.row(r.dst, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname='template1'),'')`).Scan(&dstCollVer)
+		ev := map[string]any{"source": srcCollate, "source_version": srcCollVer, "target_version": dstCollVer}
+		if p.err == nil && srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer {
+			p.emit(check.Warning, false, fmt.Sprintf("The target database will be created with collation %s, but the collation library versions differ (source %s, target %s): a few strings may sort differently on the target; the sort order is compared again once it exists.", srcCollate, srcCollVer, dstCollVer), collationVersionAdvice, ev)
+		} else if p.err != nil {
+			p.emit(check.Blocker, false, "", "", ev)
+		} else {
+			p.ok("The target database will be created with collation "+srcCollate+".", ev)
+		}
 	}
 
 	var tc *pgx.Conn
@@ -975,6 +992,14 @@ func limitList(s []string, n int) []string {
 		return s[:n]
 	}
 	return s
+}
+
+// collationVersionAdvice: indexes are built on the target by the engine, so
+// they match the target's library; only result order can differ.
+const collationVersionAdvice = "No action is needed for the copy: the engine builds every index on the target, so indexes match the target's library. If exact text order matters to the applications, compare ORDER BY results on text columns after cutover."
+
+func collationVersionMessage(locale, src, dst string) string {
+	return fmt.Sprintf("Both use %s and a sample of strings sorts the same, but the collation library versions differ (source %s, target %s): a few strings may sort differently on the target.", locale, src, dst)
 }
 
 func sortProbe(p *probe, c *pgx.Conn) string {

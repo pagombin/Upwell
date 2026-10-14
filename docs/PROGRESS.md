@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | A failed base copy kept its slot (74.4 GiB of source WAL on the droplet) until Restart from zero | done (D81) | the three `TestBaseCopyTarget*` tests: slot still there after 2 minutes before, dropped after |
 | A crashed or killed server process was reported as "did not restart" | done (D81) | `TestBaseCopyTargetBackendCrashed` failed before, passes |
+| Preflight blocked on "Collations differ (en_US.UTF-8, en_US.utf-8)": the cause was the collation library version, not named, and unchecked when Upwell creates the database | done (D82) | `TestCollationVersionDifferenceWarns` |
 | Why the target closed the connection on the droplet (now 3 h 34 min in, `public.order_line5`) | needs the target's logs | see the diagnosis prompt given to the operator |
 
 ## Base copy progress empty while the copy ran (2026-10-13), branch `claude/new-session-agkd2d`
