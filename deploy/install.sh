@@ -109,9 +109,13 @@ backup_store() {
 if [[ $MODE == uninstall ]]; then
   n=$(engines_active)
   if [[ $n -gt 0 && $FORCE -eq 0 ]]; then fail "$n engine unit(s) are running. Finish or abort the migrations first, or pass --force."; fi
-  systemctl disable --now upwell.service upwell-health.timer >/dev/null 2>&1 || true
+  systemctl disable --now upwell.service upwell-health.timer upwell-firewall.path >/dev/null 2>&1 || true
   systemctl stop 'upwell-eng@*' >/dev/null 2>&1 || true
-  rm -f "$UNIT_DIR/upwell.service" "$UNIT_DIR/upwell-eng@.service" "$UNIT_DIR/upwell-health.service" "$UNIT_DIR/upwell-health.timer" "$POLKIT" "$LOGROTATE" "$BIN" "$BIN.prev"
+  # The cluster rules Upwell added (D88); the conntrack setting reverts at the next boot.
+  ufw show added 2>/dev/null | sed -nE "s/^ufw allow proto tcp from ([0-9a-fA-F.:]+) port ([0-9]+) comment 'upwell cluster'\$/\1 \2/p" | while read -r ip port; do
+    ufw delete allow proto tcp from "$ip" port "$port" >/dev/null 2>&1 || true
+  done
+  rm -f "$UNIT_DIR/upwell.service" "$UNIT_DIR/upwell-eng@.service" "$UNIT_DIR/upwell-health.service" "$UNIT_DIR/upwell-health.timer" "$UNIT_DIR/upwell-firewall.service" "$UNIT_DIR/upwell-firewall.path" /usr/local/lib/upwell/upwell-firewall /etc/sysctl.d/60-upwell-conntrack.conf /etc/modules-load.d/upwell.conf "$POLKIT" "$LOGROTATE" "$BIN" "$BIN.prev"
   systemctl daemon-reload
   say "uninstall" "removed the service, units, polkit rule and binary"
   if [[ $PURGE -eq 1 ]]; then
@@ -347,6 +351,14 @@ place "$SELF_DIR/systemd/upwell.service" "$UNIT_DIR/upwell.service" 0644 "unit u
 place "$SELF_DIR/systemd/upwell-eng@.service" "$UNIT_DIR/upwell-eng@.service" 0644 "unit upwell-eng@.service"
 place "$SELF_DIR/systemd/upwell-health.service" "$UNIT_DIR/upwell-health.service" 0644 "unit upwell-health.service"
 place "$SELF_DIR/systemd/upwell-health.timer" "$UNIT_DIR/upwell-health.timer" 0644 "unit upwell-health.timer"
+# Cluster firewall rules and the conntrack setting (D88): Upwell lists the
+# clusters' addresses in $DATA/firewall/clusters; this root unit applies them.
+place "$SELF_DIR/systemd/upwell-firewall.service" "$UNIT_DIR/upwell-firewall.service" 0644 "unit upwell-firewall.service"
+place "$SELF_DIR/systemd/upwell-firewall.path" "$UNIT_DIR/upwell-firewall.path" 0644 "unit upwell-firewall.path"
+mkdir -p /usr/local/lib/upwell
+place "$SELF_DIR/firewall/upwell-firewall" /usr/local/lib/upwell/upwell-firewall 0755 "firewall helper"
+place "$SELF_DIR/firewall/60-upwell-conntrack.conf" /etc/sysctl.d/60-upwell-conntrack.conf 0644 "conntrack setting"
+place "$SELF_DIR/firewall/upwell-modules.conf" /etc/modules-load.d/upwell.conf 0644 "conntrack module at boot"
 mkdir -p "$(dirname "$POLKIT")"
 place "$SELF_DIR/polkit/50-upwell.rules" "$POLKIT" 0644 "polkit rule"
 place "$SELF_DIR/logrotate/upwell" "$LOGROTATE" 0644 "log rotation"
@@ -411,6 +423,24 @@ else
   for r in "${need[@]}"; do ufw allow "$r" >>"$LOGFILE" 2>&1 || fail "ufw allow $r failed"; done
   if [[ $active -eq 0 ]]; then ufw --force enable >>"$LOGFILE" 2>&1 || fail "ufw enable failed"; fi
   say "firewall" "allowed ${need[*]:-existing rules} (ssh ${ssh_ports:-none}); ufw active"; CHANGED=1
+fi
+
+# ---------- conntrack and cluster rules (D88)
+
+liberal=$(cat /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal 2>/dev/null || echo "")
+if [[ $liberal == 1 ]]; then say "conntrack" "unchanged (nf_conntrack_tcp_be_liberal = 1)"
+elif check; then would "conntrack" "set nf_conntrack_tcp_be_liberal = 1 (was ${liberal:-not loaded})"
+else
+  modprobe nf_conntrack >>"$LOGFILE" 2>&1 || true
+  sysctl -q -p /etc/sysctl.d/60-upwell-conntrack.conf >>"$LOGFILE" 2>&1 || fail "setting net.netfilter.nf_conntrack_tcp_be_liberal failed"
+  say "conntrack" "nf_conntrack_tcp_be_liberal = 1 (was ${liberal:-not loaded})"; CHANGED=1
+fi
+if ! check; then
+  install -d -m 0750 -o upwell -g upwell "$DATA/firewall"
+  touch "$DATA/firewall/clusters" && chown upwell:upwell "$DATA/firewall/clusters"
+  systemctl enable --now upwell-firewall.path >>"$LOGFILE" 2>&1 || fail "enabling upwell-firewall.path failed"
+  systemctl start upwell-firewall.service >>"$LOGFILE" 2>&1 || fail "upwell-firewall.service failed: journalctl -u upwell-firewall -n 20"
+  say "cluster firewall" "$(grep -c '^allowed' "$DATA/firewall/status" 2>/dev/null || echo 0) cluster address(es) allowed"
 fi
 
 # ---------- service

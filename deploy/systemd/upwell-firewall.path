@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply Upwell's cluster firewall rules when Upwell changes the list
+
+[Path]
+PathChanged=/var/lib/upwell/firewall/clusters
+Unit=upwell-firewall.service
+
+[Install]
+WantedBy=multi-user.target

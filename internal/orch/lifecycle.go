@@ -662,6 +662,10 @@ func (o *Orchestrator) launch(ctx context.Context, m Migration, d Database) erro
 			map[string]any{"extension": x.Name, "schema": x.Schema})
 	}
 	spec.ExcludeSchemas = exts.ExcludeSchemas
+	// D88: the clusters' addresses may have changed since preflight.
+	if _, _, err := o.SyncFirewall(ctx); err != nil {
+		o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "cluster firewall list: %v", err)
+	}
 	// Streaming only: an offline copy applies no changes (pgcopydb sets
 	// session_replication_role only in its apply), needs no heartbeat and
 	// decodes nothing (D65).
@@ -797,6 +801,19 @@ func (o *Orchestrator) startAttempt(ctx context.Context, m Migration, d Database
 		return fmt.Errorf("could not confirm that unit %s is stopped: %w", plan.Unit, err)
 	} else if st.Active {
 		return fmt.Errorf("unit %s is still running", plan.Unit)
+	}
+	// D89: a previous attempt's session still open on the target (its
+	// connection stalled) keeps the replication origin; the new apply would
+	// fail on it at every resume.
+	if tc, err := pg.Connect(ctx, spec.TargetConn.WithDB(d.TargetName), 30*time.Second); err == nil {
+		ended, err := pgpack.EndStaleEngineSessions(ctx, tc)
+		tc.Close(ctx)
+		if err != nil {
+			o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "looking for the previous engine's sessions on the target: %v", err)
+		}
+		if len(ended) > 0 {
+			o.Event(ctx, m.ID, d.SourceName, "stale_sessions", "warning", fmt.Sprintf("%s: ended %d session(s) a previous engine left open on the target, which would keep its replication origin busy: %s", d.SourceName, len(ended), strings.Join(ended, "; ")), map[string]any{"sessions": ended})
+		}
 	}
 	if err := os.MkdirAll(plan.RunDir, 0o750); err != nil {
 		return err

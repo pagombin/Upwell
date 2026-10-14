@@ -1,0 +1,7 @@
+[Unit]
+Description=Upwell cluster firewall rules and conntrack setting (D88)
+After=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/upwell/upwell-firewall

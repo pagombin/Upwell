@@ -80,6 +80,17 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 		}
 	}
 	o.runLockJanitor(tctx)
+	// D88: follow cluster address changes (a failover can move a cluster)
+	// and drop the rules of cleaned-up migrations.
+	if o.metrics.due("_host|firewall", 5*time.Minute) {
+		go func() {
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if _, _, err := o.SyncFirewall(fctx); err != nil {
+				o.logf("warn", "orchestrator", "", "", "", "cluster firewall list: %v", err)
+			}
+		}()
+	}
 	t0 := time.Now()
 	o.metrics.hostSample(tctx)
 	if d := time.Since(t0); d > slowestFor {

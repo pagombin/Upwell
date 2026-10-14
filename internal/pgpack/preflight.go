@@ -47,6 +47,20 @@ type Env struct {
 	WorkDir         string
 	Permission      Permission
 	Resuming        bool
+	// Network is the droplet's firewall state for the clusters (D88); nil
+	// when not read (preflight outside Upwell).
+	Network *NetworkPath
+}
+
+// NetworkPath is what the firewall unit applied for this droplet (D88).
+type NetworkPath struct {
+	Liberal    string   // nf_conntrack_tcp_be_liberal, "" when conntrack is not loaded
+	UfwEnabled bool     // ufw is enabled
+	Managed    bool     // the firewall unit is installed
+	Wanted     []string // "ip port" of every cluster
+	Missing    []string // wanted but not (yet) allowed
+	StatusAt   int64
+	Error      string
 }
 
 func cd(id, scope, title, failsAs string) check.Definition {
@@ -59,6 +73,7 @@ var Catalog = []check.Definition{
 	cd("tools", check.ScopeHost, "Engine and client tools installed", "hard"),
 	cd("engine_version", check.ScopeHost, "Engine version supports this migration", "hard"),
 	cd("engine_commit_order", check.ScopeHost, "Engine applies overlapping transactions", "hard"),
+	cd("network_path", check.ScopeHost, "Droplet firewall keeps long connections to the clusters", "acceptable"),
 	cd("client_version", check.ScopeHost, "PostgreSQL client version", "hard"),
 	cd("host_resources", check.ScopeHost, "Droplet size", "warning"),
 	cd("clock_sync", check.ScopeHost, "System clock synchronized", "warning"),
@@ -298,6 +313,7 @@ func (r *Runner) hostChecks(ctx context.Context) {
 			ok(r, "engine_commit_order", "", "", "pgcopydb "+e.EngineVersion+" applies transactions in commit order.", ev, t)
 		}
 	}
+	r.networkCheck()
 	t = time.Now()
 	ncpu := runtime.NumCPU()
 	var si syscall.Sysinfo_t
@@ -1362,4 +1378,31 @@ func collVersionSQL(ver int, db string) string {
 		where = "datname=" + pg.QuoteLiteral(db)
 	}
 	return `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE ` + where + `),'')`
+}
+
+// networkCheck (D88): on the droplet a 300 GB base copy kept losing its
+// connection until conntrack's liberal TCP tracking was on and each
+// cluster's address was allowed through ufw.
+func (r *Runner) networkCheck() {
+	n := r.Env.Network
+	if n == nil {
+		return
+	}
+	t := time.Now()
+	ev := map[string]any{"nf_conntrack_tcp_be_liberal": n.Liberal, "ufw_enabled": n.UfwEnabled, "managed": n.Managed, "clusters": n.Wanted, "missing": n.Missing, "error": n.Error}
+	fix := "Run install.sh again: it sets net.netfilter.nf_conntrack_tcp_be_liberal = 1 and installs upwell-firewall.path, which allows each cluster's address. By hand: sudo sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1, and sudo ufw allow proto tcp from <cluster ip> port <cluster port> for the source and the target."
+	switch {
+	case !n.UfwEnabled:
+		ok(r, "network_path", "", "", "The droplet's firewall (ufw) is not enabled, so it cannot drop the clusters' packets.", ev, t)
+	case n.Liberal != "1":
+		r.emit("network_path", "", "", check.Blocker, false, "The droplet's firewall can cut long connections to the clusters: conntrack marks some packets of a fast stream INVALID and ufw drops them (nf_conntrack_tcp_be_liberal is "+firstNonEmpty(n.Liberal, "not set")+"). A base copy then fails with a closed connection, after hours on a large database.", fix, ev, t)
+	case n.Error != "":
+		r.emit("network_path", "", "", check.Blocker, false, "Upwell could not list the clusters' addresses for the firewall: "+n.Error+".", fix, ev, t)
+	case !n.Managed:
+		r.emit("network_path", "", "", check.Warning, false, "Connection tracking is liberal, but the firewall unit that allows each cluster's address is not installed.", fix, ev, t)
+	case len(n.Missing) > 0:
+		r.emit("network_path", "", "", check.Blocker, false, fmt.Sprintf("The firewall does not yet allow %d cluster address(es): %s (see journalctl -u upwell-firewall).", len(n.Missing), strings.Join(n.Missing, ", ")), fix, ev, t)
+	default:
+		ok(r, "network_path", "", "", fmt.Sprintf("Connection tracking is liberal and the firewall allows the %d cluster address(es): %s.", len(n.Wanted), strings.Join(n.Wanted, ", ")), ev, t)
+	}
 }

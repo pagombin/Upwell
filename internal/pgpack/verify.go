@@ -720,3 +720,33 @@ func largeObjects(ctx context.Context, c *pgx.Conn) (loSummary, error) {
 	}
 	return s, err
 }
+
+// EndStaleEngineSessions ends the engine's leftover sessions in the
+// connected target database (D89): pgcopydb names its sessions
+// "pgcopydb[<pid>]". Called only when no engine runs for the database, so
+// any such session of this user there is a previous attempt's, for example
+// an apply whose connection stalled (the droplet, 2026-10-14). Alive, it
+// keeps the replication origin, and every new apply fails with "replication
+// origin with ID n is already active for PID p".
+func EndStaleEngineSessions(ctx context.Context, c *pgx.Conn) ([]string, error) {
+	rows, err := pg.Query(ctx, c, `SELECT pid, application_name, COALESCE(state,''), COALESCE(client_addr::text,'local'), backend_start::text,
+		pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid() AND application_name LIKE 'pgcopydb[%'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var pid int32
+		var app, state, addr, start string
+		var ok bool
+		if err := rows.Scan(&pid, &app, &state, &addr, &start, &ok); err != nil {
+			return out, err
+		}
+		if ok {
+			out = append(out, fmt.Sprintf("pid %d (%s from %s, %s, started %s)", pid, app, addr, state, start))
+		}
+	}
+	return out, rows.Err()
+}

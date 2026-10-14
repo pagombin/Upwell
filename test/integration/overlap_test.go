@@ -72,3 +72,39 @@ func TestOverlappingTransactionsReachTarget(t *testing.T) {
 	}
 	e.cleanup(id, "Overlapping transactions")
 }
+
+// D89, the droplet (2026-10-14): migration_poc's apply connection stalled;
+// when the engine was started again the target still had the old session,
+// which held the replication origin, and every resume failed with
+// "replication origin with ID 2 is already active for PID ...". Here a
+// session named like pgcopydb's holds the origin while the database is
+// stopped; resuming must end it and stream again.
+func TestResumeEndsStaleApplySession(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_staleapply")
+	id := streamingMigration(t, e, "Stale apply session", db)
+	d := e.db(id, db)
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/stop", nil, nil, 200)
+	e.waitDBState(id, db, 2*time.Minute, orch.DStopped)
+	ctx := context.Background()
+	stale, err := pg.Connect(ctx, dstConn.WithDB(db), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stale.Close(ctx)
+	if _, err := stale.Exec(ctx, "SET application_name = 'pgcopydb[999999]'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.Exec(ctx, "SELECT pg_replication_origin_session_setup($1)", d.OriginName); err != nil {
+		t.Fatalf("holding origin %s: %v", d.OriginName, err)
+	}
+	exec1(t, srcConn, db, `INSERT INTO orders(customer, amount, note) VALUES (7, 7, 'after stale')`)
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/resume", nil, nil, 200)
+	if d := e.waitDBState(id, db, 3*time.Minute, orch.DInSync, orch.DFailed, orch.DRestartRequired, orch.DStopped); d.State != orch.DInSync {
+		t.Fatalf("resume with a stale apply session on the target ended %s: %s", d.State, d.LastError)
+	}
+	e.waitFor(2*time.Minute, "the row written while stopped to reach the target", func() bool {
+		return q(t, dstConn, db, `SELECT count(*) FROM orders WHERE note = 'after stale'`) == "1"
+	})
+	e.abortAndClean(id, "Stale apply session")
+}
