@@ -405,3 +405,82 @@ func TestP1IdentityFullDuplicates(t *testing.T) {
 			t.Logf("NO-GO as expected: %.300s", rc.Detail)
 		}})
 }
+
+// 13. Every cutover step interrupted by an Upwell restart (SIGKILL of the
+// process), then the cutover continued: GO with identical data.
+func TestP1CutoverRestartAtEveryStep(t *testing.T) {
+	steps := []string{"readiness", "writers", "heartbeat", "await", "endpos", "drain", "origin", "sequences", "verify"}
+	for _, plugin := range plugins {
+		for _, step := range steps {
+			plugin, step := plugin, step
+			t.Run(plugin+"/"+step, func(t *testing.T) {
+				e := newProcEnv(t)
+				db := uniq("it_p1_rs_" + step[:min(4, len(step))])
+				seedDB(t, db, 20000)
+				name := "Restart at " + step + " " + plugin
+				id := e.defineMigration(name, []string{db}, map[string]any{"decoding_plugin": plugin})
+				e.preflight(id)
+				e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+				e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
+				exec1(t, srcConn, db, `INSERT INTO orders(customer, amount, note) SELECT g, g, 'streamed' FROM generate_series(1, 2000) g; UPDATE orders SET amount = amount + 1 WHERE id % 97 = 0`)
+				time.Sleep(10 * time.Second)
+				var rd struct {
+					Ready bool `json:"ready"`
+				}
+				e.waitFor(10*time.Minute, "readiness", func() bool {
+					e.do("GET", "/api/v1/migrations/"+id+"/cutover/readiness", nil, &rd, 200)
+					return rd.Ready
+				})
+				var r struct {
+					OperationID string `json:"operation_id"`
+				}
+				e.do("POST", "/api/v1/migrations/"+id+"/cutover", map[string]any{"confirm_writers_stopped": true}, &r, 202)
+				// Kill Upwell while the step runs (or as soon as it has passed).
+				killedAt := ""
+				order := map[string]int{}
+				for i, s := range []string{"readiness", "writers", "heartbeat", "await", "endpos", "drain", "origin", "sequences", "verify", "verdict"} {
+					order[s] = i
+				}
+				e.waitFor(10*time.Minute, "step "+step, func() bool {
+					var op orch.Operation
+					e.do("GET", "/api/v1/operations/"+r.OperationID, nil, &op, 200)
+					for _, st := range op.Steps {
+						if st.State == "running" && order[st.Key] >= order[step] {
+							killedAt = st.Key
+							return true
+						}
+					}
+					return op.State != "running"
+				})
+				if killedAt == "" {
+					t.Skipf("the cutover finished before step %s could be interrupted", step)
+				}
+				e.restartProc()
+				t.Logf("killed Upwell during step %s", killedAt)
+				// Continue: the console offers it; the API is the same call.
+				m := e.migration(id).Migration
+				if m.Flags.Verdict == "" {
+					var r2 struct {
+						OperationID string `json:"operation_id"`
+					}
+					code := e.do("POST", "/api/v1/migrations/"+id+"/cutover", map[string]any{"confirm_writers_stopped": true}, &r2)
+					if code == 202 {
+						e.waitOp(r2.OperationID, 25*time.Minute)
+					} else {
+						t.Logf("continue answered %d", code)
+					}
+				}
+				v := e.migration(id).Migration.Flags.Verdict
+				_, diffs := compareDatabase(t, db)
+				if v == "GO" && len(diffs) > 0 {
+					t.Fatalf("CRITICAL: GO with different data after a restart at %s:\n%s", killedAt, strings.Join(diffs, "\n"))
+				}
+				if v != "GO" {
+					logVerification(t, e, id)
+					t.Fatalf("restart at %s: verdict %q, want GO (writes were stopped throughout)", killedAt, v)
+				}
+				e.cleanup(id, name)
+			})
+		}
+	}
+}

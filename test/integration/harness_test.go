@@ -76,6 +76,9 @@ type Env struct {
 	Dir    string
 	Cfg    config.Config
 	Store  *store.Store
+	// Base is the server's URL (the in-process server, or an upwell process).
+	Base string
+	proc *upwellProc
 	Orch   *orch.Orchestrator
 	Srv    *httptest.Server
 	client *http.Client
@@ -165,6 +168,7 @@ func newEnv(t *testing.T, dir string, hooks orch.TestHooks) *Env {
 		as.CreateUser(ctx, "operator", "correct-horse-battery", "operator")
 	}
 	e.Srv = httptest.NewTLSServer(srv.Handler())
+	e.Base = e.Srv.URL
 	go o.Run(ctx)
 	jar, _ := cookiejar.New(nil)
 	e.client = &http.Client{Jar: jar, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, Timeout: 120 * time.Second}
@@ -179,7 +183,9 @@ func (e *Env) Close() {
 		return
 	}
 	e.cancel()
-	e.Srv.Close()
+	if e.Srv != nil {
+		e.Srv.Close()
+	}
 	time.Sleep(300 * time.Millisecond)
 	e.log.Close()
 	e.Store.Close()
@@ -206,7 +212,7 @@ func (e *Env) doKey(method, path, key string, body any, out any, want ...int) in
 		b, _ := json.Marshal(body)
 		rd = bytes.NewReader(b)
 	}
-	req, _ := http.NewRequest(method, e.Srv.URL+path, rd)
+	req, _ := http.NewRequest(method, e.Base+path, rd)
 	req.Header.Set("Content-Type", "application/json")
 	if method != "GET" {
 		req.Header.Set("X-CSRF-Token", e.csrf)
@@ -238,7 +244,7 @@ func (e *Env) doKey(method, path, key string, body any, out any, want ...int) in
 }
 
 func (e *Env) raw(method, path string) (int, string) {
-	req, _ := http.NewRequest(method, e.Srv.URL+path, nil)
+	req, _ := http.NewRequest(method, e.Base+path, nil)
 	resp, err := e.client.Do(req)
 	if err != nil {
 		e.t.Fatal(err)

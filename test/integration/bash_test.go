@@ -155,7 +155,7 @@ func TestRedactionCanaries(t *testing.T) {
 	}
 	e.mustGO(id)
 	get := func(path, bearer string) []byte {
-		req, _ := http.NewRequest("GET", e.Srv.URL+path, nil)
+		req, _ := http.NewRequest("GET", e.Base+path, nil)
 		if bearer != "" {
 			req.Header.Set("Authorization", "Bearer "+bearer)
 		}
