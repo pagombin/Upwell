@@ -81,6 +81,10 @@ type Flags struct {
 	Verdict          string        `json:"verdict,omitempty"`
 	VerdictAt        int64         `json:"verdict_at,omitempty"`
 	VerifyRunID      string        `json:"verify_run_id,omitempty"`
+	// Unverified lists "database: table" for every table whose rows the last
+	// verification did not compare (D91); a GO with any is shown apart.
+	Unverified      []string `json:"unverified,omitempty"`
+	UnverifiedCount int      `json:"unverified_count,omitempty"`
 	Verifying        bool          `json:"verifying,omitempty"`
 	CleanupRunning   bool          `json:"cleanup_running,omitempty"`
 	Freeze           *FreezeState  `json:"freeze,omitempty"`

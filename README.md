@@ -96,6 +96,8 @@ The verdict is decided per database and the migration is GO only if every databa
 | Schema objects | The same indexes, constraints (including NOT VALID ones), triggers, views, functions, partitions and enum values |
 | Row counts | Exact counts match for every table up to `exact_count_max_mb` (1 GB by default); a larger table outside the checksum window is only checked for being empty or truncated on the target, and is listed as not counted |
 | Checksums | Row checksums match for every table that fits in the time budget (`verify_checksum_budget_seconds`, smallest first) and has the same row count on both sides; tables beyond the budget are listed as not checksummed |
+| Large tables, row by row | With `verify_large_tables = full` (or "Verify every table fully" after a verdict), every row of the tables beyond the budget is compared by primary key range, in parallel and resumable; a differing range is named |
+| Coverage | Lists every table whose rows were not all compared; a GO with any such table is shown as "GO, not fully verified" with the tables, never as a plain GO |
 | Sequences | Target sequences are at or past the source's values (in their direction, for descending ones); a sequence the user may not read is a failure, not "unused" |
 | Large objects and materialized views | Large objects match exactly; materialized views match (refreshed on the target when the source refreshed them while streaming) |
 | Engine reached the end position | The engine applied everything up to the end position; a database that did not drain is NO-GO |

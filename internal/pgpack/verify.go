@@ -27,6 +27,13 @@ type VerifyInput struct {
 	ExactCountMaxBytes int64
 	ChecksumBudget     time.Duration
 	Database           string
+	// FullLarge compares every row of the tables that do not fit in the
+	// checksum budget, by key range (D91), instead of counting or sizing them.
+	FullLarge     bool
+	ChunkBytes    int64
+	Workers       int
+	Tracker       ChunkTracker
+	ChunkProgress ChunkProgress
 }
 
 // VerifyResult is one database's verification.
@@ -297,6 +304,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	deadline := time.Now().Add(in.ChecksumBudget)
 	var countFail, sumFail, notSummed, estOnly []string
 	exactN, summedN, countDiffSummed := 0, 0, 0
+	var fullList []LargeTable
 	type pair struct {
 		n   int64
 		sum string
@@ -331,6 +339,10 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			}
 			continue
 		}
+		if in.FullLarge {
+			fullList = append(fullList, LargeTable{Name: t.Name, Bytes: t.Bytes, Est: t.Est})
+			continue
+		}
 		notSummed = append(notSummed, t.Name)
 		if t.Bytes <= in.ExactCountMaxBytes {
 			var a, b pair
@@ -351,6 +363,31 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			if dtb := dt[t.Name].Bytes; t.Bytes > 0 && dtb*10 < t.Bytes {
 				countFail = append(countFail, fmt.Sprintf("%s (too large to count; %s on the source but only %s on the target)", t.Name, humanBytes(float64(t.Bytes)), humanBytes(float64(dtb))))
 			}
+		}
+	}
+	// D91: the tables beyond the budget, every row, by key range.
+	var fullFail, fullErr, fullOK []string
+	if len(fullList) > 0 {
+		for _, r := range FullCompare(ctx, in.Source, in.Target, fullList, in.ChunkBytes, in.Workers, in.Tracker, in.ChunkProgress) {
+			switch {
+			case r.Err != nil:
+				fullErr = append(fullErr, fmt.Sprintf("%s (%v)", r.Table, r.Err))
+			case len(r.Mismatches) > 0:
+				fullFail = append(fullFail, r.Mismatches...)
+			default:
+				fullOK = append(fullOK, r.Table)
+				exactN++
+				summedN++
+			}
+		}
+		fev := map[string]any{"tables": len(fullList), "compared": limitList(fullOK, 100), "mismatches": limitList(fullFail, 100), "errors": limitList(fullErr, 50)}
+		switch {
+		case len(fullFail) > 0:
+			add(vres("full_compare", db, check.Blocker, "Large tables compared row by row", fmt.Sprintf("%d range(s) differ: %s.", len(fullFail), strings.Join(limitList(fullFail, 5), "; ")), fev))
+		case len(fullErr) > 0:
+			add(vres("full_compare", db, check.Blocker, "Large tables compared row by row", fmt.Sprintf("%d table(s) could not be compared: %s.", len(fullErr), strings.Join(limitList(fullErr, 5), "; ")), fev))
+		default:
+			add(vres("full_compare", db, check.OK, "Large tables compared row by row", fmt.Sprintf("Every row of %d table(s) too large for the checksum window matches, compared by key range.", len(fullOK)), fev))
 		}
 	}
 	ev = map[string]any{"exact": exactN, "mismatches": countFail, "estimated_only": estOnly}
@@ -378,6 +415,14 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 		add(vres("checksums", db, check.Blocker, "Row checksums match", fmt.Sprintf("Checksums match for %d table(s).%s", summedN, also), ev))
 	default:
 		add(vres("checksums", db, check.OK, "Row checksums match", fmt.Sprintf("Checksums match for all %d table(s).", summedN), ev))
+	}
+	// D91: how much was compared. A GO with tables whose rows were not all
+	// compared is shown apart from a fully verified GO.
+	cev := map[string]any{"tables": len(tables), "fully_compared": summedN, "not_fully_compared": limitList(notSummed, 500), "counted_only": len(notSummed) - len(estOnly), "size_only": limitList(estOnly, 500)}
+	if len(notSummed) > 0 {
+		add(vres("coverage", db, check.Warning, "Every row compared", fmt.Sprintf("%d of %d table(s) were not compared row by row (%d counted only, %d checked for size only): %s. Run verification with every table compared fully before relying on them.", len(notSummed), len(tables), len(notSummed)-len(estOnly), len(estOnly), strings.Join(limitList(notSummed, 5), ", ")), cev))
+	} else {
+		add(vres("coverage", db, check.OK, "Every row compared", fmt.Sprintf("Every row of all %d table(s) was compared.", len(tables)), cev))
 	}
 
 	// Large objects: logical decoding does not carry them, so changes made

@@ -101,6 +101,9 @@ func (r *Report) PDF() ([]byte, error) {
 	muted("Upwell migration report - generated " + ts(r.GeneratedAt) + " - customer-confidential: contains database and table names and sizes")
 	h1(r.Migration.Name)
 	v := r.Migration.Flags.Verdict
+	if v == "GO" && r.Migration.Flags.UnverifiedCount > 0 {
+		v = fmt.Sprintf("GO, not fully verified (%d table(s) not compared row by row)", r.Migration.Flags.UnverifiedCount)
+	}
 	if v == "" {
 		v = "no verdict yet"
 	}

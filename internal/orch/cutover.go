@@ -704,6 +704,7 @@ func (o *Orchestrator) stopUndrained(ctx context.Context, m Migration, dbs []Dat
 
 // verifyPhase runs the origin check, sequence sync, verification and verdict.
 func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operation, a audit.Actor) {
+	o.updateFlags(ctx, m.ID, func(f *Flags) { f.UnverifiedCount, f.Unverified = 0, nil })
 	src, dst, err := o.Conns(ctx, m)
 	if err != nil {
 		o.finishCutover(ctx, m, op, a, err)
@@ -784,15 +785,35 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	op.StepStart("verify", "")
 	runID := op.ID
 	verdicts := map[string]bool{}
+	var unverified []string
 	for i, d := range inc {
 		op.StepDetail("verify", "verifying "+d.SourceName, float64(i)/float64(max(len(inc), 1)))
 		if o.testHooks.BeforeVerify != nil {
 			o.testHooks.BeforeVerify(ctx, d)
 		}
-		cur, _ := o.GetDatabase(ctx, m.ID, d.ID)
+		cur, gerr := o.GetDatabase(ctx, m.ID, d.ID)
+		if gerr != nil {
+			// Never verify against a database row Upwell could not read: its
+			// heartbeat token and positions decide the first checks.
+			cur = d
+			op.LogDB("error", d.SourceName, "reading the database's state before verification failed: %v", gerr)
+		}
+		// D91: tables beyond the checksum budget compared row by row when the
+		// setting (or a "verify fully" request) asks for it; ranges found equal
+		// in this verification are not compared again after an interruption.
+		full := v.Str("verify_large_tables") == "full" || op.Params["full"] == true
+		runKey := d.ID + ":" + cur.HBToken + ":" + cur.EndPos
+		if op.Kind == "verify" {
+			runKey += ":" + op.ID
+		}
+		dbi, ndb := i, len(inc)
 		res, err := pgpack.Verify(ctx, pgpack.VerifyInput{Source: src.WithDB(d.SourceName), Target: dst.WithDB(d.TargetName), TargetMaint: dst, Origin: d.OriginName,
 			HeartbeatRequired: hbOn, Offline: offline, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
-			ExactCountMaxBytes: int64(v.Int("exact_count_max_mb")) << 20, ChecksumBudget: time.Duration(v.Int("verify_checksum_budget_seconds")) * time.Second, Database: d.SourceName})
+			ExactCountMaxBytes: int64(v.Int("exact_count_max_mb")) << 20, ChecksumBudget: time.Duration(v.Int("verify_checksum_budget_seconds")) * time.Second, Database: d.SourceName,
+			FullLarge: full, ChunkBytes: int64(v.Int("verify_chunk_mb")) << 20, Workers: v.Int("verify_workers"), Tracker: chunkTracker{o: o, key: runKey},
+			ChunkProgress: func(done, total int, table string) {
+				op.StepDetail("verify", fmt.Sprintf("verifying %s: %s, key range %d of %d", d.SourceName, table, done, total), (float64(dbi)+float64(done)/float64(max(total, 1)))/float64(max(ndb, 1)))
+			}})
 		if err != nil {
 			res.GO = false
 			res.Results = append(res.Results, check.Result{CheckID: "verify_error", Level: check.Blocker, Hard: true, Title: "Verification completed", Message: err.Error(), Database: d.SourceName})
@@ -818,6 +839,15 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 				msg = "The offline copy of this database did not finish."
 			}
 			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName, Message: msg})
+		}
+		for _, r := range res.Results {
+			if r.CheckID == "coverage" && r.Level != check.OK {
+				if ev, ok := r.Evidence["not_fully_compared"].([]string); ok {
+					for _, tname := range ev {
+						unverified = append(unverified, d.SourceName+": "+tname)
+					}
+				}
+			}
 		}
 		table := "verifications"
 		if o.testHooks.FailVerificationStore {
@@ -886,6 +916,8 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		}
 	}
 	op.StepEnd("verify", "done", "")
+	// D91: which tables this verdict rests on without a row-by-row comparison.
+	o.updateFlags(ctx, m.ID, func(f *Flags) { f.UnverifiedCount, f.Unverified = len(unverified), limitStrings(unverified, 500) })
 	o.finishCutover(ctx, m, op, a, nil)
 }
 
@@ -1016,7 +1048,9 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 }
 
 // Reverify re-runs the origin check and verification after a drain.
-func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key string) (*Operation, error) {
+// full compares every row of every table, by key range for the large ones
+// (D91), whatever verify_large_tables says.
+func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key string, full bool) (*Operation, error) {
 	cutoverStartMu.Lock()
 	defer cutoverStartMu.Unlock()
 	m, err := o.GetMigration(ctx, id)
@@ -1043,7 +1077,7 @@ func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key stri
 	if offline {
 		steps = steps[1:]
 	}
-	op, err := o.newOp(ctx, m.ID, "verify", key, a.Username, steps, nil)
+	op, err := o.newOp(ctx, m.ID, "verify", key, a.Username, steps, map[string]any{"full": full})
 	if err != nil {
 		return op, err
 	}
@@ -1051,7 +1085,7 @@ func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key stri
 	for _, d := range included(dbs) {
 		o.setDB(ctx, d.ID, map[string]any{"verdict": nil})
 	}
-	o.audit.Append(ctx, a, "verify.run", m.ID, nil, map[string]any{"operation": op.ID})
+	o.audit.Append(ctx, a, "verify.run", m.ID, nil, map[string]any{"operation": op.ID, "full": full})
 	go func() {
 		bg := context.Background()
 		o.verifyPhase(bg, m, op, a)

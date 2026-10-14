@@ -1,5 +1,15 @@
 # Upwell overnight build: progress
 
+## Data safety after the base copy (Part 1 to 4 request, 2026-10-14), branch `claude/new-session-agkd2d`
+
+The request names `overnight-build-2`; that branch already exists, holds the earlier audit of 643e4c1 and is merged into `main`, and reusing it would need a force push, so this work continues on `claude/new-session-agkd2d`, which contains it. The audit document itself was not attached; its findings were fixed on `overnight-build-2` (sections below).
+
+### Part 1: scenarios
+
+| # | Scenario | Test | Plugin | Result | Fixed |
+| --- | --- | --- | --- | --- | --- |
+| 15 | One changed byte in a table beyond the count limit and budget | `TestVerifyLargeTableOneByte`, `TestVerifyLargeTableFullGO` | pgoutput | pass | D91: full comparison by key range; "GO, not fully verified" |
+
 ## Freeze and verification review; pgcopydb overlapping-transaction loss (2026-10-14), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |

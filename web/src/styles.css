@@ -196,6 +196,7 @@ label.field > span.lbl { font-size: 12px; color: var(--muted); font-weight: 500;
 .verdict { font-size: 28px; font-weight: 700; letter-spacing: 0.02em; }
 .verdict.go { color: var(--ok); }
 .verdict.nogo { color: var(--crit); }
+.verdict.go.partial { color: var(--warn); }
 .sev-stripe { border-left: 3px solid var(--border-strong); }
 .sev-stripe.crit { border-left-color: var(--crit); }
 .sev-stripe.warn { border-left-color: var(--warn); }

@@ -51,7 +51,7 @@ export function MigrationLayout() {
             <h1><Trunc>{m.name}</Trunc></h1>
             <div className="row small muted">
               <span className="mono">{m.short_id}</span><Pill state={m.state} />
-              {m.flags.verdict && <Pill state={m.flags.verdict} text={`Verdict ${m.flags.verdict}`} />}
+              {m.flags.verdict && <Pill state={m.flags.verdict === "GO" && (m.flags.unverified_count || 0) > 0 ? undefined : m.flags.verdict} kind={m.flags.verdict === "GO" && (m.flags.unverified_count || 0) > 0 ? "warn" : undefined} text={m.flags.verdict === "GO" && (m.flags.unverified_count || 0) > 0 ? `Verdict GO, ${m.flags.unverified_count} table(s) not fully verified` : `Verdict ${m.flags.verdict}`} />}
               {m.fixture && <span className="pill neutral nodot">Demonstration data</span>}
               <span>{v.included} databases · {bytes(v.total_bytes)}</span>
               {m.started_at && <span>Started {time(m.started_at)}</span>}

@@ -2,7 +2,7 @@ export type Role = "viewer" | "operator" | "admin";
 export interface User { id: string; username: string; role: Role; disabled: boolean; last_login_at?: number; created_at: number; totp_enabled?: boolean }
 export interface Flags {
   started?: boolean; paused?: boolean; aborted?: boolean; cleaned_up?: boolean; apps_switched?: boolean;
-  preflight_running?: boolean; preflight_ok?: boolean; preflight_run_id?: string; verdict?: string; verdict_at?: number;
+  preflight_running?: boolean; preflight_ok?: boolean; preflight_run_id?: string; verdict?: string; verdict_at?: number; unverified?: string[]; unverified_count?: number;
   verifying?: boolean; cleanup_running?: boolean; verify_run_id?: string;
   cutover?: { op_id: string; phase: string; started_at: number; writes_stopped_at?: number; ended_at?: number; write_pause_ms?: number; override?: boolean; verdict?: string };
   freeze?: FreezeState;

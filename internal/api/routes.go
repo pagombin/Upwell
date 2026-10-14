@@ -1371,7 +1371,13 @@ func (s *Server) switched(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) error {
-	op, err := s.Orch.Reverify(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"))
+	var in struct {
+		Full bool `json:"full"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	op, err := s.Orch.Reverify(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"), in.Full)
 	return opResponse(w, op, err)
 }
 
