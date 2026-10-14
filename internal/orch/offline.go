@@ -151,7 +151,7 @@ func (o *Orchestrator) offlineWorker(ctx context.Context, m Migration, dbs []Dat
 				changing = append(changing, d.SourceName+" (a table was truncated or rewritten, or a sequence or large object changed)")
 			}
 			if len(act.OpenWriters) > 0 {
-				changing = append(changing, fmt.Sprintf("%s (%d open or prepared write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
+				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s), prepared ones included: %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
 			}
 			o.setDB(bg, d.ID, map[string]any{"writes_baseline": act.Changes, "writes_fingerprint": act.Fingerprint})
 		}

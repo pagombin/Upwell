@@ -819,12 +819,12 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	p = r.probe(ctx, "collation", "", d.Source)
 	p.fail(baseErr)
 	if exists && p.err == nil {
-		p.row(sc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&srcCollVer)
+		p.row(sc, collVersionSQL(r.srcVer, "")).Scan(&srcCollVer)
 		if tc, err := pg.Connect(ctx, e.Target.WithDB(d.Target), 30*time.Second); err != nil {
 			p.fail(err)
 			p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
 		} else {
-			p.row(tc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&dstCollVer)
+			p.row(tc, collVersionSQL(r.dstVer, "")).Scan(&dstCollVer)
 			probeS := sortProbe(p, sc)
 			probeT := sortProbe(p, tc)
 			tc.Close(ctx)
@@ -846,8 +846,8 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
 	} else {
 		// The new database takes template1's collation version (D82).
-		p.row(sc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&srcCollVer)
-		p.row(r.dst, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname='template1'),'')`).Scan(&dstCollVer)
+		p.row(sc, collVersionSQL(r.srcVer, "")).Scan(&srcCollVer)
+		p.row(r.dst, collVersionSQL(r.dstVer, "template1")).Scan(&dstCollVer)
 		ev := map[string]any{"source": srcCollate, "source_version": srcCollVer, "target_version": dstCollVer}
 		if p.err == nil && srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer {
 			p.emit(check.Warning, false, fmt.Sprintf("The target database will be created with collation %s, but the collation library versions differ (source %s, target %s): a few strings may sort differently on the target; the sort order is compared again once it exists.", srcCollate, srcCollVer, dstCollVer), collationVersionAdvice, ev)
@@ -1347,4 +1347,19 @@ func EngineMajorMinor(v string) (major, minor int, ok bool) {
 	major, _ = strconv.Atoi(m[1])
 	minor, _ = strconv.Atoi(m[2])
 	return major, minor, true
+}
+
+// collVersionSQL reads a database's collation version (the current one when
+// db is ""). pg_database.datcollversion exists from PostgreSQL 15; before
+// that there is nothing to compare, so the version reads empty (D82 failed
+// preflight on a PostgreSQL 14 source).
+func collVersionSQL(ver int, db string) string {
+	if ver > 0 && ver < 150000 {
+		return `SELECT ''`
+	}
+	where := "datname=current_database()"
+	if db != "" {
+		where = "datname=" + pg.QuoteLiteral(db)
+	}
+	return `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE ` + where + `),'')`
 }

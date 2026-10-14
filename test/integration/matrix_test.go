@@ -58,6 +58,9 @@ func TestVersionMatrix(t *testing.T) {
 				if r.Level == "blocker" && r.Hard {
 					hard = append(hard, r.CheckID)
 				}
+				if r.Level == "blocker" && !r.Hard {
+					t.Logf("acceptable blocker %s: %s", r.CheckID, r.Message)
+				}
 			}
 			t.Logf("target_apply_privileges %s; hard blockers %v", apply, hard)
 			if !c.wantGO {

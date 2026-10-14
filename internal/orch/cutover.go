@@ -427,7 +427,7 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 				changing = append(changing, d.SourceName+" (a table was truncated or rewritten, or a sequence or large object changed)")
 			}
 			if len(act.OpenWriters) > 0 {
-				changing = append(changing, fmt.Sprintf("%s (%d open or prepared write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
+				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s), prepared ones included: %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
 			}
 		}
 		override := false
@@ -1144,7 +1144,7 @@ func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, 
 		res.Message = "Since the writers step a table on the source was truncated or rewritten, or a sequence or large object changed; the row counter does not show those, and the target may not have them." + overrideNote
 	case len(act.OpenWriters) > 0:
 		res.Level = check.Blocker
-		res.Message = fmt.Sprintf("%d open or prepared write transaction(s) on the source (%s): when they commit, their changes will be missing on the target.%s", len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; "), overrideNote)
+		res.Message = fmt.Sprintf("%d open write transaction(s), prepared ones included on the source (%s): when they commit, their changes will be missing on the target.%s", len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; "), overrideNote)
 	default:
 		res.Level = check.OK
 		res.Message = "No row changes on the source since writers were confirmed stopped, and no open write transaction."
