@@ -8,6 +8,12 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 
 | # | Scenario | Test | Plugin | Result | Fixed |
 | --- | --- | --- | --- | --- | --- |
+| 5 | Target failover: primary stopped at once, asynchronous standby promoted behind the same address (PgBouncer) | `TestP1TargetFailover` | both | pass | none needed: the origin's progress is replayed with the data |
+| 6 | Source failover: the slot is gone | `TestP1SourceSlotGone` | both | pass after fix | D95: was "failed (permanent)", now Restart required naming the missing slot |
+| 7 | Slot WAL lost (`wal_status` lost) | `TestP1SlotWALLost` | both | pass after fix | D95 |
+| 4 | Engine killed with SIGKILL mid-apply of a large transaction, resumed | `TestP1KillDuringLargeApply`, `TestFaultSIGKILLMainDuringCDC` | both | pass | none needed |
+| 9 | PgBouncer (session mode) drops every connection for 10 s while streaming | `TestP1PoolerDrop` | both | pass | none needed |
+| 16 | PostgreSQL 16 to 18 hashing over float, numeric, money, interval, json, ranges, multiranges, geometry, network, bit, bytea, arrays; one changed byte on 18 after GO | `TestP1CrossVersionHashing` | both | pass | D94: xml found the target's missing XML support (preflight now blocks); PostGIS not installed locally, not tested |
 | 15 | One changed byte in a table beyond the count limit and budget | `TestVerifyLargeTableOneByte`, `TestVerifyLargeTableFullGO` | pgoutput | pass | D91: full comparison by key range; "GO, not fully verified" |
 | 17 | Unreadable and descending sequences | `TestP1SequencesUnreadableAndDescending` (verification and sync directly), `TestP1SequencesStreaming` | both | pass | the suite's own comparison treated every sequence as ascending (fixed, D92); Upwell already handled both |
 | 18 | Every verification query failing in turn (26 to 30 queries, three verification paths) | `TestP1EveryVerificationQueryFails` | n/a (verification alone) | pass after fix | D92: an unreadable materialized view was a warning (GO); the session's version query was ignored |
