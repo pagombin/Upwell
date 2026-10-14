@@ -167,6 +167,15 @@ func background(t *testing.T, db string, pace time.Duration, f func(ctx context.
 	return func() { close(stop); <-done }
 }
 
+// waitSlotReady waits until db's logical slot exists with a consistent start
+// point (confirmed_flush_lsn is set once creation has finished).
+func waitSlotReady(t *testing.T, e *Env, db string) {
+	t.Helper()
+	e.waitFor(10*time.Minute, "the slot of "+db, func() bool {
+		return q(t, srcConn, "defaultdb", fmt.Sprintf(`SELECT count(*)::text FROM pg_replication_slots WHERE database = '%s' AND slot_type = 'logical' AND confirmed_flush_lsn IS NOT NULL`, db)) == "1"
+	})
+}
+
 // holdTx opens a session on the source and runs sql inside a transaction
 // left open; the returned function commits it.
 func holdTx(t *testing.T, db, sql string) func() {
@@ -252,6 +261,10 @@ func TestP1LargeTransactions(t *testing.T) {
 		// logical slot waits for every running transaction), committed once
 		// the database is in sync.
 		during: func(t *testing.T, e *Env, id, db string) func() {
+			// The state reads base_copy from the engine's launch, before its
+			// slot exists: wait for the slot (opened earlier, a writing
+			// transaction holds slot creation until it commits).
+			waitSlotReady(t, e, db)
 			longCommit = holdTx(t, db, `INSERT INTO lng SELECT g, 'long ' || g FROM generate_series(1, 5000) g`)
 			return nil
 		},
@@ -526,16 +539,17 @@ func TestP1SequencesStreaming(t *testing.T) {
 // false GO. Types whose text form depends on settings or version are
 // streamed; the verdict must be GO with every row compared, and then one
 // changed byte on the target must turn a full re-verification into NO-GO.
-// PostGIS is not installed locally (see PROGRESS, Part 1).
+// PostGIS is not installed locally, and the local PostgreSQL 18 has no XML
+// support (preflight now blocks xml columns there: TestPreflightXMLSupport).
 func TestP1CrossVersionHashing(t *testing.T) {
 	forPlugins(t, scenario{name: "xver", wantGO: true, dstPort: pg18Port,
 		settings: map[string]any{"verify_large_tables": "full"},
 		schema: `CREATE TABLE x(id int PRIMARY KEY, f4 real, f8 float8, n numeric, m money, iv interval, tz timetz, ts timestamptz,
-				j jsonb, js json, x xml, tv tsvector, r int4range, mr int4multirange, tr tstzrange, p point, bx box, pl polygon, c circle,
+				j jsonb, js json, tv tsvector, r int4range, mr int4multirange, tr tstzrange, p point, bx box, pl polygon, c circle,
 				ip inet, cd cidr, mac macaddr8, u uuid, bt bit varying(16), ba bytea, a float8[], o oid, ch char(5), b boolean);
 			INSERT INTO x SELECT g, g / 3.0, g / 7.0, g / 11.0, g * 1.25, make_interval(days => g, secs => g / 9.0), '12:34:56.789+05:30',
 				'2026-03-29 01:30:00+01'::timestamptz + g * interval '17 minutes', jsonb_build_object('k', g, 'f', g / 3.0, 'a', jsonb_build_array(1.0, 'x')),
-				'{"b": 1, "a": [1.10, 2]}', '<a b="1">x</a>', to_tsvector('simple', 'the quick ' || g), int4range(g, g + 10), int4multirange(int4range(1, g + 2), int4range(g + 5, g + 9)),
+				'{"b": 1, "a": [1.10, 2]}', to_tsvector('simple', 'the quick ' || g), int4range(g, g + 10), int4multirange(int4range(1, g + 2), int4range(g + 5, g + 9)),
 				tstzrange('2026-01-01', '2026-01-01'::timestamptz + g * interval '1 hour'), point(g / 3.0, -g), box(point(0, 0), point(g, g / 7.0)), polygon(box(point(0, 0), point(g, 1))),
 				circle(point(g, g), g / 3.0), ('10.0.' || (g % 255) || '.1/24')::inet, '192.168.0.0/16', '08:00:2b:01:02:03:04:05', md5(g::text)::uuid, (g % 65536)::bit(16)::varbit,
 				decode(md5(g::text), 'hex'), ARRAY[g / 3.0, 1e-300, 'NaN', '-Infinity']::float8[], g, 'ab', g % 2 = 0

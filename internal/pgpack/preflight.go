@@ -3,6 +3,7 @@ package pgpack
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/pagombin/upwell/internal/check"
 	"github.com/pagombin/upwell/internal/pg"
@@ -122,6 +124,7 @@ var Catalog = []check.Definition{
 	cd("dst_extra_objects", check.ScopeDatabase, "Objects only on the target", "warning"),
 	cd("dst_database", check.ScopeDatabase, "Target database", "hard"),
 	cd("extensions", check.ScopeDatabase, "Extensions available on the target", "hard"),
+	cd("xml_support", check.ScopeDatabase, "Target supports xml", "hard"),
 	cd("slot_exists", check.ScopeDatabase, "No leftover replication slot", "hard"),
 	cd("origin_exists", check.ScopeDatabase, "No leftover replication origin", "hard"),
 	cd("publication_exists", check.ScopeDatabase, "No leftover publication", "hard"),
@@ -939,6 +942,31 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		p.emit(check.Blocker, true, "These source extensions are not available on the target: "+strings.Join(missingExt, ", ")+"."+left, "Ask for them to be enabled on the Advanced cluster, or remove them from the source.", map[string]any{"missing": missingExt, "source": srcExt, "left_out": providerExt})
 	} else {
 		p.ok(fmt.Sprintf("All %d source extension(s) are available on the target.%s", len(srcExt)-len(providerExt), left), map[string]any{"source": srcExt, "left_out": providerExt})
+	}
+
+	// xml columns need a target built with XML support; without it the
+	// base copy fails only after copying ("unsupported XML feature").
+	p = r.probe(ctx, "xml_support", "", d.Source)
+	xmlCols, xmlN := p.sample(sc, `SELECT format('%I.%I.%I', n.nspname, c.relname, a.attname) FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid
+		WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		  AND 'xml'::regtype IN (t.oid, t.typelem, t.typbasetype)`, 20)
+	if xmlN == 0 {
+		p.ok("No xml columns.", map[string]any{"columns": 0})
+	} else {
+		var s string
+		err := pg.QueryRow(ctx, r.dst, `SELECT '<a/>'::xml::text`).Scan(&s)
+		var pe *pgconn.PgError
+		switch {
+		case errors.As(err, &pe) && pe.Code == "0A000":
+			p.emit(check.Blocker, true, fmt.Sprintf("%d xml column(s) (for example %s), but the target was built without XML support: the base copy would fail on them.", xmlN, xmlCols[0]),
+				"Use a target with XML support, or change those columns to text on the source.", map[string]any{"columns": xmlN, "examples": xmlCols})
+		case err != nil:
+			p.fail(err)
+			p.emit(check.Blocker, true, "", "", map[string]any{"columns": xmlN})
+		default:
+			p.ok(fmt.Sprintf("%d xml column(s); the target supports xml.", xmlN), map[string]any{"columns": xmlN})
+		}
 	}
 
 	for _, x := range []struct {

@@ -201,3 +201,41 @@ func TestP1SequencesUnreadableAndDescending(t *testing.T) {
 		t.Fatal("the sync reported success with a sequence it could not read")
 	}
 }
+
+// TestPreflightXMLSupport: a source with xml columns and a target built
+// without XML support (the local PostgreSQL 18). The base copy failed only
+// after copying ("unsupported XML feature", found by scenario 16); preflight
+// must block it first, and must not block a source without xml columns.
+func TestPreflightXMLSupport(t *testing.T) {
+	requirePG18(t)
+	for _, withXML := range []bool{true, false} {
+		db := uniq("it_xml")
+		dropDB(t, db)
+		exec1(t, srcConn, "defaultdb", "CREATE DATABASE "+db)
+		t.Cleanup(func() { dropDB(t, db) })
+		col := "x text"
+		if withXML {
+			col = "x xml"
+		}
+		exec1(t, srcConn, db, "CREATE TABLE doc(id int PRIMARY KEY, "+col+"); INSERT INTO doc VALUES (1, '<a/>')")
+		env := failClosedEnv(t, db)
+		env.Target = pg18Conn
+		var got *check.Result
+		(&pgpack.Runner{Env: env, Emit: func(r check.Result) {
+			if r.CheckID == "xml_support" {
+				r := r
+				got = &r
+			}
+		}}).Run(context.Background())
+		if got == nil {
+			t.Fatalf("xml=%v: no xml_support result", withXML)
+		}
+		t.Logf("xml=%v: %s %s", withXML, got.Level, got.Message)
+		if withXML && (got.Level != check.Blocker || !got.Hard || !strings.Contains(got.Message, "public.doc.x")) {
+			t.Fatalf("xml columns and a target without XML support: %s (hard %v) %s", got.Level, got.Hard, got.Message)
+		}
+		if !withXML && got.Level != check.OK {
+			t.Fatalf("no xml columns: %s %s", got.Level, got.Message)
+		}
+	}
+}
