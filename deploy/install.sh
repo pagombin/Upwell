@@ -14,7 +14,6 @@
 # Everything is also written to /var/log/upwell/install.log.
 set -Eeuo pipefail
 
-PGCOPYDB_PIN="0.18"
 PGCOPYDB_TAG="v0.18"
 # The v0.18 tag plus deploy/pgcopydb/*.patch (D84: without them pgcopydb
 # loses transactions that overlap another one). Upwell refuses online
@@ -196,7 +195,22 @@ else
   # in deploy/pgcopydb.
   say "pgcopydb" "building $PGCOPYDB_BUILD from source (found ${cur:-none})"
   dev=$(client_major); dev=${dev:-16}
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git build-essential "postgresql-server-dev-$dev" libpq-dev libgc-dev libncurses-dev libedit-dev libssl-dev libkrb5-dev zlib1g-dev liblz4-dev libzstd-dev libxslt1-dev libselinux1-dev libpam0g-dev libsqlite3-dev >>"$LOGFILE" 2>&1 || fail "installing build dependencies for pgcopydb failed"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git build-essential "postgresql-server-dev-$dev" libpq-dev libgc-dev libncurses-dev libedit-dev libssl-dev libkrb5-dev zlib1g-dev liblz4-dev libzstd-dev libxslt1-dev libselinux1-dev libpam0g-dev libsqlite3-dev libreadline-dev libnuma-dev >>"$LOGFILE" 2>&1 || fail "installing build dependencies for pgcopydb failed"
+  # pgcopydb links every library PostgreSQL itself was built with (pg_config
+  # --libs; PostgreSQL 18 added -lnuma). Name any the linker cannot find
+  # before building, instead of failing at the link step.
+  pgc=/usr/lib/postgresql/$dev/bin/pg_config
+  [[ -x $pgc ]] || pgc=$(command -v pg_config || true)
+  nolib=()
+  for l in $("$pgc" --libs 2>/dev/null | grep -oE -- '-l[A-Za-z0-9_+]+' | sed 's/^-l//' | sort -u); do
+    found=0
+    for d in "$("$pgc" --libdir 2>/dev/null)" "$("$pgc" --pkglibdir 2>/dev/null)"; do
+      [[ -n $d && ( -e $d/lib$l.so || -e $d/lib$l.a ) ]] && found=1
+    done
+    for ext in so a; do [[ $(gcc -print-file-name="lib$l.$ext") == /* ]] && found=1; done
+    [[ $found -eq 1 ]] || nolib+=("$l")
+  done
+  [[ ${#nolib[@]} -eq 0 ]] || fail "building pgcopydb needs development files for: ${nolib[*]} (install the matching lib*-dev packages; pg_config --libs asks for them)"
   src=/usr/local/src/pgcopydb-$PGCOPYDB_BUILD
   rm -rf "$src"
   git clone -q --depth 1 --branch "$PGCOPYDB_TAG" https://github.com/dimitri/pgcopydb "$src" >>"$LOGFILE" 2>&1 || fail "cloning pgcopydb failed"
