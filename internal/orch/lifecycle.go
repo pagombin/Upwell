@@ -871,6 +871,21 @@ func (o *Orchestrator) resumeDB(ctx context.Context, m Migration, d Database, wh
 		done("failed: " + err.Error())
 		return err
 	}
+	// Part 1, scenario 6: after a source failover the new primary has no
+	// slot (before PostgreSQL 17 slots do not survive it), and a slot can
+	// lose its WAL. Changes since the last apply are then gone for good: the
+	// database must restart from zero, never resume. A check that cannot run
+	// does not launch either.
+	if gone, why, err := slotGone(ctx, spec.SourceConn.WithDB(d.SourceName), spec.SlotName); err != nil {
+		done("failed: " + err.Error())
+		return fmt.Errorf("checking the replication slot %s before resuming: %w", spec.SlotName, err)
+	} else if gone {
+		o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": engine.FailSlotLost, "next_retry_at": nil,
+			"last_error": "The replication slot " + spec.SlotName + " " + why + " on the source, so the changes made since the last apply cannot be streamed: restart this database from zero."})
+		o.Event(ctx, m.ID, d.SourceName, "slot_lost", "critical", d.SourceName+": the replication slot "+why+" (a source failover, or it was dropped or invalidated), so this database must restart from zero. Upwell never does this automatically.", map[string]any{"slot": spec.SlotName})
+		done("slot " + why)
+		return uerr("slot_lost", "The replication slot "+spec.SlotName+" "+why+" on the source.", "Restart this database from zero.")
+	}
 	if err := o.diskOK(ctx); err != nil {
 		done("failed: " + err.Error())
 		return err
@@ -889,6 +904,26 @@ func (o *Orchestrator) resumeDB(ctx context.Context, m Migration, d Database, wh
 	o.Event(ctx, m.ID, d.SourceName, "resume", "info", fmt.Sprintf("Resumed %s (%s)", d.SourceName, why), nil)
 	done("resumed")
 	return nil
+}
+
+// slotGone reports whether the slot no longer exists or has lost its WAL.
+func slotGone(ctx context.Context, c pg.Conn, slot string) (bool, string, error) {
+	conn, err := pg.Connect(ctx, c, 30*time.Second)
+	if err != nil {
+		return false, "", err
+	}
+	defer conn.Close(ctx)
+	var status *string
+	err = pg.QueryRow(ctx, conn, `SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1`, slot).Scan(&status)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return true, "no longer exists", nil
+	case err != nil:
+		return false, "", err
+	case status != nil && *status == "lost":
+		return true, "has lost the WAL it needs (wal_status lost)", nil
+	}
+	return false, "", nil
 }
 
 // diskOK checks the work volume before a relaunch.

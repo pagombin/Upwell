@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"syscall"
 	"testing"
@@ -357,11 +358,14 @@ func TestP1SlotWALLost(t *testing.T) {
 			d := e.db(id, db)
 			e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/stop", nil, nil, 200)
 			e.waitDBState(id, db, 2*time.Minute, orch.DStopped)
-			superSQL(t, srcPort, "postgres", "ALTER SYSTEM SET max_slot_wal_keep_size = '64MB'; SELECT pg_reload_conf()")
-			defer superSQL(t, srcPort, "postgres", "ALTER SYSTEM RESET max_slot_wal_keep_size; SELECT pg_reload_conf()")
+			superSQL(t, srcPort, "postgres", "ALTER SYSTEM SET max_slot_wal_keep_size = '64MB'")
+			superSQL(t, srcPort, "postgres", "SELECT pg_reload_conf()")
+			defer superSQL(t, srcPort, "postgres", "SELECT pg_reload_conf()")
+			defer superSQL(t, srcPort, "postgres", "ALTER SYSTEM RESET max_slot_wal_keep_size")
 			for i := 0; i < 6 && superSQL(t, srcPort, "postgres", "SELECT wal_status FROM pg_replication_slots WHERE slot_name = '"+d.SlotName+"'") != "lost"; i++ {
 				exec1(t, srcConn, db, `INSERT INTO w SELECT g, repeat(md5(g::text), 20) FROM generate_series(100000 * `+fmt.Sprint(i+1)+`, 100000 * `+fmt.Sprint(i+1)+` + 60000) g`)
-				superSQL(t, srcPort, "postgres", "SELECT pg_switch_wal(); CHECKPOINT")
+				superSQL(t, srcPort, "postgres", "SELECT pg_switch_wal()")
+				superSQL(t, srcPort, "postgres", "CHECKPOINT")
 			}
 			st := superSQL(t, srcPort, "postgres", "SELECT wal_status FROM pg_replication_slots WHERE slot_name = '"+d.SlotName+"'")
 			t.Logf("slot %s wal_status %s", d.SlotName, st)
@@ -706,6 +710,15 @@ func TestSnapshotWaitShown(t *testing.T) {
 	})
 	if !hasEvent(t, e, id, "snapshot_wait", fmt.Sprintf("PID %d (batch-report)", pid)) {
 		t.Fatal("no event naming the session the slot creation waits for")
+	}
+	resp, err := e.client.Get(e.Base + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `upwell_snapshot_wait_seconds{database="`+db+`"`) {
+		t.Fatalf("no upwell_snapshot_wait_seconds for %s in /metrics (%d):\n%.3000s", db, resp.StatusCode, body)
 	}
 	if _, err := w.Exec(ctx, "COMMIT"); err != nil {
 		t.Fatal(err)

@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/pagombin/upwell/internal/orch"
 )
 
 // Prometheus exposition (overnight item 5): upwell_* gauges labelled with
@@ -73,6 +76,9 @@ func (s *Server) prometheus(w http.ResponseWriter, r *http.Request) error {
 	freeze := gauge("upwell_write_freeze_applied", "1 while a write freeze is applied on the migration's source.")
 	dbState := gauge("upwell_database_state", "One series per database, with its state.")
 	alerts := gauge("upwell_alerts_firing", "Firing alerts by severity.")
+	snapWait := gauge("upwell_snapshot_wait_seconds", "How long a database's slot creation has waited for open transactions on the source (its base copy cannot start).")
+	waits := s.Orch.SnapshotWaits()
+	now := time.Now().UnixMilli()
 	perDB := []struct {
 		key string
 		m   *promMetric
@@ -142,12 +148,19 @@ func (s *Server) prometheus(w http.ResponseWriter, r *http.Request) error {
 				c.m.add(x, "migration", mig, "scope", c.scope)
 			}
 		}
-		dbs, _ := s.Orch.ListDatabases(ctx, m.ID)
+		dbs, err := s.Orch.ListDatabases(ctx, m.ID)
+		if err != nil {
+			// Not "no databases": a scrape that cannot read them fails.
+			return err
+		}
 		for _, d := range dbs {
 			if !d.Include {
 				continue
 			}
 			dbState.add(1, "migration", mig, "database", d.SourceName, "state", d.State)
+			if w, ok := waits[d.ID]; ok && (d.State == orch.DPreparing || d.State == orch.DBaseCopy) && !d.BaseCopyDone {
+				snapWait.add(float64(now-w.Since)/1000, "migration", mig, "database", d.SourceName)
+			}
 			for _, p := range perDB {
 				if x, ok := s.Orch.LastValue(m.ID, d.SourceName, p.key); ok {
 					p.m.add(x, "migration", mig, "database", d.SourceName)
@@ -172,7 +185,7 @@ func (s *Server) prometheus(w http.ResponseWriter, r *http.Request) error {
 		alerts.add(bySev[sev], "severity", sev)
 	}
 	var b strings.Builder
-	all := []*promMetric{build, migState, verdict, freeze, dbState, alerts}
+	all := []*promMetric{build, migState, verdict, freeze, dbState, alerts, snapWait}
 	for _, p := range perDB {
 		all = append(all, p.m)
 	}
