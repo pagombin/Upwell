@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -528,13 +529,23 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			pending[d.SourceName] = cur
 		}
 		lastNudge := time.Now().Add(-4 * time.Second)
+		lastErr := map[string]error{} // why a heartbeat could not be looked for
 		for len(pending) > 0 {
 			if ctx.Err() != nil {
 				fail("await", cancelReason(op.ID))
 				return
 			}
 			for name, d := range pending {
-				if ok, err := pgpack.HeartbeatOnTarget(bg, dst.WithDB(d.TargetName), d.HBToken); err == nil && ok {
+				ok, err := pgpack.HeartbeatOnTarget(bg, dst.WithDB(d.TargetName), d.HBToken)
+				if err != nil {
+					if lastErr[name] == nil {
+						op.LogDB("warn", name, "looking for the final heartbeat on the target failed (retrying): %v", err)
+					}
+					lastErr[name] = err
+					continue
+				}
+				delete(lastErr, name)
+				if ok {
 					op.LogDB("info", name, "final heartbeat is on the target")
 					delete(pending, name)
 				}
@@ -546,8 +557,12 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			if time.Now().After(deadline) {
 				var names []string
 				for n := range pending {
+					if lastErr[n] != nil {
+						n += " (the target could not be read: " + lastErr[n].Error() + ")"
+					}
 					names = append(names, n)
 				}
+				sort.Strings(names)
 				err := fmt.Errorf("the final heartbeat did not reach the target for %s within %s, so changes may be missing there. End positions were not set and streaming continues; restart the affected databases from zero or investigate the engine logs, then run the cutover again", strings.Join(names, ", "), limit)
 				op.StepEnd("await", "failed", err.Error())
 				for name, d := range pending {

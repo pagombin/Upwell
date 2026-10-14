@@ -36,11 +36,23 @@ type scenario struct {
 	// is called with the database's final state and must accept it.
 	wantGO bool
 	check  func(t *testing.T, e *Env, id, db string)
+	// dstPort, when set, is another target cluster (scenario 16).
+	dstPort int
 }
 
 func runScenario(t *testing.T, plugin string, sc scenario) {
 	e := newEnv(t, "", orch.TestHooks{})
 	db := uniq("it_p1_" + sc.name[:min(len(sc.name), 10)])
+	dst := dstConn
+	if sc.dstPort != 0 {
+		dst.Port = sc.dstPort
+		if c, err := pg.Connect(context.Background(), dst, 5*time.Second); err != nil {
+			t.Skipf("no target cluster on port %d: %v", sc.dstPort, err)
+		} else {
+			c.Close(context.Background())
+		}
+		t.Cleanup(func() { exec1(t, dst, "defaultdb", "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)") })
+	}
 	dropDB(t, db)
 	exec1(t, srcConn, "defaultdb", "CREATE DATABASE "+db)
 	t.Cleanup(func() { dropDB(t, db) })
@@ -49,6 +61,9 @@ func runScenario(t *testing.T, plugin string, sc scenario) {
 		t.Fatal(err)
 	}
 	set := map[string]any{"decoding_plugin": plugin}
+	if sc.dstPort != 0 {
+		set["_target_port"] = sc.dstPort
+	}
 	for k, v := range sc.settings {
 		set[k] = v
 	}
@@ -92,7 +107,7 @@ func runScenario(t *testing.T, plugin string, sc scenario) {
 	time.Sleep(10 * time.Second) // the source's statistics settle before the writers step
 	op := e.startCutover(id)
 	v := e.migration(id).Migration.Flags.Verdict
-	n, diffs := compareDatabase(t, db)
+	n, diffs := compareDatabaseOn(t, srcConn, dst, db)
 	switch {
 	case v == "GO" && len(diffs) > 0:
 		logVerification(t, e, id)
@@ -503,4 +518,132 @@ func TestP1SequencesStreaming(t *testing.T) {
 				t.Fatalf("down_seq: source %s, target %s", s, d)
 			}
 		}})
+}
+
+// 16. PostgreSQL 16 to 18: the row hashes verification compares are computed
+// on each server from the row's text form, so a type that prints differently
+// on 18 would be a false NO-GO, and identical text from different data a
+// false GO. Types whose text form depends on settings or version are
+// streamed; the verdict must be GO with every row compared, and then one
+// changed byte on the target must turn a full re-verification into NO-GO.
+// PostGIS is not installed locally (see PROGRESS, Part 1).
+func TestP1CrossVersionHashing(t *testing.T) {
+	forPlugins(t, scenario{name: "xver", wantGO: true, dstPort: pg18Port,
+		settings: map[string]any{"verify_large_tables": "full"},
+		schema: `CREATE TABLE x(id int PRIMARY KEY, f4 real, f8 float8, n numeric, m money, iv interval, tz timetz, ts timestamptz,
+				j jsonb, js json, x xml, tv tsvector, r int4range, mr int4multirange, tr tstzrange, p point, bx box, pl polygon, c circle,
+				ip inet, cd cidr, mac macaddr8, u uuid, bt bit varying(16), ba bytea, a float8[], o oid, ch char(5), b boolean);
+			INSERT INTO x SELECT g, g / 3.0, g / 7.0, g / 11.0, g * 1.25, make_interval(days => g, secs => g / 9.0), '12:34:56.789+05:30',
+				'2026-03-29 01:30:00+01'::timestamptz + g * interval '17 minutes', jsonb_build_object('k', g, 'f', g / 3.0, 'a', jsonb_build_array(1.0, 'x')),
+				'{"b": 1, "a": [1.10, 2]}', '<a b="1">x</a>', to_tsvector('simple', 'the quick ' || g), int4range(g, g + 10), int4multirange(int4range(1, g + 2), int4range(g + 5, g + 9)),
+				tstzrange('2026-01-01', '2026-01-01'::timestamptz + g * interval '1 hour'), point(g / 3.0, -g), box(point(0, 0), point(g, g / 7.0)), polygon(box(point(0, 0), point(g, 1))),
+				circle(point(g, g), g / 3.0), ('10.0.' || (g % 255) || '.1/24')::inet, '192.168.0.0/16', '08:00:2b:01:02:03:04:05', md5(g::text)::uuid, (g % 65536)::bit(16)::varbit,
+				decode(md5(g::text), 'hex'), ARRAY[g / 3.0, 1e-300, 'NaN', '-Infinity']::float8[], g, 'ab', g % 2 = 0
+			FROM generate_series(1, 3000) g;`,
+		streaming: func(t *testing.T, e *Env, id, db string) func() {
+			exec1(t, srcConn, db, `UPDATE x SET f4 = f4 * 1.1, f8 = 'Infinity', iv = iv * 1.5, m = m + 0.01 WHERE id % 10 = 0;
+				INSERT INTO x(id, f4, f8, n, j, tv) VALUES (100001, 'NaN', '-0', 'NaN', '{"deep": {"x": [null, true, 1e400]}}', '');
+				DELETE FROM x WHERE id % 97 = 0`)
+			return nil
+		},
+		check: func(t *testing.T, e *Env, id, db string) {
+			if f := e.migration(id).Migration.Flags; f.UnverifiedCount != 0 {
+				t.Fatalf("GO not fully verified: %v", f.Unverified)
+			}
+			// One changed byte on the PostgreSQL 18 target: a full re-verification must be NO-GO.
+			dst := dstConn
+			dst.Port = pg18Port
+			exec1(t, dst, db, `UPDATE x SET js = '{"b": 1, "a": [1.10, 3]}' WHERE id = 1500`)
+			var op struct {
+				ID string `json:"operation_id"`
+			}
+			e.do("POST", "/api/v1/migrations/"+id+"/verify", map[string]any{"full": true}, &op, 202)
+			e.waitOp(op.ID, 10*time.Minute)
+			if v := e.migration(id).Migration.Flags.Verdict; v != "NO-GO" {
+				logVerification(t, e, id)
+				t.Fatalf("one changed byte on the 18 target: verdict %s, want NO-GO", v)
+			}
+		}})
+}
+
+// 10-12. A writer with an open transaction through the writers step, a writer
+// resuming after verification, and an Admin override with writes running,
+// under both plugins: never GO, and the independent comparison shows what
+// would have been lost.
+func TestP1WritersUnderBothPlugins(t *testing.T) {
+	cases := []struct {
+		name string
+		f    func(*testing.T)
+	}{
+		{"open_txn", TestWritersOpenTransactionRefused},
+		{"after_verify", TestWritesAfterVerificationNoGo},
+		{"override", TestOverrideWithWritesRunningNoGo},
+	}
+	for _, p := range plugins {
+		for _, c := range cases {
+			p, c := p, c
+			t.Run(p+"/"+c.name, func(t *testing.T) {
+				itPlugin = p
+				defer func() { itPlugin = "" }()
+				c.f(t)
+			})
+		}
+	}
+}
+
+// 14. The final heartbeat never reaches the target (its apply is blocked):
+// NO-GO, streaming continues; once the apply is unblocked the heartbeat
+// arrives after nudges, and a new cutover ends GO with identical data.
+func TestP1HeartbeatNeverThenLate(t *testing.T) {
+	for _, p := range plugins {
+		p := p
+		t.Run(p, func(t *testing.T) {
+			itPlugin = p
+			defer func() { itPlugin = "" }()
+			e := newEnv(t, "", orch.TestHooks{})
+			if _, _, err := e.Orch.SettingsService().Set(context.Background(), "cutover_drain_timeout_seconds", 60, "test"); err != nil {
+				t.Fatal(err)
+			}
+			db := uniq("it_p1_hb")
+			name := "Heartbeat never " + p
+			id := streamingMigration(t, e, name, db)
+			exec1(t, srcConn, db, `INSERT INTO orders(customer, amount, note) SELECT g, g, 'before' FROM generate_series(1, 500) g`)
+			time.Sleep(10 * time.Second)
+			// Block the apply: a session on the target holds the heartbeat table.
+			ctx := context.Background()
+			lk, err := pg.Connect(ctx, dstConn.WithDB(db), time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := lk.Exec(ctx, `BEGIN; LOCK TABLE upwell.heartbeat IN ACCESS EXCLUSIVE MODE`); err != nil {
+				t.Fatal(err)
+			}
+			op := e.cutoverOp(id, map[string]any{"confirm_writers_stopped": true})
+			v := e.migration(id).Migration.Flags.Verdict
+			t.Logf("blocked: operation %s, verdict %q: %.200s", op.State, v, op.Error)
+			if v == "GO" {
+				t.Fatal("GO although the final heartbeat never reached the target")
+			}
+			if !strings.Contains(op.Error, "final heartbeat did not reach the target") {
+				t.Fatalf("the failure does not name the missing heartbeat: %q", op.Error)
+			}
+			lk.Exec(ctx, "ROLLBACK")
+			lk.Close(ctx)
+			// Streaming continued: once unblocked, a new cutover ends GO.
+			e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
+			exec1(t, srcConn, db, `INSERT INTO orders(customer, amount, note) SELECT g, g, 'after' FROM generate_series(1, 500) g`)
+			time.Sleep(10 * time.Second)
+			e.startCutover(id)
+			v = e.migration(id).Migration.Flags.Verdict
+			_, diffs := compareDatabase(t, db)
+			if v == "GO" && len(diffs) > 0 {
+				t.Fatalf("CRITICAL: GO with different data:\n%s", strings.Join(diffs, "\n"))
+			}
+			if v != "GO" {
+				logVerification(t, e, id)
+				t.Fatalf("second cutover: verdict %q, want GO", v)
+			}
+			e.cleanup(id, name)
+		})
+	}
 }

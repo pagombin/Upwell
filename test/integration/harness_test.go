@@ -72,13 +72,13 @@ var dstConn = pg.Conn{Host: "127.0.0.1", Port: dstPort, User: "doadmin", Passwor
 
 // Env is one in-process Upwell with its own store.
 type Env struct {
-	t      *testing.T
-	Dir    string
-	Cfg    config.Config
-	Store  *store.Store
+	t     *testing.T
+	Dir   string
+	Cfg   config.Config
+	Store *store.Store
 	// Base is the server's URL (the in-process server, or an upwell process).
-	Base string
-	proc *upwellProc
+	Base   string
+	proc   *upwellProc
 	Orch   *orch.Orchestrator
 	Srv    *httptest.Server
 	client *http.Client

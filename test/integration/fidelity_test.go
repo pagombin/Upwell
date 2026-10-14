@@ -318,7 +318,12 @@ func sequenceValues(t *testing.T, c pg.Conn, db string) map[string]seqState {
 }
 
 func compareDatabase(t *testing.T, db string) (tables int, mismatches []string) {
-	src, dst := tableFingerprints(t, srcConn, db), tableFingerprints(t, dstConn, db)
+	return compareDatabaseOn(t, srcConn, dstConn, db)
+}
+
+// compareDatabaseOn is compareDatabase between any two clusters.
+func compareDatabaseOn(t *testing.T, srcC, dstC pg.Conn, db string) (tables int, mismatches []string) {
+	src, dst := tableFingerprints(t, srcC, db), tableFingerprints(t, dstC, db)
 	names := make([]string, 0, len(src))
 	for n := range src {
 		names = append(names, n)
@@ -336,7 +341,7 @@ func compareDatabase(t *testing.T, db string) (tables int, mismatches []string) 
 			mismatches = append(mismatches, fmt.Sprintf("%s.%s exists only on the target", db, n))
 		}
 	}
-	ss, ds := sequenceValues(t, srcConn, db), sequenceValues(t, dstConn, db)
+	ss, ds := sequenceValues(t, srcC, db), sequenceValues(t, dstC, db)
 	for n, v := range ss {
 		d, ok := ds[n]
 		// Behind: the target would hand out a value the source already used.

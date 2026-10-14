@@ -19,10 +19,18 @@ import (
 // not see before, fail closed, and verification must end NO-GO if the source
 // changed after the writers step.
 
+// itPlugin, when set, is the decoding plugin streamingMigration uses (Part 1
+// runs the same tests under both).
+var itPlugin string
+
 func streamingMigration(t *testing.T, e *Env, name, db string) string {
 	t.Helper()
 	seedDB(t, db, 3000)
-	id := e.defineMigration(name, []string{db}, nil)
+	var set map[string]any
+	if itPlugin != "" {
+		set = map[string]any{"decoding_plugin": itPlugin}
+	}
+	id := e.defineMigration(name, []string{db}, set)
 	e.preflight(id)
 	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
 	e.waitDBState(id, db, 3*time.Minute, orch.DInSync)
@@ -84,6 +92,7 @@ func TestWritersOpenTransactionRefused(t *testing.T) {
 	if op.State != "failed" || !strings.Contains(op.Error, "open write transaction") {
 		t.Fatalf("the writers step did not name the open write transaction: %s %q", op.State, op.Error)
 	}
+	logIndependent(t, db)
 	e.abortAndClean(id, "Writers open txn")
 }
 
@@ -105,6 +114,7 @@ func TestWritesAfterVerificationNoGo(t *testing.T) {
 	if !blockerWith(t, e, id, "writes_stopped", "changed") {
 		t.Fatal("no writes_stopped blocker naming the change")
 	}
+	logIndependent(t, db)
 	e.abortAndClean(id, "Writes after verify")
 }
 
@@ -145,5 +155,13 @@ func TestOverrideWithWritesRunningNoGo(t *testing.T) {
 	if !blockerWith(t, e, id, "writes_stopped", "Admin overrode") {
 		t.Fatal("NO-GO did not name the overridden writes")
 	}
+	logIndependent(t, db)
 	e.abortAndClean(id, name)
+}
+
+// logIndependent logs what the suite's own comparison finds (Part 1: source
+// and target compared independently of Upwell's verification).
+func logIndependent(t *testing.T, db string) {
+	n, diffs := compareDatabase(t, db)
+	t.Logf("independent comparison: %d tables, %d difference(s) %v", n, len(diffs), diffs)
 }

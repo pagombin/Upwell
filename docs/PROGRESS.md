@@ -9,6 +9,10 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | # | Scenario | Test | Plugin | Result | Fixed |
 | --- | --- | --- | --- | --- | --- |
 | 15 | One changed byte in a table beyond the count limit and budget | `TestVerifyLargeTableOneByte`, `TestVerifyLargeTableFullGO` | pgoutput | pass | D91: full comparison by key range; "GO, not fully verified" |
+| 17 | Unreadable and descending sequences | `TestP1SequencesUnreadableAndDescending` (verification and sync directly), `TestP1SequencesStreaming` | both | pass | the suite's own comparison treated every sequence as ascending (fixed, D92); Upwell already handled both |
+| 18 | Every verification query failing in turn (26 to 30 queries, three verification paths) | `TestP1EveryVerificationQueryFails` | n/a (verification alone) | pass after fix | D92: an unreadable materialized view was a warning (GO); the session's version query was ignored |
+| general | Store unreadable from the drain on | `TestCutoverStoreReadFailureNeverGO` | pgoutput | pass after fix | D93: was GO with the old code (proven by reverting) |
+| general | Cleanup's existence checks failing | `TestEngineCleanupCheckFailureNotSuccess` | n/a | pass after fix | D93: cleanup reported success with the slot left (proven by reverting) |
 
 ## Freeze and verification review; pgcopydb overlapping-transaction loss (2026-10-14), branch `claude/new-session-agkd2d`
 
