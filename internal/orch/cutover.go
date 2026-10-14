@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +45,11 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 	if err != nil {
 		return nil, false, err
 	}
-	dbs, _ := o.ListDatabases(ctx, m.ID)
+	dbs, err := o.ListDatabases(ctx, m.ID)
+	if err != nil {
+		// Not "every database ready" (an empty list would be).
+		return nil, false, err
+	}
 	v := o.Settings(ctx, m)
 	stable := int64(o.globalSettings(ctx).Int("cutover_stable_seconds")) * 1000
 	thr := int64(v.Int("cutover_lag_threshold_mb")) << 20
@@ -150,14 +155,22 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 		}
 		out = append(out, sc)
 	}
-	alerts, _ := o.ListAlerts(ctx, "firing", 100)
+	alerts, aerr := o.ListAlerts(ctx, "firing", 100)
 	crit := 0
 	for _, a := range alerts {
 		if a.Severity == "critical" && (a.MigrationID == m.ID || a.MigrationID == "") {
 			crit++
 		}
 	}
-	out = append(out, Condition{Key: "alerts", Label: "No critical alerts firing", OK: crit == 0, Detail: fmt.Sprintf("%d critical alert(s) firing", crit)})
+	if aerr != nil {
+		// Not "none firing" (fail closed).
+		out = append(out, Condition{Key: "alerts", Label: "No critical alerts firing", OK: false, Detail: "the alerts could not be read: " + aerr.Error()})
+	} else {
+		out = append(out, Condition{Key: "alerts", Label: "No critical alerts firing", OK: crit == 0, Detail: fmt.Sprintf("%d critical alert(s) firing", crit)})
+	}
+	if len(included(dbs)) == 0 {
+		out = append(out, Condition{Key: "databases", Label: "At least one database included", OK: false, Detail: "no database is included in this migration"})
+	}
 	hb := v.Bool("heartbeat")
 	out = append(out, Condition{Key: "heartbeat", Label: "Heartbeat on (proof the last writes arrive)", OK: true, Detail: map[bool]string{true: "On", false: "Off: accepted risk, GO relies on data comparison only"}[hb]})
 	for _, c := range out {
@@ -469,7 +482,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			op.StepEnd("heartbeat", "skipped", "heartbeat is off for this migration (accepted risk)")
 		} else {
 			for _, d := range dbs {
-				cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+				cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+				if gerr != nil {
+					fail("heartbeat", fmt.Errorf("%s: reading its state: %w", d.SourceName, gerr))
+					return
+				}
 				if cur.HBToken != "" {
 					continue
 				}
@@ -504,17 +521,31 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		deadline := time.Now().Add(limit)
 		pending := map[string]Database{}
 		for _, d := range dbs {
-			cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+			cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+			if gerr != nil {
+				fail("await", fmt.Errorf("%s: reading its state: %w", d.SourceName, gerr))
+				return
+			}
 			pending[d.SourceName] = cur
 		}
 		lastNudge := time.Now().Add(-4 * time.Second)
+		lastErr := map[string]error{} // why a heartbeat could not be looked for
 		for len(pending) > 0 {
 			if ctx.Err() != nil {
 				fail("await", cancelReason(op.ID))
 				return
 			}
 			for name, d := range pending {
-				if ok, err := pgpack.HeartbeatOnTarget(bg, dst.WithDB(d.TargetName), d.HBToken); err == nil && ok {
+				ok, err := pgpack.HeartbeatOnTarget(bg, dst.WithDB(d.TargetName), d.HBToken)
+				if err != nil {
+					if lastErr[name] == nil {
+						op.LogDB("warn", name, "looking for the final heartbeat on the target failed (retrying): %v", err)
+					}
+					lastErr[name] = err
+					continue
+				}
+				delete(lastErr, name)
+				if ok {
 					op.LogDB("info", name, "final heartbeat is on the target")
 					delete(pending, name)
 				}
@@ -526,8 +557,12 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			if time.Now().After(deadline) {
 				var names []string
 				for n := range pending {
+					if lastErr[n] != nil {
+						n += " (the target could not be read: " + lastErr[n].Error() + ")"
+					}
 					names = append(names, n)
 				}
+				sort.Strings(names)
 				err := fmt.Errorf("the final heartbeat did not reach the target for %s within %s, so changes may be missing there. End positions were not set and streaming continues; restart the affected databases from zero or investigate the engine logs, then run the cutover again", strings.Join(names, ", "), limit)
 				op.StepEnd("await", "failed", err.Error())
 				for name, d := range pending {
@@ -562,7 +597,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	if !past("endpos") {
 		var notStreaming []string
 		for _, d := range dbs {
-			cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+			cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+			if gerr != nil {
+				fail("endpos", fmt.Errorf("%s: reading its state: %w; no end position was set and streaming continues", d.SourceName, gerr))
+				return
+			}
 			if cur.EndPos == "" && cur.State != DInSync && cur.State != DCatchUp {
 				notStreaming = append(notStreaming, d.SourceName+" ("+Label(cur.State)+")")
 			}
@@ -577,8 +616,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	plans := map[string]engine.RunPlan{}
 	specs := map[string]engine.DatabaseSpec{}
 	for _, d := range dbs {
-		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
-		spec, err := o.dbSpec(bg, m, cur)
+		cur, err := o.GetDatabase(bg, m.ID, d.ID)
+		var spec engine.DatabaseSpec
+		if err == nil {
+			spec, err = o.dbSpec(bg, m, cur)
+		}
 		if err == nil {
 			var plan engine.RunPlan
 			if plan, err = o.eng.Plan(spec, true); err == nil {
@@ -607,7 +649,12 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	o.refreshState(bg, m.ID)
 	op.StepStart("endpos", "")
 	for _, d := range dbs {
-		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+		cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+		if gerr != nil {
+			op.StepEnd("endpos", "failed", fmt.Sprintf("%s: reading its state: %v", d.SourceName, gerr))
+			o.finishCutover(bg, m, op, a, gerr)
+			return
+		}
 		spec, plan := specs[d.ID], plans[d.ID]
 		if cur.EndPos == "" {
 			lsn, err := o.eng.SetEndPosition(bg, plan, spec)
@@ -646,7 +693,16 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	for {
 		go o.Tick(bg)
 		time.Sleep(2 * time.Second)
-		cur, _ := o.ListDatabases(bg, m.ID)
+		cur, lerr := o.cutoverDBs(bg, m.ID)
+		if lerr != nil {
+			// Not "nothing left to drain" (Part 1, fail closed): wait, until the deadline.
+			op.Log("warn", "reading the databases' drain state failed: %v", lerr)
+			if time.Now().After(deadline) {
+				op.StepEnd("drain", "failed", "could not read the databases' drain state: "+lerr.Error())
+				break
+			}
+			continue
+		}
 		drained, broken := 0, []string{}
 		undrained = nil
 		for _, d := range included(cur) {
@@ -704,13 +760,18 @@ func (o *Orchestrator) stopUndrained(ctx context.Context, m Migration, dbs []Dat
 
 // verifyPhase runs the origin check, sequence sync, verification and verdict.
 func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operation, a audit.Actor) {
+	o.updateFlags(ctx, m.ID, func(f *Flags) { f.UnverifiedCount, f.Unverified = 0, nil })
 	src, dst, err := o.Conns(ctx, m)
 	if err != nil {
 		o.finishCutover(ctx, m, op, a, err)
 		return
 	}
 	v := o.Settings(ctx, m)
-	dbs, _ := o.ListDatabases(ctx, m.ID)
+	dbs, lerr := o.cutoverDBs(ctx, m.ID)
+	if lerr != nil {
+		o.finishCutover(ctx, m, op, a, fmt.Errorf("the databases to verify could not be read: %w", lerr))
+		return
+	}
 	inc := included(dbs)
 	offline := v.Str("mode") == "offline"
 	hbOn := v.Bool("heartbeat") && !offline
@@ -784,15 +845,35 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 	op.StepStart("verify", "")
 	runID := op.ID
 	verdicts := map[string]bool{}
+	var unverified []string
 	for i, d := range inc {
 		op.StepDetail("verify", "verifying "+d.SourceName, float64(i)/float64(max(len(inc), 1)))
 		if o.testHooks.BeforeVerify != nil {
 			o.testHooks.BeforeVerify(ctx, d)
 		}
-		cur, _ := o.GetDatabase(ctx, m.ID, d.ID)
+		cur, gerr := o.GetDatabase(ctx, m.ID, d.ID)
+		if gerr != nil {
+			// Never verify against a database row Upwell could not read: its
+			// heartbeat token and positions decide the first checks.
+			cur = d
+			op.LogDB("error", d.SourceName, "reading the database's state before verification failed: %v", gerr)
+		}
+		// D91: tables beyond the checksum budget compared row by row when the
+		// setting (or a "verify fully" request) asks for it; ranges found equal
+		// in this verification are not compared again after an interruption.
+		full := v.Str("verify_large_tables") == "full" || op.Params["full"] == true
+		runKey := d.ID + ":" + cur.HBToken + ":" + cur.EndPos
+		if op.Kind == "verify" {
+			runKey += ":" + op.ID
+		}
+		dbi, ndb := i, len(inc)
 		res, err := pgpack.Verify(ctx, pgpack.VerifyInput{Source: src.WithDB(d.SourceName), Target: dst.WithDB(d.TargetName), TargetMaint: dst, Origin: d.OriginName,
 			HeartbeatRequired: hbOn, Offline: offline, HeartbeatToken: cur.HBToken, HBBeforeLSN: cur.HBBeforeLSN, OriginLSN: cur.OriginLSN,
-			ExactCountMaxBytes: int64(v.Int("exact_count_max_mb")) << 20, ChecksumBudget: time.Duration(v.Int("verify_checksum_budget_seconds")) * time.Second, Database: d.SourceName})
+			ExactCountMaxBytes: int64(v.Int("exact_count_max_mb")) << 20, ChecksumBudget: time.Duration(v.Int("verify_checksum_budget_seconds")) * time.Second, Database: d.SourceName,
+			FullLarge: full, ChunkBytes: int64(v.Int("verify_chunk_mb")) << 20, Workers: v.Int("verify_workers"), Tracker: chunkTracker{o: o, key: runKey},
+			ChunkProgress: func(done, total int, table string) {
+				op.StepDetail("verify", fmt.Sprintf("verifying %s: %s, key range %d of %d", d.SourceName, table, done, total), (float64(dbi)+float64(done)/float64(max(total, 1)))/float64(max(ndb, 1)))
+			}})
 		if err != nil {
 			res.GO = false
 			res.Results = append(res.Results, check.Result{CheckID: "verify_error", Level: check.Blocker, Hard: true, Title: "Verification completed", Message: err.Error(), Database: d.SourceName})
@@ -818,6 +899,15 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 				msg = "The offline copy of this database did not finish."
 			}
 			res.Results = append(res.Results, check.Result{CheckID: "drained", Level: check.Blocker, Hard: true, Title: "Engine reached the end position", Database: d.SourceName, Message: msg})
+		}
+		for _, r := range res.Results {
+			if r.CheckID == "coverage" && r.Level != check.OK {
+				if ev, ok := r.Evidence["not_fully_compared"].([]string); ok {
+					for _, tname := range ev {
+						unverified = append(unverified, d.SourceName+": "+tname)
+					}
+				}
+			}
 		}
 		table := "verifications"
 		if o.testHooks.FailVerificationStore {
@@ -886,14 +976,24 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		}
 	}
 	op.StepEnd("verify", "done", "")
+	// D91: which tables this verdict rests on without a row-by-row comparison.
+	o.updateFlags(ctx, m.ID, func(f *Flags) { f.UnverifiedCount, f.Unverified = len(unverified), limitStrings(unverified, 500) })
 	o.finishCutover(ctx, m, op, a, nil)
 }
 
 // finishCutover computes the verdict from the stored per-database verdicts.
 func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Operation, a audit.Actor, ferr error) {
 	op.StepStart("verdict", "")
-	dbs, _ := o.ListDatabases(ctx, m.ID)
+	dbs, lerr := o.cutoverDBs(ctx, m.ID)
 	goAll := ferr == nil
+	// Fail closed: a verdict over databases that could not be read, or over
+	// none, is never GO.
+	if lerr != nil {
+		goAll = false
+		op.Log("error", "reading the databases' verdicts failed: %v", lerr)
+	} else if len(included(dbs)) == 0 {
+		goAll = false
+	}
 	if cur, err := o.GetMigration(ctx, m.ID); err != nil || cur.Flags.Aborted {
 		goAll = false
 	}
@@ -1016,7 +1116,9 @@ func (o *Orchestrator) AbortCutover(ctx context.Context, a audit.Actor, id strin
 }
 
 // Reverify re-runs the origin check and verification after a drain.
-func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key string) (*Operation, error) {
+// full compares every row of every table, by key range for the large ones
+// (D91), whatever verify_large_tables says.
+func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key string, full bool) (*Operation, error) {
 	cutoverStartMu.Lock()
 	defer cutoverStartMu.Unlock()
 	m, err := o.GetMigration(ctx, id)
@@ -1043,7 +1145,7 @@ func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key stri
 	if offline {
 		steps = steps[1:]
 	}
-	op, err := o.newOp(ctx, m.ID, "verify", key, a.Username, steps, nil)
+	op, err := o.newOp(ctx, m.ID, "verify", key, a.Username, steps, map[string]any{"full": full})
 	if err != nil {
 		return op, err
 	}
@@ -1051,7 +1153,7 @@ func (o *Orchestrator) Reverify(ctx context.Context, a audit.Actor, id, key stri
 	for _, d := range included(dbs) {
 		o.setDB(ctx, d.ID, map[string]any{"verdict": nil})
 	}
-	o.audit.Append(ctx, a, "verify.run", m.ID, nil, map[string]any{"operation": op.ID})
+	o.audit.Append(ctx, a, "verify.run", m.ID, nil, map[string]any{"operation": op.ID, "full": full})
 	go func() {
 		bg := context.Background()
 		o.verifyPhase(bg, m, op, a)
@@ -1150,4 +1252,15 @@ func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, 
 		res.Message = "No row changes on the source since writers were confirmed stopped, and no open write transaction."
 	}
 	return res
+}
+
+// cutoverDBs reads the migration's databases for the cutover's drain,
+// verification and verdict.
+func (o *Orchestrator) cutoverDBs(ctx context.Context, id string) ([]Database, error) {
+	if o.testHooks.CutoverReadErr != nil {
+		if err := o.testHooks.CutoverReadErr(); err != nil {
+			return nil, err
+		}
+	}
+	return o.ListDatabases(ctx, id)
 }

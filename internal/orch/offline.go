@@ -185,7 +185,13 @@ func (o *Orchestrator) offlineWorker(ctx context.Context, m Migration, dbs []Dat
 			o.finishCutover(bg, m, op, a, errors.New("the migration was aborted during the copy"))
 			return
 		}
-		all, _ := o.ListDatabases(bg, m.ID)
+		all, lerr := o.ListDatabases(bg, m.ID)
+		if lerr != nil {
+			// An unreadable state is not "every copy finished" (fail closed).
+			op.Log("warn", "reading the databases' copy state failed: %v", lerr)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 		done, total := 0, 0
 		var broken []string
 		for _, d := range included(all) {

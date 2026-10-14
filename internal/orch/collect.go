@@ -43,6 +43,16 @@ type collector struct {
 	// copyBusy: a read in flight.
 	copyProg map[string]copyProgSample
 	copyBusy map[string]bool
+	// snapWait: a database whose slot creation waits for other sessions'
+	// transactions, so its base copy has not started (D94).
+	snapWait map[string]SnapshotWait
+}
+
+// SnapshotWait is a slot creation waiting for open transactions.
+type SnapshotWait struct {
+	Since    int64                    `json:"since"`
+	At       int64                    `json:"at"`
+	Blockers []pgpack.SnapshotBlocker `json:"blockers"`
 }
 
 // copyProgSample is one read of a database's base-copy progress.
@@ -65,7 +75,7 @@ type prevSample struct {
 }
 
 func newCollector(o *Orchestrator) *collector {
-	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, apply: map[string]applyWatch{}, lastAt: map[string]time.Time{}, copyProg: map[string]copyProgSample{}, copyBusy: map[string]bool{}}
+	return &collector{o: o, series: map[string]int64{}, prev: map[string]prevSample{}, slow: map[string]time.Time{}, hb: map[string]time.Time{}, stale: map[string]int{}, last: map[string]float64{}, drift: map[string]driftSample{}, apply: map[string]applyWatch{}, lastAt: map[string]time.Time{}, copyProg: map[string]copyProgSample{}, copyBusy: map[string]bool{}, snapWait: map[string]SnapshotWait{}}
 }
 
 func (c *collector) seriesID(ctx context.Context, mig, db, name string) int64 {
@@ -161,7 +171,11 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 	defer scn.Close(ctx)
 	c.clearStale(m.ID, "source")
 	var cur string
-	pg.QueryRow(ctx, scn, `SELECT pg_current_wal_lsn()::text`).Scan(&cur)
+	if err := pg.QueryRow(ctx, scn, `SELECT pg_current_wal_lsn()::text`).Scan(&cur); err != nil {
+		// A sample that could not be taken is stale, never zero.
+		c.markStale(ctx, m, "source", err)
+		return
+	}
 	if p, ok := c.prev[m.ID+"|wal"]; ok && cur != "" {
 		dt := now.Sub(p.ts).Seconds()
 		if dt > 0 {
@@ -257,6 +271,11 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 				}
 				s.Close(ctx)
 			}
+		}
+		if (d.State == DBaseCopy || d.State == DPreparing) && !d.BaseCopyDone && c.due(d.ID+"|snapwait", 10*time.Second) {
+			c.snapshotWait(ctx, m, d, scn)
+		} else if d.State != DBaseCopy && d.State != DPreparing || d.BaseCopyDone {
+			c.endSnapshotWait(ctx, m, d)
 		}
 		if d.State == DBaseCopy && c.due(d.ID+"|copyprog", 15*time.Second) {
 			// Off the sampling path and the page's request: on a busy target
@@ -567,6 +586,19 @@ func (o *Orchestrator) LastValue(mig, db, name string) (float64, bool) {
 	return o.metrics.Last(mig, db, name)
 }
 
+// LastValueAt is LastValue with the time the value was sampled.
+func (o *Orchestrator) LastValueAt(mig, db, name string) (float64, time.Time, bool) {
+	return o.metrics.LastAt(mig, db, name)
+}
+
+// StaleSamples is how many samples in a row of one side ("source" or
+// "target") of a migration could not be taken.
+func (o *Orchestrator) StaleSamples(mig, side string) int {
+	o.metrics.mu.Lock()
+	defer o.metrics.mu.Unlock()
+	return o.metrics.stale[mig+"|"+side]
+}
+
 // ---------- alerts
 
 type alerter struct {
@@ -834,6 +866,72 @@ func (c *collector) DriftSample(dbID string) (diff []string, at time.Time, lastE
 	defer c.mu.Unlock()
 	x := c.drift[dbID]
 	return append([]string(nil), x.diff...), x.at, x.err
+}
+
+// snapshotWait records whether the database's slot creation waits for
+// other sessions' transactions, with an event when it starts and ends.
+func (c *collector) snapshotWait(ctx context.Context, m Migration, d Database, scn *pgx.Conn) {
+	waiting, bl, err := pgpack.SlotCreationBlockers(ctx, scn, d.SlotName)
+	if err != nil {
+		c.o.logf("warn", "collector", m.ID, d.SourceName, "", "checking whether the slot creation waits: %v", err)
+		return
+	}
+	now := time.Now().UnixMilli()
+	c.mu.Lock()
+	prev, was := c.snapWait[d.ID]
+	if waiting {
+		since := now
+		if was {
+			since = prev.Since
+		}
+		c.snapWait[d.ID] = SnapshotWait{Since: since, At: now, Blockers: bl}
+	}
+	c.mu.Unlock()
+	switch {
+	case !waiting && was:
+		c.endSnapshotWait(ctx, m, d)
+	case waiting && !was:
+		var names []string
+		for _, b := range bl {
+			names = append(names, snapshotBlockerText(b))
+		}
+		c.o.Event(ctx, m.ID, d.SourceName, "snapshot_wait", "warning", "The base copy cannot start: creating the replication slot waits for open transactions to end: "+strings.Join(names, "; ")+".", map[string]any{"blockers": bl})
+	}
+}
+
+// endSnapshotWait forgets a database's slot-creation wait, with an event.
+func (c *collector) endSnapshotWait(ctx context.Context, m Migration, d Database) {
+	c.mu.Lock()
+	prev, was := c.snapWait[d.ID]
+	delete(c.snapWait, d.ID)
+	c.mu.Unlock()
+	if was {
+		c.o.Event(ctx, m.ID, d.SourceName, "snapshot_wait", "info", fmt.Sprintf("The transactions holding the slot creation ended after %s; the base copy can start.", (time.Duration(time.Now().UnixMilli()-prev.Since)*time.Millisecond).Round(time.Second)), nil)
+	}
+}
+
+func snapshotBlockerText(b pgpack.SnapshotBlocker) string {
+	s := fmt.Sprintf("PID %d", b.PID)
+	if b.App != "" {
+		s += " (" + b.App + ")"
+	}
+	s += fmt.Sprintf(", %s in %s, transaction open %s, %s", b.User, b.Database, time.Duration(b.OpenSeconds)*time.Second, b.State)
+	if b.Client != "" {
+		s += ", from " + b.Client
+	}
+	return s
+}
+
+// SnapshotWaits returns the databases (by ID) whose slot creation waits.
+func (o *Orchestrator) SnapshotWaits() map[string]SnapshotWait {
+	c := o.metrics
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]SnapshotWait, len(c.snapWait))
+	for k, v := range c.snapWait {
+		out[k] = v
+	}
+	return out
 }
 
 // readCopyProgress starts a background read of a database's base-copy

@@ -80,6 +80,17 @@ func (o *Orchestrator) Tick(ctx context.Context) {
 		}
 	}
 	o.runLockJanitor(tctx)
+	// D88: follow cluster address changes (a failover can move a cluster)
+	// and drop the rules of cleaned-up migrations.
+	if o.metrics.due("_host|firewall", 5*time.Minute) {
+		go func() {
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if _, _, err := o.SyncFirewall(fctx); err != nil {
+				o.logf("warn", "orchestrator", "", "", "", "cluster firewall list: %v", err)
+			}
+		}()
+	}
 	t0 := time.Now()
 	o.metrics.hostSample(tctx)
 	if d := time.Since(t0); d > slowestFor {
@@ -196,6 +207,25 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 			}
 			o.afterExit(ctx, m, d, engine.FailTransient, "the engine's main process died")
 			return
+		}
+		// D90: an apply that has applied nothing for a long time while the
+		// source changed is usually waiting on a connection that died on the
+		// way to the target (the droplet: 33 minutes until the engine saw
+		// it). Restart the engine; the next attempt ends the old session on
+		// the target (D89) and continues from the staged changes.
+		if after := o.globalSettings(ctx).Int("apply_stall_restart_seconds"); after > 0 && d.BaseCopyDone && (d.State == DInSync || d.State == DCatchUp) && d.EndPos == "" {
+			if w, ok := o.metrics.ApplyWatch(d.ID); ok && w.Stalled && time.Since(w.OriginChangedAt) >= time.Duration(after)*time.Second {
+				// At most once per window: the restarted engine needs that long
+				// to show progress before it is judged again.
+				if c := m.Flags.Cutover; (c == nil || c.EndedAt != 0) && o.metrics.due(d.ID+"|stall-restart", time.Duration(after)*time.Second) {
+					why := fmt.Sprintf("the target applied nothing for %s while the source changed %d time(s); restarting the engine (a connection to the target may have died without the engine noticing)", time.Since(w.OriginChangedAt).Round(time.Second), w.ChangesSince())
+					o.Event(ctx, m.ID, d.SourceName, "apply_stalled_restart", "warning", d.SourceName+": "+why, map[string]any{"origin": w.Origin, "since": w.OriginChangedAt.UnixMilli()})
+					o.mustStop(ctx, m, d, "apply stalled")
+					o.endAttempt(ctx, d, nil, "apply stalled")
+					o.afterExit(ctx, m, d, engine.FailTransient, why)
+					return
+				}
+			}
 		}
 		if classes.slotLost {
 			o.mustStop(ctx, m, d, "slot lost")

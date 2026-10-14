@@ -6,21 +6,30 @@ import { useApi, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { FreezePreview, FreezeState, Operation, VerificationRow } from "../lib/types";
 import { OpSteps, useOps } from "../components/ops";
+import { StatusSummary, type Summary } from "../components/overview";
 import { Card, ConfirmDialog, Dialog, Empty, ErrorState, LevelPill, Pill, Skeleton, Trunc, useAction } from "../components/ui";
 import { useMig } from "./migration";
 
-interface Cond { key: string; label: string; ok: boolean; detail: string; database?: string }
+interface Cond { key: string; label: string; ok: boolean; detail: string; database?: string; sample_age_ms?: number }
 
-export function Verdict({ verdict, at }: { verdict?: string; at?: number }) {
+export function Verdict({ verdict, at, unverified, unverifiedCount, onVerifyFully }: { verdict?: string; at?: number; unverified?: string[]; unverifiedCount?: number; onVerifyFully?: () => void }) {
   if (!verdict) return null;
   const go = verdict === "GO";
+  // D91: a GO that rests on tables not compared row by row is not shown as a plain GO.
+  const partial = go && (unverifiedCount || 0) > 0;
   return (
-    <div className={`callout ${go ? "ok" : "crit"}`} role="status" data-testid="verdict">
+    <div className={`callout ${!go ? "crit" : partial ? "warn" : "ok"}`} role="status" data-testid="verdict">
       <div className="body">
-        <span className={`verdict ${go ? "go" : "nogo"}`}>{go ? "GO" : "NO-GO"}</span>
-        <span>{go
-          ? "Every database passed: the final heartbeat reached the target, each target origin reached its end position, and the data comparison matched. Applications may switch to the target."
-          : "At least one database failed a data-safety check. Do not switch applications to the target. The source is unchanged; resume writes there and read the failed checks below."}</span>
+        <span className={`verdict ${go ? "go" : "nogo"}${partial ? " partial" : ""}`}>{!go ? "NO-GO" : partial ? "GO, not fully verified" : "GO"}</span>
+        <span>{!go
+          ? "At least one database failed a data-safety check. Do not switch applications to the target. The source is unchanged; resume writes there and read the failed checks below."
+          : partial
+            ? `Every check that ran passed, but ${unverifiedCount} table(s) were not compared row by row (they did not fit in the verification time budget, so they were only counted or checked for size). Verify every table fully before switching applications if those tables matter.`
+            : "Every database passed: the final heartbeat reached the target, each target origin reached its end position, and every row of every table was compared. Applications may switch to the target."}</span>
+        {partial && unverified && unverified.length > 0 && (
+          <details><summary>Tables not compared row by row</summary><ul className="small mono" style={{ margin: "6px 0 0", paddingLeft: 18 }}>{unverified.slice(0, 50).map((t) => <li key={t}>{t}</li>)}{unverified.length > 50 && <li>and {(unverifiedCount || unverified.length) - 50} more (in the report)</li>}</ul></details>
+        )}
+        {partial && onVerifyFully && <div><button onClick={onVerifyFully}>Verify every table fully</button></div>}
         {at && <span className="small muted">Decided {time(at)}</span>}
       </div>
     </div>
@@ -53,6 +62,7 @@ export function CutoverTab() {
   const admin = me?.user.role === "admin";
   const [abort, setAbort] = useState(false);
   const [switched, setSwitched] = useState(false);
+  const [fullVerify, setFullVerify] = useState(false);
   const inc = v.databases.filter((d) => d.include);
   const endposSet = inc.some((d) => d.endpos);
   const pauseStart = c?.writes_stopped_at || c?.started_at;
@@ -71,7 +81,31 @@ export function CutoverTab() {
         {(() => { const st = op.data?.steps.find((x) => x.state === "running"); return st ? ` Cutover step running: ${st.title}.` : ""; })()}
         {m.flags.verdict ? ` Verdict ${m.flags.verdict}.` : ""}
       </div>
-      <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
+      {!m.flags.verdict && !offline && (() => {
+        // The first view: where the cutover stands, what needs doing, what is next.
+        const failing = ready.data?.conditions.filter((x) => !x.ok) || [];
+        const st = op.data?.steps.find((x) => x.state === "running");
+        const idx = st && op.data ? op.data.steps.indexOf(st) + 1 : 0;
+        const sum: Summary = running
+          ? { state: interrupted ? "Cutover interrupted" : `Cutover running${st ? `: ${st.title} (step ${idx} of ${op.data!.steps.length})` : ""}`, tone: interrupted ? "crit" : "warn", actions: [],
+              next: `Writes have been paused for ${duration(pauseMs)} and must stay stopped on the source until the verdict.` }
+          : !ready.data
+            ? { state: ready.error ? "Readiness could not be read" : "Checking readiness…", tone: ready.error ? "crit" : "neutral", actions: [], next: "" }
+            : ready.data.ready
+              ? { state: "Ready for the cutover", tone: "ok", actions: [], next: "When the customer is ready, stop every writer (or use the write freeze) and start the cutover. Writes stay paused until the verdict." }
+              : { state: `Not ready: ${failing.length} of ${ready.data.conditions.length} condition${ready.data.conditions.length === 1 ? "" : "s"} failing`, tone: "warn",
+                  actions: failing.slice(0, 6).map((x) => ({ db: x.database || x.key, to: x.database ? `../databases/${encodeURIComponent(x.database)}` : ".", text: `${x.label}${x.detail ? `: ${x.detail}` : ""}` })),
+                  next: "The cutover can start once every condition passes; they are checked every 5 seconds." };
+        return <StatusSummary s={sum} />;
+      })()}
+      <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} unverified={m.flags.unverified} unverifiedCount={m.flags.unverified_count}
+        onVerifyFully={can("operator") && !m.fixture && !running ? () => setFullVerify(true) : undefined} />
+      {fullVerify && (
+        <ConfirmDialog title="Verify every table fully" confirmLabel="Verify fully" onClose={() => setFullVerify(false)}
+          onConfirm={async () => { const r = await api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/verify`, { full: true }); ops.open(r.operation_id, "Full verification"); view.refresh(); }}>
+          <p>Compares every row of every table, the large ones by key range, several at once. It takes about as long as reading every table on both clusters. Writes must stay stopped on the source: any change since the cutover's writers step ends NO-GO.</p>
+        </ConfirmDialog>
+      )}
       {m.flags.freeze && <FreezeBanner mig={id} f={m.flags.freeze} host={v.source ? `${v.source.host}:${v.source.port}` : ""} go={m.flags.verdict === "GO"} canUndo={can("operator") && !m.fixture} onDone={view.refresh} />}
       {interrupted && (
         <div className="callout crit" role="alert">
@@ -92,7 +126,7 @@ export function CutoverTab() {
               {ready.data.conditions.map((x, i) => (
                 <li key={x.key + (x.database || "") + i} className={x.ok ? "done" : "failed"}>
                   <span className="num" aria-hidden="true">{x.ok ? "✓" : "!"}</span>
-                  <div className="stack" style={{ gap: 2 }}><Trunc>{x.label}</Trunc>{x.detail && <span className="detail">{x.detail}</span>}</div>
+                  <div className="stack" style={{ gap: 2 }}><Trunc>{x.label}</Trunc>{x.detail && <span className="detail">{x.detail}</span>}{x.sample_age_ms !== undefined && <span className={`small ${x.sample_age_ms > 60000 ? "warn-text" : "muted"}`}>sampled {duration(x.sample_age_ms)} ago</span>}</div>
                   <span />
                 </li>
               ))}
@@ -320,17 +354,33 @@ export function VerificationTab() {
   const m = view.data!.migration;
   return (
     <div className="stack" style={{ gap: 24 }}>
-      <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} />
+      <Verdict verdict={m.flags.verdict} at={m.flags.verdict_at} unverified={m.flags.unverified} unverifiedCount={m.flags.unverified_count} />
+      {byDb.length > 0 && (() => {
+        const failed = byDb.filter(([, rows]) => rows.some((r) => r.result === "blocker")).length;
+        const warned = byDb.filter(([, rows]) => !rows.some((r) => r.result === "blocker") && rows.some((r) => r.result === "warning")).length;
+        return <p data-testid="verification-counts"><strong>{byDb.length} database{byDb.length === 1 ? "" : "s"}:</strong> {byDb.length - failed - warned} passed, {warned} passed with warnings, {failed} failed{m.flags.unverified_count ? `; ${m.flags.unverified_count} table(s) not compared row by row` : ""}.</p>;
+      })()}
       <div className="row">
-        <span className="muted" style={{ flex: 1 }}>Upwell never accepts the engine's own success: each database is checked for the final heartbeat, the target origin position, the schema, row counts and row checksums.</span>
-        {can("operator") && !m.fixture && m.flags.verdict && !m.flags.cleaned_up && <button disabled={!!busy} onClick={async () => { const r = await run("v", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/verify`)); if (r) ops.open(r.operation_id, "Verify again"); }}>Verify again</button>}
+        <span className="muted" style={{ flex: 1 }}>Upwell never accepts the engine's own success: each database is checked for the final heartbeat, the target origin position, the schema, row counts and row checksums; with full verification every row of every table is compared.</span>
+        {can("operator") && !m.fixture && m.flags.verdict && !m.flags.cleaned_up && <>
+          <button disabled={!!busy} onClick={async () => { const r = await run("v", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/verify`)); if (r) ops.open(r.operation_id, "Verify again"); }}>Verify again</button>
+          <button disabled={!!busy} onClick={async () => { const r = await run("vf", () => api.post<{ operation_id: string }>(`/api/v1/migrations/${id}/verify`, { full: true })); if (r) ops.open(r.operation_id, "Full verification"); }}>Verify every table fully</button>
+        </>}
       </div>
       {ver.error ? <ErrorState error={ver.error} retry={ver.refresh} /> : !ver.data ? <Skeleton lines={8} /> : byDb.length === 0 ? (
         <Empty title="Not verified yet">Verification runs as part of the cutover, after every database drains to its end position.</Empty>
       ) : byDb.map(([db, rows]) => {
-        const bad = rows.some((r) => r.result === "blocker");
+        const blockers = rows.filter((r) => r.result === "blocker").length;
+        const warnings = rows.filter((r) => r.result === "warning").length;
+        const cov = rows.find((r) => r.check_id === "coverage");
+        const at = Math.max(...rows.map((r) => r.ts));
+        // Never a plain "Passed" over warnings or tables not compared row by row.
+        const pill = blockers ? <Pill kind="crit" text={`Failed: ${blockers} check${blockers === 1 ? "" : "s"}`} />
+          : warnings ? <Pill kind="warn" text={`Passed with ${warnings} warning${warnings === 1 ? "" : "s"}`} /> : <Pill kind="ok" text="Passed" />;
         return (
-          <Card key={db} title={<span className="row" style={{ gap: 8, flexWrap: "nowrap" }}><Trunc className="mono">{db}</Trunc><Pill kind={bad ? "crit" : "ok"} text={bad ? "Failed" : "Passed"} /></span>}>
+          <Card key={db} title={<span className="row" style={{ gap: 8, flexWrap: "nowrap" }}><Trunc className="mono">{db}</Trunc>{pill}</span>}
+            actions={<span className="small muted">Verified {time(at)}</span>}>
+            {cov && <p className={`small ${cov.result === "ok" ? "muted" : "warn-text"}`} data-testid="coverage-line">{cov.result === "ok" ? "Coverage: every row of every table was compared." : `Coverage: ${cov.detail?.message || "not every table was compared row by row."}`}</p>}
             <div className="tablewrap">
               <table className="data" aria-label={`Verification for ${db}`}>
                 <thead><tr><th style={{ width: 150 }}>Result</th><th>Check</th><th>Detail</th><th style={{ width: 100 }}><span className="sr-only">Evidence</span></th></tr></thead>

@@ -22,6 +22,63 @@ import (
 // pooler in front of a DigitalOcean Advanced cluster did on the droplet.
 func startPgBouncer(t *testing.T, mode string, port int) pg.Conn {
 	t.Helper()
+	c, _ := startPgBouncerTo(t, mode, port, dstPort)
+	return c
+}
+
+// bouncer is a running PgBouncer a test can kill, start again, and point at
+// another server (a failover behind a stable address).
+type bouncer struct {
+	t       *testing.T
+	bin     string
+	dir     string
+	mode    string
+	port    int
+	backend int
+}
+
+func (b *bouncer) writeIni() {
+	ini := fmt.Sprintf(`[databases]
+* = host=127.0.0.1 port=%d
+[pgbouncer]
+listen_addr = 127.0.0.1
+listen_port = %d
+auth_type = plain
+auth_file = %s/users.txt
+pool_mode = %s
+unix_socket_dir =
+logfile = %s/pgbouncer.log
+pidfile = %s/pgbouncer.pid
+default_pool_size = 5
+`, b.backend, b.port, b.dir, b.mode, b.dir, b.dir)
+	os.WriteFile(filepath.Join(b.dir, "pgbouncer.ini"), []byte(ini), 0o644)
+	exec.Command("chown", "-R", "postgres", b.dir).Run()
+}
+
+func (b *bouncer) start() {
+	b.t.Helper()
+	b.writeIni()
+	if out, err := exec.Command("runuser", "-u", "postgres", "--", b.bin, "-d", filepath.Join(b.dir, "pgbouncer.ini")).CombinedOutput(); err != nil {
+		b.t.Fatalf("pgbouncer: %v %s", err, out)
+	}
+	time.Sleep(500 * time.Millisecond)
+}
+
+// kill ends PgBouncer with SIGKILL: every client connection drops at once.
+func (b *bouncer) kill() {
+	if raw, err := os.ReadFile(filepath.Join(b.dir, "pgbouncer.pid")); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+			if p, err := os.FindProcess(pid); err == nil {
+				p.Kill()
+			}
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	os.Remove(filepath.Join(b.dir, "pgbouncer.pid"))
+}
+
+func startPgBouncerTo(t *testing.T, mode string, port, backend int) (pg.Conn, *bouncer) {
+	t.Helper()
 	bin, err := exec.LookPath("pgbouncer")
 	if err != nil {
 		t.Skip("pgbouncer is not installed")
@@ -52,38 +109,13 @@ func startPgBouncer(t *testing.T, mode string, port int) pg.Conn {
 		}
 		os.RemoveAll(dir)
 	})
-	ini := fmt.Sprintf(`[databases]
-* = host=127.0.0.1 port=%d
-[pgbouncer]
-listen_addr = 127.0.0.1
-listen_port = %d
-auth_type = plain
-auth_file = %s/users.txt
-pool_mode = %s
-unix_socket_dir =
-logfile = %s/pgbouncer.log
-pidfile = %s/pgbouncer.pid
-default_pool_size = 5
-`, dstPort, port, dir, mode, dir, dir)
-	os.WriteFile(filepath.Join(dir, "pgbouncer.ini"), []byte(ini), 0o644)
 	os.WriteFile(filepath.Join(dir, "users.txt"), []byte(`"doadmin" "`+password+`"`+"\n"), 0o644)
-	exec.Command("chown", "-R", "postgres", dir).Run()
-	if out, err := exec.Command("runuser", "-u", "postgres", "--", bin, "-d", filepath.Join(dir, "pgbouncer.ini")).CombinedOutput(); err != nil {
-		t.Fatalf("pgbouncer: %v %s", err, out)
-	}
-	t.Cleanup(func() {
-		if b, err := os.ReadFile(filepath.Join(dir, "pgbouncer.pid")); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
-				if p, err := os.FindProcess(pid); err == nil {
-					p.Kill()
-				}
-			}
-		}
-	})
+	b := &bouncer{t: t, bin: bin, dir: dir, mode: mode, port: port, backend: backend}
+	b.start()
+	t.Cleanup(b.kill)
 	c := dstConn
 	c.Port = port
-	time.Sleep(500 * time.Millisecond)
-	return c
+	return c, b
 }
 
 func TestPoolerInFront(t *testing.T) {

@@ -3,6 +3,7 @@ package pgpack
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/pagombin/upwell/internal/check"
 	"github.com/pagombin/upwell/internal/pg"
@@ -47,6 +49,20 @@ type Env struct {
 	WorkDir         string
 	Permission      Permission
 	Resuming        bool
+	// Network is the droplet's firewall state for the clusters (D88); nil
+	// when not read (preflight outside Upwell).
+	Network *NetworkPath
+}
+
+// NetworkPath is what the firewall unit applied for this droplet (D88).
+type NetworkPath struct {
+	Liberal    string   // nf_conntrack_tcp_be_liberal, "" when conntrack is not loaded
+	UfwEnabled bool     // ufw is enabled
+	Managed    bool     // the firewall unit is installed
+	Wanted     []string // "ip port" of every cluster
+	Missing    []string // wanted but not (yet) allowed
+	StatusAt   int64
+	Error      string
 }
 
 func cd(id, scope, title, failsAs string) check.Definition {
@@ -59,6 +75,7 @@ var Catalog = []check.Definition{
 	cd("tools", check.ScopeHost, "Engine and client tools installed", "hard"),
 	cd("engine_version", check.ScopeHost, "Engine version supports this migration", "hard"),
 	cd("engine_commit_order", check.ScopeHost, "Engine applies overlapping transactions", "hard"),
+	cd("network_path", check.ScopeHost, "Droplet firewall keeps long connections to the clusters", "acceptable"),
 	cd("client_version", check.ScopeHost, "PostgreSQL client version", "hard"),
 	cd("host_resources", check.ScopeHost, "Droplet size", "warning"),
 	cd("clock_sync", check.ScopeHost, "System clock synchronized", "warning"),
@@ -107,6 +124,7 @@ var Catalog = []check.Definition{
 	cd("dst_extra_objects", check.ScopeDatabase, "Objects only on the target", "warning"),
 	cd("dst_database", check.ScopeDatabase, "Target database", "hard"),
 	cd("extensions", check.ScopeDatabase, "Extensions available on the target", "hard"),
+	cd("xml_support", check.ScopeDatabase, "Target supports xml", "hard"),
 	cd("slot_exists", check.ScopeDatabase, "No leftover replication slot", "hard"),
 	cd("origin_exists", check.ScopeDatabase, "No leftover replication origin", "hard"),
 	cd("publication_exists", check.ScopeDatabase, "No leftover publication", "hard"),
@@ -298,6 +316,7 @@ func (r *Runner) hostChecks(ctx context.Context) {
 			ok(r, "engine_commit_order", "", "", "pgcopydb "+e.EngineVersion+" applies transactions in commit order.", ev, t)
 		}
 	}
+	r.networkCheck()
 	t = time.Now()
 	ncpu := runtime.NumCPU()
 	var si syscall.Sysinfo_t
@@ -925,6 +944,31 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		p.ok(fmt.Sprintf("All %d source extension(s) are available on the target.%s", len(srcExt)-len(providerExt), left), map[string]any{"source": srcExt, "left_out": providerExt})
 	}
 
+	// xml columns need a target built with XML support; without it the
+	// base copy fails only after copying ("unsupported XML feature").
+	p = r.probe(ctx, "xml_support", "", d.Source)
+	xmlCols, xmlN := p.sample(sc, `SELECT format('%I.%I.%I', n.nspname, c.relname, a.attname) FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid
+		WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		  AND 'xml'::regtype IN (t.oid, t.typelem, t.typbasetype)`, 20)
+	if xmlN == 0 {
+		p.ok("No xml columns.", map[string]any{"columns": 0})
+	} else {
+		var s string
+		err := pg.QueryRow(ctx, r.dst, `SELECT '<a/>'::xml::text`).Scan(&s)
+		var pe *pgconn.PgError
+		switch {
+		case errors.As(err, &pe) && pe.Code == "0A000":
+			p.emit(check.Blocker, true, fmt.Sprintf("%d xml column(s) (for example %s), but the target was built without XML support: the base copy would fail on them.", xmlN, xmlCols[0]),
+				"Use a target with XML support, or change those columns to text on the source.", map[string]any{"columns": xmlN, "examples": xmlCols})
+		case err != nil:
+			p.fail(err)
+			p.emit(check.Blocker, true, "", "", map[string]any{"columns": xmlN})
+		default:
+			p.ok(fmt.Sprintf("%d xml column(s); the target supports xml.", xmlN), map[string]any{"columns": xmlN})
+		}
+	}
+
 	for _, x := range []struct {
 		id, what, q string
 		c           *pgx.Conn
@@ -1319,7 +1363,7 @@ var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
 
 // EngineBuildRequired is the pgcopydb build deploy/install.sh makes: the
 // v0.18 tag with the patches in deploy/pgcopydb.
-const EngineBuildRequired = "0.18+upwell.1"
+const EngineBuildRequired = "0.18+upwell.2"
 
 var enginePatchRe = regexp.MustCompile(`\+upwell\.(\d+)`)
 
@@ -1362,4 +1406,31 @@ func collVersionSQL(ver int, db string) string {
 		where = "datname=" + pg.QuoteLiteral(db)
 	}
 	return `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE ` + where + `),'')`
+}
+
+// networkCheck (D88): on the droplet a 300 GB base copy kept losing its
+// connection until conntrack's liberal TCP tracking was on and each
+// cluster's address was allowed through ufw.
+func (r *Runner) networkCheck() {
+	n := r.Env.Network
+	if n == nil {
+		return
+	}
+	t := time.Now()
+	ev := map[string]any{"nf_conntrack_tcp_be_liberal": n.Liberal, "ufw_enabled": n.UfwEnabled, "managed": n.Managed, "clusters": n.Wanted, "missing": n.Missing, "error": n.Error}
+	fix := "Run install.sh again: it sets net.netfilter.nf_conntrack_tcp_be_liberal = 1 and installs upwell-firewall.path, which allows each cluster's address. By hand: sudo sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1, and sudo ufw allow proto tcp from <cluster ip> port <cluster port> for the source and the target."
+	switch {
+	case !n.UfwEnabled:
+		ok(r, "network_path", "", "", "The droplet's firewall (ufw) is not enabled, so it cannot drop the clusters' packets.", ev, t)
+	case n.Liberal != "1":
+		r.emit("network_path", "", "", check.Blocker, false, "The droplet's firewall can cut long connections to the clusters: conntrack marks some packets of a fast stream INVALID and ufw drops them (nf_conntrack_tcp_be_liberal is "+firstNonEmpty(n.Liberal, "not set")+"). A base copy then fails with a closed connection, after hours on a large database.", fix, ev, t)
+	case n.Error != "":
+		r.emit("network_path", "", "", check.Blocker, false, "Upwell could not list the clusters' addresses for the firewall: "+n.Error+".", fix, ev, t)
+	case !n.Managed:
+		r.emit("network_path", "", "", check.Warning, false, "Connection tracking is liberal, but the firewall unit that allows each cluster's address is not installed.", fix, ev, t)
+	case len(n.Missing) > 0:
+		r.emit("network_path", "", "", check.Blocker, false, fmt.Sprintf("The firewall does not yet allow %d cluster address(es): %s (see journalctl -u upwell-firewall).", len(n.Missing), strings.Join(n.Missing, ", ")), fix, ev, t)
+	default:
+		ok(r, "network_path", "", "", fmt.Sprintf("Connection tracking is liberal and the firewall allows the %d cluster address(es): %s.", len(n.Wanted), strings.Join(n.Wanted, ", ")), ev, t)
+	}
 }

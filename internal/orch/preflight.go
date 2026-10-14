@@ -150,7 +150,7 @@ func (o *Orchestrator) preflightWorker(m Migration, op *Operation, runID, fp str
 		o.bus.Publish("migration", "check", m.ID, r)
 	}
 	runner := &pgpack.Runner{Env: pgpack.Env{Source: src, Target: dst, TargetStorageGB: tconn.StorageGB, Databases: pdbs, Settings: o.Settings(ctx, m),
-		EngineVersion: ver, EngineErr: verr, PgBinDir: o.cfg.Engine.PgBinDir, WorkDir: o.cfg.RunsDir(), Permission: pp}, Emit: emit}
+		EngineVersion: ver, EngineErr: verr, PgBinDir: o.cfg.Engine.PgBinDir, WorkDir: o.cfg.RunsDir(), Permission: pp, Network: o.NetworkPath(ctx)}, Emit: emit}
 	runner.Run(ctx)
 	if current != "" {
 		op.StepEnd(current, "done", "")

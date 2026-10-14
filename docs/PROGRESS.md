@@ -1,5 +1,35 @@
 # Upwell overnight build: progress
 
+## Data safety after the base copy (Part 1 to 4 request, 2026-10-14), branch `claude/new-session-agkd2d`
+
+The request names `overnight-build-2`; that branch already exists, holds the earlier audit of 643e4c1 and is merged into `main`, and reusing it would need a force push, so this work continues on `claude/new-session-agkd2d`, which contains it. The audit document itself was not attached; its findings were fixed on `overnight-build-2` (sections below).
+
+### Part 1: scenarios
+
+| # | Scenario | Test | Plugin | Result | Fixed |
+| --- | --- | --- | --- | --- | --- |
+| 15 | One changed byte in a table beyond the count limit and budget | `TestVerifyLargeTableOneByte`, `TestVerifyLargeTableFullGO` | pgoutput | pass | D91: full comparison by key range; "GO, not fully verified" |
+| 17 | Unreadable and descending sequences | `TestP1SequencesUnreadableAndDescending` (verification and sync directly), `TestP1SequencesStreaming` | both | pass | the suite's own comparison treated every sequence as ascending (fixed, D92); Upwell already handled both |
+| 18 | Every verification query failing in turn (26 to 30 queries, three verification paths) | `TestP1EveryVerificationQueryFails` | n/a (verification alone) | pass after fix | D92: an unreadable materialized view was a warning (GO); the session's version query was ignored |
+| general | Store unreadable from the drain on | `TestCutoverStoreReadFailureNeverGO` | pgoutput | pass after fix | D93: was GO with the old code (proven by reverting) |
+| general | Cleanup's existence checks failing | `TestEngineCleanupCheckFailureNotSuccess` | n/a | pass after fix | D93: cleanup reported success with the slot left (proven by reverting) |
+
+### Part 2: enhancements
+
+Out of scope by the request: DigitalOcean API discovery, notifications, SSO, update checks and a self-serve mode.
+
+| Enhancement | Why | Status |
+| --- | --- | --- |
+| Name the sessions a base copy waits for (slot creation held by open transactions) | one idle-in-transaction session anywhere on the source holds the copy back silently; found by the Part 1 run | done (D94): event, migration view, database page, overview "needs attention", `upwell_snapshot_wait_seconds` |
+| Preflight: xml columns on a target without XML support | the base copy failed only after copying (scenario 16) | done (D94) |
+| Resume checks the slot first | a lost slot read "failed (permanent)" instead of "restart from zero" | done (D95) |
+| Await step names why the target could not be read | the failure said only that the heartbeat never arrived | done (D94) |
+| Metrics scrape fails on an unreadable database list | an empty scrape looked like "no databases" | done |
+| Engine patch: apply a REPLICA IDENTITY FULL delete or update to one row only (by ctid) | identical rows in a table without a key are all changed on the target; today this ends NO-GO (scenario 8b) | not done: an engine change on the apply path needs its own review and a long soak; preflight warns and verification catches it |
+| Slot failover for PostgreSQL 17+ sources (`failover = true` slots synced to the standby) | a source failover would no longer force a restart from zero | not done: needs a PostgreSQL 17 source with a standby and pgcopydb support for creating failover slots |
+| Verification ETA for the full comparison | the chunked comparison shows "range i of n" but no time left | not done: low value until measured on a real 300 GB table |
+| Cutover rehearsal (every step up to verification, without end positions) | lets the customer see the write pause in advance | not done: would need a second path through the cutover; risk outweighs value tonight |
+
 ## Freeze and verification review; pgcopydb overlapping-transaction loss (2026-10-14), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |
@@ -19,6 +49,10 @@
 | Logs tab and migration pages (U1 to U13, per-database copy ETA, hosts in the header) | done (D86) | browser suite |
 | Full integration suite with pgcopydb 0.18+upwell.1 (PostgreSQL 14, 15, 16, 18) | pass | 72 passed, 1 skipped (opt-in), 3 failed and fixed (D85: PostgreSQL 14 collation query; two tests' wording and fault), then passed on a rerun |
 | Browser suite (`dev/e2e.sh --update`) | pass | 229 + 4 + 15 passed; screenshots and visual baseline refreshed |
+| `migration_db` base copy failed: "the engine's internal catalog was locked" | fixed in Upwell's build (D87) | `TestBaseCopyCatalogLockHeld`: catalog locked 15 s; upwell.1 failed the copy, upwell.2 reached In sync |
+| Connections cut by the droplet's firewall (conntrack INVALID drops); operator's sysctl and ufw rule made automatic | done (D88) | `TestFirewallHelperRoundTrip`; preflight `network_path`; install.sh |
+| `migration_poc`: "replication origin with ID 2 is already active", resume failing | fixed (D89) | `TestResumeEndsStaleApplySession` reproduces the droplet's error before, streams after |
+| `migration_poc` applied nothing for 33 minutes, then needed several Resume clicks | fixed (D89, D90) | dead connection detected in 2 minutes (`tcp_user_timeout`); stalled apply restarted automatically (`TestApplyStallRestartsEngine`); stale session ended (`TestResumeEndsStaleApplySession`) |
 | How the overall base copy figure is computed with databases of very different sizes | answered | weighted by source size (`overallProgress`); per-database ETA added |
 
 ## Slot held after a failed base copy; crash detection (2026-10-13), branch `claude/new-session-agkd2d`

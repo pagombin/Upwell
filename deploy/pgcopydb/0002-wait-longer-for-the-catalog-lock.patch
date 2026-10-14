@@ -1,0 +1,59 @@
+Subject: [PATCH upwell-2] catalog: wait up to 2 minutes for the SQLite lock
+
+pgcopydb's COPY, index and vacuum workers all record their progress in one
+SQLite catalog. A worker that finds it locked retried for 5 seconds and then
+failed. On the droplet (2026-10-14) an index worker built index 17071 on the
+target, could not record it within 5 s ("database is locked" on
+"update summary set done_time_epoch ..."), and the whole base copy of a
+300 GB database failed. The three retry loops (BEGIN, prepare, step) now wait
+up to 2 minutes.
+
+diff --git a/src/bin/pgcopydb/catalog.c b/src/bin/pgcopydb/catalog.c
+index 4fac961..8d6e810 100644
+--- a/src/bin/pgcopydb/catalog.c
++++ b/src/bin/pgcopydb/catalog.c
+@@ -1968,7 +1968,13 @@ catalog_begin(DatabaseCatalog *catalog, bool immediate)
+ 	{
+ 		ConnectionRetryPolicy retryPolicy = { 0 };
+ 
+-		int maxT = 5;            /* 5s */
++		/*
++		 * Upwell patch (upwell-2): 5 s was too short.  Every COPY, index and
++		 * vacuum worker writes its progress here; on a busy work volume a
++		 * writer can hold the lock longer, and giving up failed a whole base
++		 * copy whose index had been built ("database is locked").
++		 */
++		int maxT = 120;          /* 2 min */
+ 		int maxSleepTime = 350;  /* 350ms */
+ 		int baseSleepTime = 10;  /* 10ms */
+ 
+@@ -10878,7 +10884,13 @@ catalog_sql_prepare(sqlite3 *db, const char *sql, SQLiteQuery *query)
+ 	{
+ 		ConnectionRetryPolicy retryPolicy = { 0 };
+ 
+-		int maxT = 5;            /* 5s */
++		/*
++		 * Upwell patch (upwell-2): 5 s was too short.  Every COPY, index and
++		 * vacuum worker writes its progress here; on a busy work volume a
++		 * writer can hold the lock longer, and giving up failed a whole base
++		 * copy whose index had been built ("database is locked").
++		 */
++		int maxT = 120;          /* 2 min */
+ 		int maxSleepTime = 150;  /* 150ms */
+ 		int baseSleepTime = 10;  /* 10ms */
+ 
+@@ -11167,7 +11179,13 @@ catalog_sql_step(SQLiteQuery *query)
+ 	{
+ 		ConnectionRetryPolicy retryPolicy = { 0 };
+ 
+-		int maxT = 5;            /* 5s */
++		/*
++		 * Upwell patch (upwell-2): 5 s was too short.  Every COPY, index and
++		 * vacuum worker writes its progress here; on a busy work volume a
++		 * writer can hold the lock longer, and giving up failed a whole base
++		 * copy whose index had been built ("database is locked").
++		 */
++		int maxT = 120;          /* 2 min */
+ 		int maxSleepTime = 350;  /* 350ms */
+ 		int baseSleepTime = 10;  /* 10ms */
+ 

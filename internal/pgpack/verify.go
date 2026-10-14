@@ -27,6 +27,13 @@ type VerifyInput struct {
 	ExactCountMaxBytes int64
 	ChecksumBudget     time.Duration
 	Database           string
+	// FullLarge compares every row of the tables that do not fit in the
+	// checksum budget, by key range (D91), instead of counting or sizing them.
+	FullLarge     bool
+	ChunkBytes    int64
+	Workers       int
+	Tracker       ChunkTracker
+	ChunkProgress ChunkProgress
 }
 
 // VerifyResult is one database's verification.
@@ -46,6 +53,9 @@ type tableInfo struct {
 	Bytes   int64
 	Est     int64
 	Columns string
+	// FullNoKey: REPLICA IDENTITY FULL and no unique index, so identical
+	// rows cannot be told apart by the engine's apply.
+	FullNoKey bool
 }
 
 func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) {
@@ -57,7 +67,8 @@ func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) 
 		GREATEST(c.reltuples,0)::bigint,
 		c.relkind::text || '|' || COALESCE((SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod)||CASE WHEN a.attnotnull THEN ' not null' ELSE '' END||
 			CASE WHEN a.attidentity<>'' THEN ' identity '||a.attidentity::text ELSE '' END||CASE WHEN a.attgenerated<>'' THEN ' generated '||COALESCE(pg_get_expr(d.adbin,d.adrelid),'') ELSE '' END,
-			',' ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),'')
+			',' ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),''),
+		c.relreplident = 'f' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisunique AND i.indpred IS NULL)
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND c.relpersistence<>'t' AND n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND NOT c.relispartition`)
 	if err != nil {
@@ -67,7 +78,7 @@ func listTables(ctx context.Context, c *pgx.Conn) (map[string]tableInfo, error) 
 	out := map[string]tableInfo{}
 	for rows.Next() {
 		var t tableInfo
-		if err := rows.Scan(&t.Name, &t.Bytes, &t.Est, &t.Columns); err != nil {
+		if err := rows.Scan(&t.Name, &t.Bytes, &t.Est, &t.Columns, &t.FullNoKey); err != nil {
 			return nil, err
 		}
 		out[t.Name] = t
@@ -121,7 +132,11 @@ func schemaObjects(ctx context.Context, c *pgx.Conn) (map[string]map[string]bool
 func prepareVerifySession(ctx context.Context, c *pgx.Conn) error {
 	stmts := []string{"SET statement_timeout = 0", "SET lock_timeout = 0", "SET idle_in_transaction_session_timeout = 0", "SET row_security = off",
 		"SET TimeZone = 'UTC'", "SET DateStyle = 'ISO, YMD'", "SET IntervalStyle = 'postgres'", "SET extra_float_digits = 3", "SET bytea_output = 'hex'", "SET lc_monetary = 'C'"}
-	if v, err := pg.ServerVersionNum(ctx, c); err == nil && v >= 140000 {
+	v, err := pg.ServerVersionNum(ctx, c)
+	if err != nil {
+		return fmt.Errorf("server version: %w", err)
+	}
+	if v >= 140000 {
 		stmts = append(stmts, "SET idle_session_timeout = 0")
 	}
 	for _, q := range stmts {
@@ -297,6 +312,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	deadline := time.Now().Add(in.ChecksumBudget)
 	var countFail, sumFail, notSummed, estOnly []string
 	exactN, summedN, countDiffSummed := 0, 0, 0
+	var fullList []LargeTable
 	type pair struct {
 		n   int64
 		sum string
@@ -321,7 +337,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			exactN++
 			if a.n != b.n {
 				// Contents not compared: the counts already differ.
-				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)", t.Name, a.n, b.n))
+				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)%s", t.Name, a.n, b.n, fullNoKeyWhy(t)))
 				countDiffSummed++
 			} else {
 				summedN++
@@ -329,6 +345,10 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 					sumFail = append(sumFail, t.Name)
 				}
 			}
+			continue
+		}
+		if in.FullLarge {
+			fullList = append(fullList, LargeTable{Name: t.Name, Bytes: t.Bytes, Est: t.Est})
 			continue
 		}
 		notSummed = append(notSummed, t.Name)
@@ -340,8 +360,10 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			go func() { defer wg.Done(); b.n, b.err = exactCount(ctx, dst, t.Name) }()
 			wg.Wait()
 			exactN++
-			if a.err != nil || b.err != nil || a.n != b.n {
-				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)", t.Name, a.n, b.n))
+			if a.err != nil || b.err != nil {
+				countFail = append(countFail, fmt.Sprintf("%s (could not count: source %v, target %v)", t.Name, a.err, b.err))
+			} else if a.n != b.n {
+				countFail = append(countFail, fmt.Sprintf("%s (source %d, target %d)%s", t.Name, a.n, b.n, fullNoKeyWhy(t)))
 			}
 		} else {
 			estOnly = append(estOnly, t.Name)
@@ -351,6 +373,31 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 			if dtb := dt[t.Name].Bytes; t.Bytes > 0 && dtb*10 < t.Bytes {
 				countFail = append(countFail, fmt.Sprintf("%s (too large to count; %s on the source but only %s on the target)", t.Name, humanBytes(float64(t.Bytes)), humanBytes(float64(dtb))))
 			}
+		}
+	}
+	// D91: the tables beyond the budget, every row, by key range.
+	var fullFail, fullErr, fullOK []string
+	if len(fullList) > 0 {
+		for _, r := range FullCompare(ctx, in.Source, in.Target, fullList, in.ChunkBytes, in.Workers, in.Tracker, in.ChunkProgress) {
+			switch {
+			case r.Err != nil:
+				fullErr = append(fullErr, fmt.Sprintf("%s (%v)", r.Table, r.Err))
+			case len(r.Mismatches) > 0:
+				fullFail = append(fullFail, r.Mismatches...)
+			default:
+				fullOK = append(fullOK, r.Table)
+				exactN++
+				summedN++
+			}
+		}
+		fev := map[string]any{"tables": len(fullList), "compared": limitList(fullOK, 100), "mismatches": limitList(fullFail, 100), "errors": limitList(fullErr, 50)}
+		switch {
+		case len(fullFail) > 0:
+			add(vres("full_compare", db, check.Blocker, "Large tables compared row by row", fmt.Sprintf("%d range(s) differ: %s.", len(fullFail), strings.Join(limitList(fullFail, 5), "; ")), fev))
+		case len(fullErr) > 0:
+			add(vres("full_compare", db, check.Blocker, "Large tables compared row by row", fmt.Sprintf("%d table(s) could not be compared: %s.", len(fullErr), strings.Join(limitList(fullErr, 5), "; ")), fev))
+		default:
+			add(vres("full_compare", db, check.OK, "Large tables compared row by row", fmt.Sprintf("Every row of %d table(s) too large for the checksum window matches, compared by key range.", len(fullOK)), fev))
 		}
 	}
 	ev = map[string]any{"exact": exactN, "mismatches": countFail, "estimated_only": estOnly}
@@ -379,6 +426,14 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	default:
 		add(vres("checksums", db, check.OK, "Row checksums match", fmt.Sprintf("Checksums match for all %d table(s).", summedN), ev))
 	}
+	// D91: how much was compared. A GO with tables whose rows were not all
+	// compared is shown apart from a fully verified GO.
+	cev := map[string]any{"tables": len(tables), "fully_compared": summedN, "not_fully_compared": limitList(notSummed, 500), "counted_only": len(notSummed) - len(estOnly), "size_only": limitList(estOnly, 500)}
+	if len(notSummed) > 0 {
+		add(vres("coverage", db, check.Warning, "Every row compared", fmt.Sprintf("%d of %d table(s) were not compared row by row (%d counted only, %d checked for size only): %s. Run verification with every table compared fully before relying on them.", len(notSummed), len(tables), len(notSummed)-len(estOnly), len(estOnly), strings.Join(limitList(notSummed, 5), ", ")), cev))
+	} else {
+		add(vres("coverage", db, check.OK, "Every row compared", fmt.Sprintf("Every row of all %d table(s) was compared.", len(tables)), cev))
+	}
 
 	// Large objects: logical decoding does not carry them, so changes made
 	// while streaming never reach the target.
@@ -404,27 +459,39 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	if err != nil {
 		add(vres("materialized_views", db, check.Blocker, "Materialized views match", "Could not list materialized views: "+err.Error(), map[string]any{}))
 	} else if len(mvs) > 0 {
-		var refreshed, differ []string
+		var refreshed, differ, unread []string
 		for _, mv := range mvs {
 			if ctx.Err() != nil {
 				return finish(out), ctx.Err()
 			}
 			an, as, e1 := rowsHash(ctx, src, mv)
+			if e1 != nil {
+				// A view that could not be read was not compared: never
+				// "differs" (a warning), always a blocker.
+				unread = append(unread, fmt.Sprintf("%s (source: %v)", mv, e1))
+				continue
+			}
 			bn, bs, e2 := rowsHash(ctx, dst, mv)
-			if e1 == nil && e2 == nil && an == bn && as == bs {
+			if e2 == nil && an == bn && as == bs {
 				continue
 			}
 			if _, err := pg.Exec(ctx, dst, "REFRESH MATERIALIZED VIEW "+mv); err == nil {
 				bn, bs, e2 = rowsHash(ctx, dst, mv)
-				if e1 == nil && e2 == nil && an == bn && as == bs {
+				if e2 == nil && an == bn && as == bs {
 					refreshed = append(refreshed, mv)
 					continue
 				}
 			}
+			if e2 != nil {
+				unread = append(unread, fmt.Sprintf("%s (target: %v)", mv, e2))
+				continue
+			}
 			differ = append(differ, mv)
 		}
-		mev := map[string]any{"views": len(mvs), "refreshed_on_target": refreshed, "different": differ}
+		mev := map[string]any{"views": len(mvs), "refreshed_on_target": refreshed, "different": differ, "unreadable": unread}
 		switch {
+		case len(unread) > 0:
+			add(vres("materialized_views", db, check.Blocker, "Materialized views match", fmt.Sprintf("%d materialized view(s) could not be compared: %s.", len(unread), strings.Join(limitList(unread, 5), "; ")), mev))
 		case len(differ) > 0:
 			add(vres("materialized_views", db, check.Warning, "Materialized views match", fmt.Sprintf("%d materialized view(s) differ even after refreshing them on the target (%s): the source's copy is older than its data. Applications reading them will see fresher results on the target.", len(differ), strings.Join(limitList(differ, 5), ", ")), mev))
 		case len(refreshed) > 0:
@@ -719,4 +786,43 @@ func largeObjects(ctx context.Context, c *pgx.Conn) (loSummary, error) {
 		s.Sum = *sum
 	}
 	return s, err
+}
+
+// EndStaleEngineSessions ends the engine's leftover sessions in the
+// connected target database (D89): pgcopydb names its sessions
+// "pgcopydb[<pid>]". Called only when no engine runs for the database, so
+// any such session of this user there is a previous attempt's, for example
+// an apply whose connection stalled (the droplet, 2026-10-14). Alive, it
+// keeps the replication origin, and every new apply fails with "replication
+// origin with ID n is already active for PID p".
+func EndStaleEngineSessions(ctx context.Context, c *pgx.Conn) ([]string, error) {
+	rows, err := pg.Query(ctx, c, `SELECT pid, application_name, COALESCE(state,''), COALESCE(client_addr::text,'local'), backend_start::text,
+		pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid() AND application_name LIKE 'pgcopydb[%'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var pid int32
+		var app, state, addr, start string
+		var ok bool
+		if err := rows.Scan(&pid, &app, &state, &addr, &start, &ok); err != nil {
+			return out, err
+		}
+		if ok {
+			out = append(out, fmt.Sprintf("pid %d (%s from %s, %s, started %s)", pid, app, addr, state, start))
+		}
+	}
+	return out, rows.Err()
+}
+
+// fullNoKeyWhy names the likely cause of a count difference on a table whose
+// identical rows the engine cannot tell apart (Part 1, scenario 8).
+func fullNoKeyWhy(t tableInfo) string {
+	if !t.FullNoKey {
+		return ""
+	}
+	return ": REPLICA IDENTITY FULL without a unique key, so an UPDATE or DELETE of one of several identical rows was applied to all of them on the target (preflight identity_full_duplicates); add a primary key and restart this database from zero"
 }

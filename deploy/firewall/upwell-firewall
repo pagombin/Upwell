@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# upwell-firewall: run as root by upwell-firewall.service whenever Upwell
+# rewrites /var/lib/upwell/firewall/clusters (upwell-firewall.path), D88.
+#
+# Long, fast PostgreSQL streams (a base copy of hundreds of GB) through ufw
+# lost their connection: conntrack marked out-of-window packets INVALID and
+# ufw drops INVALID packets, so the stream stalled until the cluster or a
+# proxy closed it ("SSL error: unexpected eof"). This keeps
+#   net.netfilter.nf_conntrack_tcp_be_liberal = 1
+# and, for each cluster address Upwell lists, the rule
+#   ufw allow proto tcp from <ip> port <port>
+# (tagged 'upwell cluster'), removing tagged rules no longer listed. Each
+# line of the list is "<ip> <port>"; anything else is ignored. The result is
+# written to /var/lib/upwell/firewall/status for Upwell to show.
+set -uo pipefail
+DIR=${UPWELL_FIREWALL_DIR:-/var/lib/upwell/firewall}
+LIST=$DIR/clusters
+STATUS=$DIR/status
+TAG="upwell cluster"
+out=()
+now=$(date -u +%s)
+
+valid_ip() {
+  local ip=$1
+  if [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+    for o in "${BASH_REMATCH[@]:1}"; do ((10#$o <= 255)) || return 1; done
+    [[ $ip != 0.0.0.0 ]]
+    return
+  fi
+  [[ ${#ip} -le 45 && $ip =~ ^[0-9a-fA-F:]+$ && $ip == *:*:* && $ip != :: ]]
+}
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+
+# 1. conntrack: liberal TCP window tracking (persisted by install.sh in
+#    /etc/sysctl.d; set again here in case the module loaded after boot).
+key=/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal
+[[ -e $key ]] || modprobe nf_conntrack 2>/dev/null || true
+if [[ -e $key ]]; then
+  [[ $(cat $key) == 1 ]] || sysctl -q -w net.netfilter.nf_conntrack_tcp_be_liberal=1 || true
+  out+=("sysctl nf_conntrack_tcp_be_liberal $(cat $key)")
+else
+  out+=("sysctl nf_conntrack_tcp_be_liberal absent")
+fi
+
+# 2. ufw rules for the listed cluster addresses.
+declare -A want=()
+if [[ -r $LIST ]]; then
+  n=0
+  while read -r ip port rest; do
+    ((n++ < 500)) || break
+    [[ -z ${ip:-} || ${ip:0:1} == "#" ]] && continue
+    if [[ -n ${rest:-} ]] || ! valid_ip "$ip" || ! valid_port "${port:-}"; then
+      out+=("invalid ${ip:-?} ${port:-?}")
+      continue
+    fi
+    want["$ip $((10#$port))"]=1
+  done <"$LIST"
+fi
+if ! command -v ufw >/dev/null 2>&1; then
+  out+=("ufw absent")
+elif ! ufw status 2>/dev/null | grep -q 'Status: active'; then
+  out+=("ufw inactive")
+  for k in "${!want[@]}"; do out+=("allowed $k"); done
+else
+  out+=("ufw active")
+  # Tagged rules already there: "ufw allow proto tcp from IP port P comment 'upwell cluster'".
+  declare -A have=()
+  while read -r ip port; do have["$ip $port"]=1; done < <(ufw show added 2>/dev/null | sed -nE "s/^ufw allow proto tcp from ([0-9a-fA-F.:]+) port ([0-9]+) comment '$TAG'\$/\1 \2/p")
+  for k in "${!want[@]}"; do
+    read -r ip port <<<"$k"
+    if [[ -n ${have[$k]:-} ]] || ufw allow proto tcp from "$ip" port "$port" comment "$TAG" >/dev/null 2>&1; then
+      out+=("allowed $ip $port")
+    else
+      out+=("failed $ip $port")
+    fi
+  done
+  for k in "${!have[@]}"; do
+    [[ -n ${want[$k]:-} ]] && continue
+    read -r ip port <<<"$k"
+    ufw delete allow proto tcp from "$ip" port "$port" >/dev/null 2>&1 && out+=("removed $ip $port")
+  done
+fi
+
+tmp=$(mktemp "$DIR/.status.XXXXXX") || exit 1
+{ echo "at $now"; printf '%s\n' "${out[@]}"; } >"$tmp"
+chmod 0644 "$tmp"
+mv -f "$tmp" "$STATUS"

@@ -1020,19 +1020,46 @@ func (s *Server) getMigration(w http.ResponseWriter, r *http.Request) error {
 	live := map[string]map[string]float64{}
 	for _, d := range dbs {
 		vals := map[string]float64{}
-		for _, n := range []string{"replay_rate", "slot_retained_bytes", "slot_headroom_bytes", "slot_active", "slot_wal_status", "heartbeat_latency_s", "target_size_bytes", "source_size_bytes", "log_errors"} {
-			if v, ok := s.Orch.LastValue(m.ID, d.SourceName, n); ok {
+		var newest int64
+		for _, n := range []string{"replay_rate", "slot_retained_bytes", "slot_headroom_bytes", "slot_active", "slot_wal_status", "heartbeat_latency_s", "target_size_bytes", "source_size_bytes", "log_errors", "backlog_bytes"} {
+			if v, at, ok := s.Orch.LastValueAt(m.ID, d.SourceName, n); ok {
 				vals[n] = v
+				ms := at.UnixMilli()
+				if ms > newest {
+					newest = ms
+				}
+				if n == "heartbeat_latency_s" {
+					vals["heartbeat_sampled_at"] = float64(ms)
+				}
 			}
+		}
+		// When this database was last sampled, so the page can show stale values as such.
+		if newest > 0 {
+			vals["sampled_at"] = float64(newest)
 		}
 		live[d.SourceName] = vals
 	}
 	view["live"] = live
+	// Databases whose base copy cannot start: slot creation waits for open
+	// transactions (D94).
+	waits := map[string]orch.SnapshotWait{}
+	sw := s.Orch.SnapshotWaits()
+	for _, d := range dbs {
+		if w, ok := sw[d.ID]; ok && (d.State == orch.DPreparing || d.State == orch.DBaseCopy) && !d.BaseCopyDone {
+			waits[d.SourceName] = w
+		}
+	}
+	view["snapshot_waits"] = waits
 	cl := map[string]float64{}
 	for _, n := range []string{"src_wal_rate", "src_connections", "dst_connections", "src_oldest_xact_s", "src_xmin_age"} {
 		if v, ok := s.Orch.LastValue(m.ID, "", n); ok {
 			cl[n] = v
 		}
+	}
+	cl["source_stale_samples"] = float64(s.Orch.StaleSamples(m.ID, "source"))
+	cl["target_stale_samples"] = float64(s.Orch.StaleSamples(m.ID, "target"))
+	if _, at, ok := s.Orch.LastValueAt(m.ID, "", "src_wal_rate"); ok {
+		cl["sampled_at"] = float64(at.UnixMilli())
 	}
 	view["cluster"] = cl
 	view["now"] = store.Now()
@@ -1298,6 +1325,9 @@ func (s *Server) getDB(w http.ResponseWriter, r *http.Request) error {
 	detail := map[string]any{"migration": m, "database": d, "attempts": attempts, "live": live, "unit": unit, "unit_name": s.Orch.Runner().UnitName(d.Instance), "now": store.Now()}
 	// Active COPY and index builds on the target, read by the collector in
 	// the background every 15 s (D80): the page never waits on the target.
+	if w, ok := s.Orch.SnapshotWaits()[d.ID]; ok && (d.State == orch.DPreparing || d.State == orch.DBaseCopy) && !d.BaseCopyDone {
+		detail["snapshot_wait"] = w
+	}
 	if d.State == orch.DBaseCopy {
 		if p, ok := s.Orch.CopyProgress(d.ID); ok {
 			detail["copy_progress"] = p
@@ -1371,7 +1401,13 @@ func (s *Server) switched(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) error {
-	op, err := s.Orch.Reverify(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"))
+	var in struct {
+		Full bool `json:"full"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	op, err := s.Orch.Reverify(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"), in.Full)
 	return opResponse(w, op, err)
 }
 

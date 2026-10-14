@@ -153,7 +153,7 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute
 <p class="muted">Upwell migration report · generated {{ts .GeneratedAt}}</p>
 <h1>{{.Migration.Name}}</h1>
 <p>Migration <code>{{.Migration.ShortID}}</code> · state {{label .Migration.State}} · verdict
-{{if eq .Migration.Flags.Verdict "GO"}}<span class="badge go">GO</span>{{else if eq .Migration.Flags.Verdict "NO-GO"}}<span class="badge nogo">NO-GO</span>{{else}}<span class="badge pending">no verdict yet</span>{{end}}</p>
+{{if and (eq .Migration.Flags.Verdict "GO") (gt .Migration.Flags.UnverifiedCount 0)}}<span class="badge pending">GO, not fully verified</span>{{else if eq .Migration.Flags.Verdict "GO"}}<span class="badge go">GO</span>{{else if eq .Migration.Flags.Verdict "NO-GO"}}<span class="badge nogo">NO-GO</span>{{else}}<span class="badge pending">no verdict yet</span>{{end}}</p>
 <p class="conf">Customer-confidential: contains database and table names and sizes.</p>
 <h2>Customer permission</h2>
 {{with .Permission}}<table><tr><th>Customer</th><td>{{.Customer}}</td><th>Account</th><td>{{.AccountID}}</td></tr><tr><th>Ticket</th><td>{{.Ticket}}</td><th>Granted by</th><td>{{.GrantedBy}} on {{.GrantedAt}}</td></tr><tr><th>Scope</th><td colspan="3">{{.Scope}}</td></tr></table>{{else}}<p>No permission record.</p>{{end}}
@@ -163,6 +163,9 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute
 {{with .Target}}<tr><th>Target</th><td>{{.Host}}</td><td>{{.Port}}</td><td>{{.User}}</td><td>{{.SSLMode}}</td></tr>{{end}}</table>
 <p class="muted">Engine pgcopydb {{.EngineVersion}} · Upwell {{.AppVersion}}{{with .Migration.Flags.Cutover}} · write pause {{dur .WritePauseMS}}{{end}}</p>
 <h2>Databases</h2>
+{{if gt .Migration.Flags.UnverifiedCount 0}}<h2>Tables not compared row by row</h2>
+<p>The verdict rests on {{.Migration.Flags.UnverifiedCount}} table(s) whose rows were not all compared (they did not fit in the verification time budget, so they were only counted or checked for size). Run "Verify every table fully" to compare them.</p>
+<ul>{{range .Migration.Flags.Unverified}}<li class="mono">{{.}}</li>{{end}}</ul>{{end}}
 <table><tr><th>Source</th><th>Target</th><th>Size</th><th>State</th><th>Verdict</th><th>Plugin</th><th>Final heartbeat after</th><th>Target origin</th></tr>
 {{range .Databases}}{{if .Include}}<tr><td>{{.SourceName}}</td><td>{{.TargetName}}</td><td>{{bytes .SizeBytes}}</td><td>{{label .State}}</td>
 <td>{{if eq .Verdict "GO"}}<span class="badge go">GO</span>{{else if eq .Verdict "NO-GO"}}<span class="badge nogo">NO-GO</span>{{else}}—{{end}}</td><td>{{.Plugin}}</td><td class="mono">{{.HBBeforeLSN}}</td><td class="mono">{{.OriginLSN}}</td></tr>{{end}}{{end}}</table>
@@ -199,12 +202,22 @@ func (r *Report) Markdown() []byte {
 	var b strings.Builder
 	esc := func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "|", "\\|"), "\n", " ") }
 	v := r.Migration.Flags.Verdict
+	if v == "GO" && r.Migration.Flags.UnverifiedCount > 0 {
+		v = fmt.Sprintf("GO, not fully verified (%d table(s) not compared row by row)", r.Migration.Flags.UnverifiedCount)
+	}
 	if v == "" {
 		v = "no verdict yet"
 	}
 	fmt.Fprintf(&b, "# %s\n\nUpwell migration report, generated %s. Migration `%s`, state %s, verdict **%s**.\n\nCustomer-confidential: contains database and table names and sizes.\n\n", r.Migration.Name, ts(r.GeneratedAt), r.Migration.ShortID, orch.Label(r.Migration.State), v)
 	if p := r.Permission; p != nil {
 		fmt.Fprintf(&b, "## Customer permission\n\n- Customer: %s (account %s)\n- Ticket: %s\n- Granted by %s on %s\n- Scope: %s\n\n", p.Customer, p.AccountID, p.Ticket, p.GrantedBy, p.GrantedAt, esc(p.Scope))
+	}
+	if n := r.Migration.Flags.UnverifiedCount; n > 0 {
+		fmt.Fprintf(&b, "## Tables not compared row by row\n\nThe verdict rests on %d table(s) whose rows were not all compared (only counted or checked for size). Run \"Verify every table fully\" to compare them.\n\n", n)
+		for _, t := range r.Migration.Flags.Unverified {
+			fmt.Fprintf(&b, "- `%s`\n", t)
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("## Databases\n\n| Source | Target | Size | State | Verdict |\n| --- | --- | --- | --- | --- |\n")
 	for _, d := range r.Databases {

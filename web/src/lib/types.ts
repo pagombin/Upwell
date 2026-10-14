@@ -2,7 +2,7 @@ export type Role = "viewer" | "operator" | "admin";
 export interface User { id: string; username: string; role: Role; disabled: boolean; last_login_at?: number; created_at: number; totp_enabled?: boolean }
 export interface Flags {
   started?: boolean; paused?: boolean; aborted?: boolean; cleaned_up?: boolean; apps_switched?: boolean;
-  preflight_running?: boolean; preflight_ok?: boolean; preflight_run_id?: string; verdict?: string; verdict_at?: number;
+  preflight_running?: boolean; preflight_ok?: boolean; preflight_run_id?: string; verdict?: string; verdict_at?: number; unverified?: string[]; unverified_count?: number;
   verifying?: boolean; cleanup_running?: boolean; verify_run_id?: string;
   cutover?: { op_id: string; phase: string; started_at: number; writes_stopped_at?: number; ended_at?: number; write_pause_ms?: number; override?: boolean; verdict?: string };
   freeze?: FreezeState;
@@ -35,7 +35,10 @@ export interface MigrationView {
   migration: Migration; databases: Database[]; included: number; state_counts: Record<string, number>; total_bytes: number;
   permission?: Permission | null; source?: Connection; target?: Connection; settings_effective?: Record<string, unknown>;
   preflight?: PreflightRun | null; live?: Record<string, Record<string, number>>; cluster?: Record<string, number>; now?: number;
+  snapshot_waits?: Record<string, SnapshotWait>;
 }
+export interface SnapshotBlocker { pid: number; database: string; user: string; application: string; client: string; state: string; open_seconds: number }
+export interface SnapshotWait { since: number; at: number; blockers: SnapshotBlocker[] }
 export interface CheckResult {
   id: string; check_id: string; version: number; scope: string; database?: string; level: "ok" | "info" | "warning" | "blocker"; hard: boolean;
   title: string; message: string; evidence: Record<string, unknown>; evidence_hash: string; remediation: string; duration_ms: number;
