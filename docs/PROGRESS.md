@@ -17,6 +17,8 @@
 | Pooled 16-connection load through a freeze | pass | `TestWriteFreezeStopsPooledLoad`: no write after the freeze, GO, same rows |
 | Bug hunt: orchestrator O1 to O9, API A1 to A9 | done (D85) | unit tests; full integration suite |
 | Logs tab and migration pages (U1 to U13, per-database copy ETA, hosts in the header) | done (D86) | browser suite |
+| Full integration suite with pgcopydb 0.18+upwell.1 (PostgreSQL 14, 15, 16, 18) | pass | 72 passed, 1 skipped (opt-in), 3 failed and fixed (D85: PostgreSQL 14 collation query; two tests' wording and fault), then passed on a rerun |
+| Browser suite (`dev/e2e.sh --update`) | pass | 229 + 4 + 15 passed; screenshots and visual baseline refreshed |
 | How the overall base copy figure is computed with databases of very different sizes | answered | weighted by source size (`overallProgress`); per-database ETA added |
 
 ## Slot held after a failed base copy; crash detection (2026-10-13), branch `claude/new-session-agkd2d`
