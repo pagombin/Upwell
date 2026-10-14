@@ -281,3 +281,31 @@ test("database page during a base copy: a failed progress read is shown as such"
   await expect(card.getByText("No COPY or index build")).toHaveCount(0);
   await expect(card.getByText(/Read from the target .* ago/)).toBeVisible();
 });
+
+test("logs: older lines, dates, search highlight, error navigation (D86)", async ({ page }) => {
+  const I = await ids(page.request);
+  const day = 24 * 3600e3;
+  const now = Date.now();
+  const line = (seq: number, ts: number) => ({ seq, ts, level: seq % 500 === 0 ? "error" : "info", component: "engine", migration: I.mig, database: I.db, msg: `line ${seq} copying public.orders` });
+  await page.route((u) => u.pathname === "/api/v1/logs", (r) => {
+    const q = new URL(r.request().url()).searchParams;
+    const before = Number(q.get("before") || 0), after = Number(q.get("after") || 0);
+    if (after) return r.fulfill({ json: [] });
+    // Newest 2,000 lines today; the 2,000 before them yesterday.
+    const top = before ? before - 1 : 4000;
+    const out = [];
+    for (let s = top - 1999; s <= top; s++) out.push(line(s, s > 2000 ? now - (4000 - s) * 1000 : now - day - (2000 - s) * 1000));
+    return r.fulfill({ json: out });
+  });
+  await page.route((u) => u.pathname.startsWith("/api/v1/stream/logs"), (r) => r.abort());
+  await page.goto(`/migrations/${I.mig}/logs`);
+  await expect(page.getByText(/^2,000 lines/)).toBeVisible();
+  await page.getByRole("button", { name: "Load older lines" }).click();
+  await expect(page.getByText(/^4,000 lines/)).toBeVisible();
+  // Lines from yesterday carry their date.
+  await expect(page.locator(".logrow").first().locator("span").first()).toHaveText(/^\d{2} \w{3} /);
+  await page.getByRole("button", { name: "Next error line" }).click();
+  await expect(page.locator(".logrow.hl")).toContainText("error");
+  await page.getByLabel("Search messages").fill("orders");
+  await expect(page.locator(".logrow mark").first()).toHaveText("orders");
+});
