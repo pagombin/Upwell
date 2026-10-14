@@ -282,7 +282,14 @@ func tableFingerprints(t *testing.T, c pg.Conn, db string) map[string]string {
 	return out
 }
 
-func sequenceValues(t *testing.T, c pg.Conn, db string) map[string]int64 {
+// seqState is a sequence's last value (its start, one step back, when never
+// called) and its direction.
+type seqState struct {
+	v    int64
+	desc bool
+}
+
+func sequenceValues(t *testing.T, c pg.Conn, db string) map[string]seqState {
 	t.Helper()
 	ctx := context.Background()
 	conn, err := pg.Connect(ctx, c.WithDB(db), time.Minute)
@@ -290,17 +297,22 @@ func sequenceValues(t *testing.T, c pg.Conn, db string) map[string]int64 {
 		t.Fatal(err)
 	}
 	defer conn.Close(ctx)
-	rows, err := conn.Query(ctx, `SELECT sequencename, coalesce(last_value, 0) FROM pg_sequences WHERE schemaname = 'public'`)
+	rows, err := conn.Query(ctx, `SELECT sequencename, coalesce(last_value, start_value - increment_by), increment_by < 0 FROM pg_sequences WHERE schemaname = 'public'`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	out := map[string]int64{}
+	out := map[string]seqState{}
 	for rows.Next() {
 		var n string
-		var v int64
-		rows.Scan(&n, &v)
-		out[n] = v
+		var s seqState
+		if err := rows.Scan(&n, &s.v, &s.desc); err != nil {
+			t.Fatal(err)
+		}
+		out[n] = s
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	return out
 }
@@ -326,8 +338,10 @@ func compareDatabase(t *testing.T, db string) (tables int, mismatches []string) 
 	}
 	ss, ds := sequenceValues(t, srcConn, db), sequenceValues(t, dstConn, db)
 	for n, v := range ss {
-		if ds[n] < v {
-			mismatches = append(mismatches, fmt.Sprintf("%s sequence %s: source %d, target %d", db, n, v, ds[n]))
+		d, ok := ds[n]
+		// Behind: the target would hand out a value the source already used.
+		if !ok || (!v.desc && d.v < v.v) || (v.desc && d.v > v.v) {
+			mismatches = append(mismatches, fmt.Sprintf("%s sequence %s: source %d, target %d (present %v)", db, n, v.v, d.v, ok))
 		}
 	}
 	return len(src), mismatches

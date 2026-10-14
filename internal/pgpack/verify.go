@@ -132,7 +132,11 @@ func schemaObjects(ctx context.Context, c *pgx.Conn) (map[string]map[string]bool
 func prepareVerifySession(ctx context.Context, c *pgx.Conn) error {
 	stmts := []string{"SET statement_timeout = 0", "SET lock_timeout = 0", "SET idle_in_transaction_session_timeout = 0", "SET row_security = off",
 		"SET TimeZone = 'UTC'", "SET DateStyle = 'ISO, YMD'", "SET IntervalStyle = 'postgres'", "SET extra_float_digits = 3", "SET bytea_output = 'hex'", "SET lc_monetary = 'C'"}
-	if v, err := pg.ServerVersionNum(ctx, c); err == nil && v >= 140000 {
+	v, err := pg.ServerVersionNum(ctx, c)
+	if err != nil {
+		return fmt.Errorf("server version: %w", err)
+	}
+	if v >= 140000 {
 		stmts = append(stmts, "SET idle_session_timeout = 0")
 	}
 	for _, q := range stmts {
@@ -455,27 +459,39 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	if err != nil {
 		add(vres("materialized_views", db, check.Blocker, "Materialized views match", "Could not list materialized views: "+err.Error(), map[string]any{}))
 	} else if len(mvs) > 0 {
-		var refreshed, differ []string
+		var refreshed, differ, unread []string
 		for _, mv := range mvs {
 			if ctx.Err() != nil {
 				return finish(out), ctx.Err()
 			}
 			an, as, e1 := rowsHash(ctx, src, mv)
+			if e1 != nil {
+				// A view that could not be read was not compared: never
+				// "differs" (a warning), always a blocker.
+				unread = append(unread, fmt.Sprintf("%s (source: %v)", mv, e1))
+				continue
+			}
 			bn, bs, e2 := rowsHash(ctx, dst, mv)
-			if e1 == nil && e2 == nil && an == bn && as == bs {
+			if e2 == nil && an == bn && as == bs {
 				continue
 			}
 			if _, err := pg.Exec(ctx, dst, "REFRESH MATERIALIZED VIEW "+mv); err == nil {
 				bn, bs, e2 = rowsHash(ctx, dst, mv)
-				if e1 == nil && e2 == nil && an == bn && as == bs {
+				if e2 == nil && an == bn && as == bs {
 					refreshed = append(refreshed, mv)
 					continue
 				}
 			}
+			if e2 != nil {
+				unread = append(unread, fmt.Sprintf("%s (target: %v)", mv, e2))
+				continue
+			}
 			differ = append(differ, mv)
 		}
-		mev := map[string]any{"views": len(mvs), "refreshed_on_target": refreshed, "different": differ}
+		mev := map[string]any{"views": len(mvs), "refreshed_on_target": refreshed, "different": differ, "unreadable": unread}
 		switch {
+		case len(unread) > 0:
+			add(vres("materialized_views", db, check.Blocker, "Materialized views match", fmt.Sprintf("%d materialized view(s) could not be compared: %s.", len(unread), strings.Join(limitList(unread, 5), "; ")), mev))
 		case len(differ) > 0:
 			add(vres("materialized_views", db, check.Warning, "Materialized views match", fmt.Sprintf("%d materialized view(s) differ even after refreshing them on the target (%s): the source's copy is older than its data. Applications reading them will see fresher results on the target.", len(differ), strings.Join(limitList(differ, 5), ", ")), mev))
 		case len(refreshed) > 0:

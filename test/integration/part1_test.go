@@ -484,3 +484,23 @@ func TestP1CutoverRestartAtEveryStep(t *testing.T) {
 		}
 	}
 }
+
+// 17b. Descending and ascending sequences used while streaming: after the
+// cutover neither may be behind on the target (for a descending sequence,
+// behind is a higher value). The comparison is compareDatabase's own.
+func TestP1SequencesStreaming(t *testing.T) {
+	forPlugins(t, scenario{name: "sequences", wantGO: true,
+		schema: `CREATE SEQUENCE down_seq INCREMENT BY -3 MAXVALUE 100000 START WITH 100000;
+			CREATE SEQUENCE up_seq INCREMENT BY 7;
+			CREATE TABLE t(id bigint PRIMARY KEY DEFAULT nextval('down_seq'), u bigint DEFAULT nextval('up_seq'));
+			INSERT INTO t SELECT FROM generate_series(1, 1000);`,
+		streaming: func(t *testing.T, e *Env, id, db string) func() {
+			exec1(t, srcConn, db, `INSERT INTO t SELECT FROM generate_series(1, 500); SELECT nextval('down_seq') FROM generate_series(1, 50)`)
+			return nil
+		},
+		check: func(t *testing.T, e *Env, id, db string) {
+			if s, d := q(t, srcConn, db, "SELECT last_value::text FROM down_seq"), q(t, dstConn, db, "SELECT last_value::text FROM down_seq"); s != d {
+				t.Fatalf("down_seq: source %s, target %s", s, d)
+			}
+		}})
+}
