@@ -11,10 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"path/filepath"
+
 	"github.com/pagombin/upwell/internal/check"
+	"github.com/pagombin/upwell/internal/engine"
+	"github.com/pagombin/upwell/internal/engine/pgcopydb"
 	"github.com/pagombin/upwell/internal/orch"
 	"github.com/pagombin/upwell/internal/pg"
 	"github.com/pagombin/upwell/internal/pgpack"
+	"github.com/pagombin/upwell/internal/runner"
 	"github.com/pagombin/upwell/internal/settings"
 )
 
@@ -113,4 +118,49 @@ func TestCutoverStoreReadFailureNeverGO(t *testing.T) {
 	}
 	failing.Store(false)
 	e.abortAndClean(id, "Store read failure")
+}
+
+// TestEngineCleanupCheckFailureNotSuccess: cleanup checked whether the slot,
+// publication and origin still existed and ignored a failed check, so it
+// read as "already gone" and cleanup reported success with the slot still
+// keeping WAL on the source.
+func TestEngineCleanupCheckFailureNotSuccess(t *testing.T) {
+	db := uniq("it_cleanfail")
+	seedDB(t, db, 10)
+	slot := uniq("upwell_cf_slot")
+	exec1(t, srcConn, db, fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE orders`, slot))
+	exec1(t, srcConn, db, fmt.Sprintf(`SELECT pg_create_physical_replication_slot('%s', true)`, slot))
+	exec1(t, dstConn, "defaultdb", fmt.Sprintf(`SELECT pg_replication_origin_create('%s')`, slot))
+	t.Cleanup(func() {
+		exec1(t, srcConn, db, fmt.Sprintf(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '%s'`, slot))
+		exec1(t, dstConn, "defaultdb", fmt.Sprintf(`SELECT pg_replication_origin_drop(roname) FROM pg_replication_origin WHERE roname = '%s'`, slot))
+	})
+	r, err := runner.New("local", filepath.Join(t.TempDir(), "units"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := pgcopydb.New(envStr("UPWELL_IT_PGCOPYDB", "pgcopydb"), r)
+	spec := engine.DatabaseSpec{MigrationID: "cf", Source: db, Target: db, SourceConn: srcConn, TargetConn: dstConn,
+		Instance: "cf-" + slot, SlotName: slot, OriginName: slot, RunDir: t.TempDir()}
+	ctx := context.Background()
+	for _, what := range []string{"pg_replication_slots", "pg_publication", "pg_replication_origin"} {
+		restore := pg.SetFaultHook(func(sql string) error {
+			if strings.Contains(sql, "count(*) FROM "+what+" WHERE") {
+				return errInjected
+			}
+			return nil
+		})
+		done, err := eng.Cleanup(ctx, spec, engine.CleanupOptions{})
+		restore()
+		if err == nil {
+			t.Fatalf("cleanup reported success although the check on %s failed (did: %v)", what, done)
+		}
+		t.Logf("check on %s failed: cleanup error %q after %v", what, err, done)
+	}
+	if _, err := eng.Cleanup(ctx, spec, engine.CleanupOptions{}); err != nil {
+		t.Fatalf("clean cleanup: %v", err)
+	}
+	if n := q(t, srcConn, db, fmt.Sprintf(`SELECT count(*)::text FROM pg_replication_slots WHERE slot_name = '%s'`, slot)); n != "0" {
+		t.Fatal("slot still present after a successful cleanup")
+	}
 }

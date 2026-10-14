@@ -409,7 +409,7 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		// A failed check is not "already gone": cleanup would report success
 		// with the slot still keeping WAL on the source.
 		var n int
-		if err := src.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&n); err != nil {
+		if err := pg.QueryRow(ctx, src, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&n); err != nil {
 			src.Close(ctx)
 			return done, fmt.Errorf("checking for slot %s: %w", d.SlotName, err)
 		}
@@ -420,7 +420,7 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 			}
 			done = append(done, "dropped slot "+d.SlotName)
 		}
-		if err := src.QueryRow(ctx, `SELECT count(*) FROM pg_publication WHERE pubname=$1`, d.SlotName).Scan(&n); err != nil {
+		if err := pg.QueryRow(ctx, src, `SELECT count(*) FROM pg_publication WHERE pubname=$1`, d.SlotName).Scan(&n); err != nil {
 			src.Close(ctx)
 			return done, fmt.Errorf("checking for publication %s: %w", d.SlotName, err)
 		}
@@ -445,7 +445,7 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		return done, fmt.Errorf("target: %w", err)
 	}
 	var n int
-	if err := dst.QueryRow(ctx, `SELECT count(*) FROM pg_replication_origin WHERE roname=$1`, d.OriginName).Scan(&n); err != nil {
+	if err := pg.QueryRow(ctx, dst, `SELECT count(*) FROM pg_replication_origin WHERE roname=$1`, d.OriginName).Scan(&n); err != nil {
 		dst.Close(ctx)
 		return done, fmt.Errorf("checking for origin %s: %w", d.OriginName, err)
 	}
