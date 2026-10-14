@@ -58,6 +58,7 @@ var Catalog = []check.Definition{
 	cd("customer_permission", check.ScopeMigration, "Customer permission recorded", "hard"),
 	cd("tools", check.ScopeHost, "Engine and client tools installed", "hard"),
 	cd("engine_version", check.ScopeHost, "Engine version supports this migration", "hard"),
+	cd("engine_commit_order", check.ScopeHost, "Engine applies overlapping transactions", "hard"),
 	cd("client_version", check.ScopeHost, "PostgreSQL client version", "hard"),
 	cd("host_resources", check.ScopeHost, "Droplet size", "warning"),
 	cd("clock_sync", check.ScopeHost, "System clock synchronized", "warning"),
@@ -111,6 +112,7 @@ var Catalog = []check.Definition{
 	cd("publication_exists", check.ScopeDatabase, "No leftover publication", "hard"),
 	cd("target_apply_privileges", check.ScopeDatabase, "Target allows the engine to apply changes", "hard"),
 	cd("heartbeat_possible", check.ScopeDatabase, "Heartbeat table can be created", "hard"),
+	cd("source_writable", check.ScopeDatabase, "Source database accepts the engine's writes", "hard"),
 	cd("write_freeze_available", check.ScopeDatabase, "Write freeze available", "info"),
 }
 
@@ -142,8 +144,8 @@ var streamingOnly = map[string]bool{
 	"staging_space": true, "apply_rate": true, "cdc_throughput": true, "wal_level": true, "repl_slots": true, "wal_senders": true,
 	"repl_privilege": true, "prepared_xacts": true, "long_transactions": true, "slot_wal_cap": true, "repl_protocol": true,
 	"publication_privs": true, "replica_identity": true, "identity_full_types": true, "identity_full_duplicates": true,
-	"slot_exists": true, "origin_exists": true, "publication_exists": true, "target_apply_privileges": true, "heartbeat_possible": true,
-	"unlogged_tables": true, "large_objects": true,
+	"slot_exists": true, "origin_exists": true, "publication_exists": true, "target_apply_privileges": true, "heartbeat_possible": true, "source_writable": true,
+	"unlogged_tables": true, "large_objects": true, "engine_commit_order": true,
 }
 
 func (r *Runner) emit(id, scope, db, level string, hard bool, msg, remediation string, ev map[string]any, start time.Time) {
@@ -287,6 +289,13 @@ func (r *Runner) hostChecks(ctx context.Context) {
 			r.emit("engine_version", "", "", check.Blocker, true, "pgcopydb "+e.EngineVersion+" has a known change-apply bug (exit 12) and cannot run online migrations.", "Install pgcopydb 0.18 or later with install.sh.", ev, t)
 		} else {
 			ok(r, "engine_version", "", "", "pgcopydb "+e.EngineVersion+" supports online migrations up to PostgreSQL 18.", ev, t)
+		}
+		ev = map[string]any{"version": e.EngineVersion, "required": EngineBuildRequired}
+		if !EngineCommitOrderFixed(e.EngineVersion) {
+			r.emit("engine_commit_order", "", "", check.Blocker, true, "pgcopydb "+e.EngineVersion+" loses transactions that overlap another one (it takes them in BEGIN order, D84): with concurrent writers, committed changes never reach the target. Online migrations need Upwell's build, "+EngineBuildRequired+".",
+				"Run install.sh again; it builds pgcopydb "+EngineBuildRequired+" from the v0.18 tag with the fixes in deploy/pgcopydb.", ev, t)
+		} else {
+			ok(r, "engine_commit_order", "", "", "pgcopydb "+e.EngineVersion+" applies transactions in commit order.", ev, t)
 		}
 	}
 	t = time.Now()
@@ -810,26 +819,43 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 	p = r.probe(ctx, "collation", "", d.Source)
 	p.fail(baseErr)
 	if exists && p.err == nil {
-		p.row(sc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&srcCollVer)
+		p.row(sc, collVersionSQL(r.srcVer, "")).Scan(&srcCollVer)
 		if tc, err := pg.Connect(ctx, e.Target.WithDB(d.Target), 30*time.Second); err != nil {
 			p.fail(err)
 			p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
 		} else {
-			p.row(tc, `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE datname=current_database()),'')`).Scan(&dstCollVer)
+			p.row(tc, collVersionSQL(r.dstVer, "")).Scan(&dstCollVer)
 			probeS := sortProbe(p, sc)
 			probeT := sortProbe(p, tc)
 			tc.Close(ctx)
 			ev := map[string]any{"source": srcCollate, "target": dstCollate, "source_version": srcCollVer, "target_version": dstCollVer, "sort_match": probeS == probeT}
-			if NormalizeLocale(srcCollate) != NormalizeLocale(dstCollate) || probeS != probeT || (srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer) {
-				p.emit(check.Blocker, false, fmt.Sprintf("Collations differ (source %s, target %s), so text indexes may sort differently.", srcCollate, dstCollate), "Recreate the target database with the source's locale, or accept the risk and reindex text indexes after cutover.", ev)
-			} else {
+			// Say which part differs (D82): the droplet's blocker named two
+			// spellings of one locale and never said the cause.
+			switch {
+			case NormalizeLocale(srcCollate) != NormalizeLocale(dstCollate):
+				p.emit(check.Blocker, false, fmt.Sprintf("Collations differ (source %s, target %s), so text sorts differently on the target.", srcCollate, dstCollate), "Recreate the target database with the source's locale, or accept the risk and review ORDER BY results on text after cutover.", ev)
+			case probeS != probeT:
+				p.emit(check.Blocker, false, fmt.Sprintf("Both databases use %s, but a sample of strings sorts differently (source %s, target %s).", srcCollate, probeS, probeT), "The clusters' collation libraries differ; accept the risk and review ORDER BY results on text after cutover, or use a target with the same library.", ev)
+			case srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer:
+				p.emit(check.Warning, false, collationVersionMessage(srcCollate, srcCollVer, dstCollVer), collationVersionAdvice, ev)
+			default:
 				p.ok("Same collation ("+srcCollate+") and sort order.", ev)
 			}
 		}
 	} else if p.err != nil {
 		p.emit(check.Blocker, false, "", "", map[string]any{"source": srcCollate})
 	} else {
-		p.ok("The target database will be created with collation "+srcCollate+".", map[string]any{"source": srcCollate})
+		// The new database takes template1's collation version (D82).
+		p.row(sc, collVersionSQL(r.srcVer, "")).Scan(&srcCollVer)
+		p.row(r.dst, collVersionSQL(r.dstVer, "template1")).Scan(&dstCollVer)
+		ev := map[string]any{"source": srcCollate, "source_version": srcCollVer, "target_version": dstCollVer}
+		if p.err == nil && srcCollVer != "" && dstCollVer != "" && srcCollVer != dstCollVer {
+			p.emit(check.Warning, false, fmt.Sprintf("The target database will be created with collation %s, but the collation library versions differ (source %s, target %s): a few strings may sort differently on the target; the sort order is compared again once it exists.", srcCollate, srcCollVer, dstCollVer), collationVersionAdvice, ev)
+		} else if p.err != nil {
+			p.emit(check.Blocker, false, "", "", ev)
+		} else {
+			p.ok("The target database will be created with collation "+srcCollate+".", ev)
+		}
 	}
 
 	var tc *pgx.Conn
@@ -930,6 +956,25 @@ func (r *Runner) databaseChecks(ctx context.Context, d DB) {
 		ok(r, "target_apply_privileges", "", d.Source, "The target user can manage replication origins and set session_replication_role.", ap.EvidenceFor(e.Target.User, r.dstVer), t)
 	}
 
+	// A database left read-only for new sessions (a write freeze still
+	// applied, for example after an earlier migration ended GO) refuses the
+	// engine's publication and slot (D83: the droplet's "cannot execute CREATE
+	// PUBLICATION in a read-only transaction").
+	p = r.probe(ctx, "source_writable", "", d.Source)
+	var ro, dbSetting string
+	p.row(sc, sourceReadOnlySQL).Scan(&ro, &dbSetting)
+	ev = map[string]any{"default_transaction_read_only": ro, "database_setting": dbSetting}
+	if readOnlyOn(ro) {
+		why := "its new sessions are read-only (default_transaction_read_only = " + ro + ")"
+		if readOnlyOn(dbSetting) {
+			why = "the database is set read-only for new sessions (ALTER DATABASE ... SET default_transaction_read_only = on), as a write freeze leaves it"
+		}
+		p.emit(check.Blocker, true, "Source database "+d.Source+" refuses writes: "+why+". The engine cannot create its publication and replication slot there.",
+			"If an earlier migration's write freeze is still applied, undo it from that migration's cutover console; otherwise run ALTER DATABASE "+pg.QuoteIdent(d.Source)+" RESET default_transaction_read_only on the source.", ev)
+	} else {
+		p.ok("The source database accepts writes for the engine's publication and slot.", ev)
+	}
+
 	p = r.probe(ctx, "heartbeat_possible", "", d.Source)
 	var canCreate, hbExists bool
 	p.row(sc, `SELECT has_database_privilege(current_database(),'CREATE')`).Scan(&canCreate)
@@ -975,6 +1020,14 @@ func limitList(s []string, n int) []string {
 		return s[:n]
 	}
 	return s
+}
+
+// collationVersionAdvice: indexes are built on the target by the engine, so
+// they match the target's library; only result order can differ.
+const collationVersionAdvice = "No action is needed for the copy: the engine builds every index on the target, so indexes match the target's library. If exact text order matters to the applications, compare ORDER BY results on text columns after cutover."
+
+func collationVersionMessage(locale, src, dst string) string {
+	return fmt.Sprintf("Both use %s and a sample of strings sorts the same, but the collation library versions differ (source %s, target %s): a few strings may sort differently on the target.", locale, src, dst)
 }
 
 func sortProbe(p *probe, c *pgx.Conn) string {
@@ -1264,6 +1317,24 @@ func settingMillis(v string) int64 {
 
 var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
 
+// EngineBuildRequired is the pgcopydb build deploy/install.sh makes: the
+// v0.18 tag with the patches in deploy/pgcopydb.
+const EngineBuildRequired = "0.18+upwell.1"
+
+var enginePatchRe = regexp.MustCompile(`\+upwell\.(\d+)`)
+
+// EngineCommitOrderFixed reports whether a pgcopydb version is Upwell's
+// build with the commit-order fix (D84): upstream 0.18 and its main branch
+// skip transactions whose BEGIN precedes the previous one's COMMIT.
+func EngineCommitOrderFixed(v string) bool {
+	m := enginePatchRe.FindStringSubmatch(v)
+	if m == nil {
+		return false
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n >= 1
+}
+
 // EngineMajorMinor reads the leading major.minor of a pgcopydb version as
 // packages report it: "0.18", "0.18.1", or the PGDG package's
 // "0.18-1.pgdg24.04+1" (the Debian revision after the dash is not part of
@@ -1276,4 +1347,19 @@ func EngineMajorMinor(v string) (major, minor int, ok bool) {
 	major, _ = strconv.Atoi(m[1])
 	minor, _ = strconv.Atoi(m[2])
 	return major, minor, true
+}
+
+// collVersionSQL reads a database's collation version (the current one when
+// db is ""). pg_database.datcollversion exists from PostgreSQL 15; before
+// that there is nothing to compare, so the version reads empty (D82 failed
+// preflight on a PostgreSQL 14 source).
+func collVersionSQL(ver int, db string) string {
+	if ver > 0 && ver < 150000 {
+		return `SELECT ''`
+	}
+	where := "datname=current_database()"
+	if db != "" {
+		where = "datname=" + pg.QuoteLiteral(db)
+	}
+	return `SELECT COALESCE((SELECT datcollversion FROM pg_database WHERE ` + where + `),'')`
 }

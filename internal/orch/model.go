@@ -184,10 +184,12 @@ type Database struct {
 	AutoRestarts int    `json:"auto_restarts"`
 	// WritesBaseline is the source's row-change counter when the writers
 	// step confirmed writes stopped (nil until then).
-	WritesBaseline *int64  `json:"writes_baseline,omitempty"`
-	CreatedAt      int64   `json:"created_at"`
-	UpdatedAt      int64   `json:"updated_at"`
-	Progress       float64 `json:"progress,omitempty"`
+	WritesBaseline *int64 `json:"writes_baseline,omitempty"`
+	// WritesFingerprint covers the writes the counter cannot see (D83).
+	WritesFingerprint string  `json:"-"`
+	CreatedAt         int64   `json:"created_at"`
+	UpdatedAt         int64   `json:"updated_at"`
+	Progress          float64 `json:"progress,omitempty"`
 }
 
 var shortSafe = regexp.MustCompile(`[^a-z0-9_]`)
@@ -305,7 +307,7 @@ func (o *Orchestrator) updateFlags(ctx context.Context, id string, fn func(*Flag
 const dbCols = `id, migration_id, source_name, target_name, include, COALESCE(skip_reason,''), state, slot_name, origin_name, COALESCE(plugin,''), instance,
 	COALESCE(size_bytes,0), COALESCE(rows_estimate,0), COALESCE(table_count,0), COALESCE(last_error,''), COALESCE(error_class,''), in_sync_since, backlog_bytes,
 	COALESCE(replay_lsn,''), COALESCE(write_lsn,''), COALESCE(hb_before_lsn,''), COALESCE(hb_token,''), COALESCE(endpos,''), COALESCE(origin_lsn,''), COALESCE(verdict,''),
-	retry_count, retry_window_start, next_retry_at, base_copy_done, created_at, updated_at, drained, auto_restarts, writes_baseline`
+	retry_count, retry_window_start, next_retry_at, base_copy_done, created_at, updated_at, drained, auto_restarts, writes_baseline, COALESCE(writes_fingerprint,'')`
 
 func scanDB(row interface{ Scan(...any) error }) (Database, error) {
 	var d Database
@@ -313,7 +315,7 @@ func scanDB(row interface{ Scan(...any) error }) (Database, error) {
 	err := row.Scan(&d.ID, &d.MigrationID, &d.SourceName, &d.TargetName, &d.Include, &d.SkipReason, &d.State, &d.SlotName, &d.OriginName, &d.Plugin, &d.Instance,
 		&d.SizeBytes, &d.RowsEstimate, &d.TableCount, &d.LastError, &d.ErrorClass, &inSync, &backlog,
 		&d.ReplayLSN, &d.WriteLSN, &d.HBBeforeLSN, &d.HBToken, &d.EndPos, &d.OriginLSN, &d.Verdict,
-		&d.RetryCount, &rw, &next, &d.BaseCopyDone, &d.CreatedAt, &d.UpdatedAt, &d.Drained, &d.AutoRestarts, &d.WritesBaseline)
+		&d.RetryCount, &rw, &next, &d.BaseCopyDone, &d.CreatedAt, &d.UpdatedAt, &d.Drained, &d.AutoRestarts, &d.WritesBaseline, &d.WritesFingerprint)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, store.ErrNotFound
 	}

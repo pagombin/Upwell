@@ -381,7 +381,7 @@ function TLSSection() {
   const [check, setCheck] = useState<CertCheck | null>(null);
   const [err, setErr] = useState<Error>();
   const [confirm, setConfirm] = useState<"install" | "rollback" | null>(null);
-  const { run, busy } = useAction();
+  const { must, busy } = useAction();
   const load = (k: "cert" | "key" | "chain") => async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) { setF((x) => ({ ...x, [k]: "" })); const t = await file.text(); setF((x) => ({ ...x, [k]: t })); setCheck(null); }
@@ -418,8 +418,8 @@ function TLSSection() {
           {err && <ErrorState error={err} />}
         </div>
       )}
-      {confirm === "install" && <ConfirmDialog title="Install this certificate" confirmLabel="Install" onClose={() => setConfirm(null)} onConfirm={async () => { await run("tls", () => api.post("/api/v1/tls/certificate", f), "Certificate installed"); setF({ cert: "", key: "", chain: "" }); setCheck(null); info.refresh(); }}><p>New connections get the new certificate at once; the current one is kept so you can roll back. Recorded in the audit log.</p></ConfirmDialog>}
-      {confirm === "rollback" && <ConfirmDialog title="Roll back the certificate" confirmLabel="Roll back" onClose={() => setConfirm(null)} onConfirm={async () => { await run("tlsrb", () => api.post("/api/v1/tls/rollback"), "Previous certificate restored"); info.refresh(); }}><p>New connections get the previous certificate again; the current one becomes the previous one.</p></ConfirmDialog>}
+      {confirm === "install" && <ConfirmDialog title="Install this certificate" confirmLabel="Install" onClose={() => setConfirm(null)} onConfirm={async () => { await must("tls", () => api.post("/api/v1/tls/certificate", f), "Certificate installed"); setF({ cert: "", key: "", chain: "" }); setCheck(null); info.refresh(); }}><p>New connections get the new certificate at once; the current one is kept so you can roll back. Recorded in the audit log.</p></ConfirmDialog>}
+      {confirm === "rollback" && <ConfirmDialog title="Roll back the certificate" confirmLabel="Roll back" onClose={() => setConfirm(null)} onConfirm={async () => { await must("tlsrb", () => api.post("/api/v1/tls/rollback"), "Previous certificate restored"); info.refresh(); }}><p>New connections get the previous certificate again; the current one becomes the previous one.</p></ConfirmDialog>}
     </Card>
   );
 }

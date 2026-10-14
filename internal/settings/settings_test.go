@@ -64,3 +64,13 @@ func TestAutoSplit(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateSplitSize(t *testing.T) {
+	for in, ok := range map[string]bool{"auto": true, "AUTO": true, "off": true, "50GB": true, "512MB": true, "1TB": true,
+		"": false, "50": false, "50 GB": false, "abc": false, "0GB": false, "-1GB": false, "50gb": false} {
+		_, err := Validate("split_tables_larger_than", in)
+		if (err == nil) != ok {
+			t.Errorf("Validate(%q): err %v, want ok=%v", in, err, ok)
+		}
+	}
+}

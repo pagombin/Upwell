@@ -1,6 +1,6 @@
 import { api } from "../lib/api";
 import { Link } from "react-router-dom";
-import { copyEtaMs, LIFECYCLE, lifecycleIndex, overallProgress, readyForCutover } from "../lib/derive";
+import { copyEtaMs, LIFECYCLE, lifecycleBad, lifecycleIndex, overallProgress, readyForCutover } from "../lib/derive";
 import { ago, bytes, duration, pct, time } from "../lib/format";
 import { useApi, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
@@ -46,7 +46,7 @@ function ActiveCard({ id, alerts }: { id: string; alerts: Alert[] }) {
   return (
     <Card title={<Link to={`/migrations/${m.short_id}`}><Trunc>{m.name}</Trunc></Link>} id={`active-mig-${m.short_id}`} actions={<><StaleBadge updatedAt={v.updatedAt} now={now} /><Pill state={m.state} /></>}>
       <div className="stack">
-        <Stepper index={lifecycleIndex(d)} bad={m.state === "needs_attention"} />
+        <Stepper index={lifecycleIndex(d)} bad={lifecycleBad(d)} />
         <div className="grid cols-4">
           <Tile label="Base copy" value={pct(prog * 100)} sub={<ProgressBar value={prog} label="Base copy progress" />} />
           <Tile label="Copy ETA" value={eta ? duration(eta) : prog >= 1 ? "Done" : "—"} sub={eta ? `at ${time(now + eta, false)}` : "Estimated from target growth"} />

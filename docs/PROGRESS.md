@@ -1,5 +1,35 @@
 # Upwell overnight build: progress
 
+## Freeze and verification review; pgcopydb overlapping-transaction loss (2026-10-14), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| "Writes frozen" while sysbench kept running | explained | sysbench targeted another cluster (`aiven-30g-small-…`), not the migration's source (`standard-migration-poc-cluster-…`) |
+| pgcopydb lost transactions that overlapped another one (upstream 0.18 and main) | fixed in Upwell's build (D84) | `TestOverlappingTransactionsReachTarget`: unfixed engine 10 of 20 rows and NO-GO; fixed 20 of 20 and GO |
+| Installer builds pgcopydb 0.18+upwell.1; online migrations refuse other builds | done (D84) | `TestEngineCommitOrderFixed`; preflight `engine_commit_order`; launch check |
+| Role settings overrode the freeze (F1) | done (D83) | `TestWriteFreezeRoleOverride` |
+| Prepared transactions invisible to the writes checks (F2) | done (D83) | `TestPreparedTransactionStopsCutover` |
+| TRUNCATE, rewrites, setval, large objects invisible; final resample of every database (F3) | done (D83) | `TestInvisibleWritesAfterVerificationNoGo` |
+| Unreadable sequence read as unused (F4); checksum wording for count mismatches | done (D83) | unit tests; review |
+| Janitor undo after GO (F5), abort racing end positions (F6), prior setting on a second freeze (F7) | done (D83) | check-and-set under the freeze and flag locks |
+| Source left read-only by an earlier GO broke the next copy (F9, the droplet's `migration_poc`) | done (D83) | `TestReadOnlySourceBlocked` |
+| Sessions the freeze could not end only in the operation log (F10) | done (D83) | event with their names |
+| Pooled 16-connection load through a freeze | pass | `TestWriteFreezeStopsPooledLoad`: no write after the freeze, GO, same rows |
+| Bug hunt: orchestrator O1 to O9, API A1 to A9 | done (D85) | unit tests; full integration suite |
+| Logs tab and migration pages (U1 to U13, per-database copy ETA, hosts in the header) | done (D86) | browser suite |
+| Full integration suite with pgcopydb 0.18+upwell.1 (PostgreSQL 14, 15, 16, 18) | pass | 72 passed, 1 skipped (opt-in), 3 failed and fixed (D85: PostgreSQL 14 collation query; two tests' wording and fault), then passed on a rerun |
+| Browser suite (`dev/e2e.sh --update`) | pass | 229 + 4 + 15 passed; screenshots and visual baseline refreshed |
+| How the overall base copy figure is computed with databases of very different sizes | answered | weighted by source size (`overallProgress`); per-database ETA added |
+
+## Slot held after a failed base copy; crash detection (2026-10-13), branch `claude/new-session-agkd2d`
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| A failed base copy kept its slot (74.4 GiB of source WAL on the droplet) until Restart from zero | done (D81) | the three `TestBaseCopyTarget*` tests: slot still there after 2 minutes before, dropped after |
+| A crashed or killed server process was reported as "did not restart" | done (D81) | `TestBaseCopyTargetBackendCrashed` failed before, passes |
+| Preflight blocked on "Collations differ (en_US.UTF-8, en_US.utf-8)": the cause was the collation library version, not named, and unchecked when Upwell creates the database | done (D82) | `TestCollationVersionDifferenceWarns` |
+| Why the target closed the connection on the droplet (now 3 h 34 min in, `public.order_line5`) | needs the target's logs | see the diagnosis prompt given to the operator |
+
 ## Base copy progress empty while the copy ran (2026-10-13), branch `claude/new-session-agkd2d`
 
 | Item | Status | Evidence |

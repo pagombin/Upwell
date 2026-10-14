@@ -124,7 +124,7 @@ setup_token_file: $DATA/setup-token
 dev: true
 engine:
   runner: local
-  pgcopydb: /usr/local/bin/pgcopydb
+  pgcopydb: ${UPWELL_PGCOPYDB:-/usr/local/bin/pgcopydb}
   pg_bin_dir: /usr/lib/postgresql/16/bin
 EOF
 UPWELL_LOG_STDERR=1 setsid $BIN serve --config $DATA/config.yaml >>$DATA/serve.log 2>&1 < /dev/null &

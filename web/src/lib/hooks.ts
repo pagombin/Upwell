@@ -11,14 +11,37 @@ export function useApi<T>(path: string | null, intervalMs = 0): Loaded<T> {
   const [updatedAt, setUpdatedAt] = useState(0);
   const [tick, setTick] = useState(0);
   const refresh = useCallback(() => setTick((t) => t + 1), []);
+  const base = path ? path.split("?")[0] : "";
+  const shown = useRef(base);
+  const failures = useRef(0);
+  // U4: another item (another migration's page) never shows the previous
+  // one's data while it loads; a new query on the same path (a chart's
+  // time window) keeps it.
+  if (shown.current !== base) {
+    shown.current = base;
+    failures.current = 0;
+    setData(undefined);
+    setError(undefined);
+    setLoading(!!path);
+    setUpdatedAt(0);
+  }
+  const hasData = data !== undefined;
   useEffect(() => {
     if (!path) return;
     let alive = true;
     api.get<T>(path).then(
-      (d) => { if (alive) { setData(d); setError(undefined); setLoading(false); setUpdatedAt(Date.now()); } },
-      (e) => { if (alive) { setError(e instanceof ApiError ? e : new ApiError(0, "error", String(e))); setLoading(false); } },
+      (d) => { if (alive) { failures.current = 0; setData(d); setError(undefined); setLoading(false); setUpdatedAt(Date.now()); } },
+      (e) => {
+        if (!alive) return;
+        // U8: one failed refresh keeps what is shown (the stale badge says
+        // how old it is); three in a row, or a first load, show the error.
+        failures.current++;
+        if (!hasData || failures.current >= 3) setError(e instanceof ApiError ? e : new ApiError(0, "error", String(e)));
+        setLoading(false);
+      },
     );
     return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, tick]);
   useEffect(() => {
     if (!intervalMs || !path) return;

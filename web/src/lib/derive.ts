@@ -14,6 +14,8 @@ export const LIFECYCLE = [
 export function lifecycleIndex(v: MigrationView): number {
   const m = v.migration;
   if (m.flags.cleaned_up) return 7;
+  // A NO-GO stops at Verify (shown as failed), not at Completed (U13).
+  if (m.flags.verdict === "NO-GO") return 5;
   if (m.flags.verdict) return 6;
   if (m.flags.verifying || m.state === "verifying") return 5;
   if (m.flags.cutover && !m.flags.cutover.ended_at) return 4;
@@ -21,6 +23,11 @@ export function lifecycleIndex(v: MigrationView): number {
   if (m.flags.started) return 2;
   if (m.flags.preflight_ok || m.state === "ready") return 1;
   return 0;
+}
+
+// lifecycleBad marks the current lifecycle step as failed.
+export function lifecycleBad(v: MigrationView): boolean {
+  return v.migration.state === "needs_attention" || (v.migration.flags.verdict === "NO-GO" && !v.migration.flags.cleaned_up);
 }
 
 const AFTER_COPY = new Set(["catch_up", "in_sync", "draining", "drained", "verified"]);
@@ -65,6 +72,22 @@ export function copyEtaMs(v: MigrationView, metrics?: Series[]): number | undefi
   }
   if (!rate) return undefined;
   return (remaining / rate) * 1000;
+}
+
+// dbCopyEtaMs estimates one database's remaining base copy time from its
+// own target growth (the overall ETA mixes every database's rate).
+export function dbCopyEtaMs(d: Database, live: Record<string, number> | undefined, metrics?: Series[]): number | undefined {
+  if (d.state !== "base_copy" || !metrics) return undefined;
+  const remaining = Math.max(0, (live?.source_size_bytes || d.size_bytes) - (live?.target_size_bytes || 0));
+  const s = metrics.find((x) => x.name === "target_size_bytes" && x.database === d.source_name);
+  const r = s ? rateFrom(s.points) : undefined;
+  return r && r > 0 ? (remaining / r) * 1000 : undefined;
+}
+
+// backlogKnown is a database's backlog, or undefined when it is not known
+// (the engine reports -1 before it streams).
+export function backlogKnown(d: Database): number | undefined {
+  return d.backlog_bytes === undefined || d.backlog_bytes === null || d.backlog_bytes < 0 ? undefined : d.backlog_bytes;
 }
 
 export function readyForCutover(v: MigrationView): boolean {

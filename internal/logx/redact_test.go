@@ -34,3 +34,15 @@ func TestRedactUpwellToken(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestRedactJSONMembers(t *testing.T) {
+	for in, want := range map[string]string{
+		`{"user":"a","password":"hunter2"}`:         `{"user":"a","password":"****"}`,
+		`{"current_password": "a \"q\" b", "x": 1}`: `{"current_password": "****", "x": 1}`,
+		`{"Token":"abc","name":"t"}`:                `{"Token":"****","name":"t"}`,
+	} {
+		if got := Redact(in); got != want {
+			t.Errorf("Redact(%s) = %s, want %s", in, got, want)
+		}
+	}
+}

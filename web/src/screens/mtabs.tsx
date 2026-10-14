@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { ago, bytes, count, duration, rate, time } from "../lib/format";
+import { backlogKnown } from "../lib/derive";
 import { useApi, useDebounced, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { Database, EventRow, Migration, Series } from "../lib/types";
@@ -37,6 +38,7 @@ export function DatabaseScreen() {
   const { can } = useSession();
   const { run, busy } = useAction();
   const [restart, setRestart] = useState(false);
+  const [att, setAtt] = useState("");
   const now = useNow(5000);
   if (d.error) return <ErrorState error={d.error} retry={d.refresh} />;
   if (!d.data) return <Skeleton lines={8} />;
@@ -58,10 +60,10 @@ export function DatabaseScreen() {
           {restartable && <button className="danger" onClick={() => setRestart(true)}>Restart from zero</button>}
         </>}
       </div>
-      {x.last_error && <div className={`callout ${x.state === "failed" || x.state === "restart_required" || x.state === "degraded" ? "crit" : "warn"}`}><div className="body"><strong>{x.error_class ? `Last error (${x.error_class.replace(/_/g, " ")})` : "Last error"}</strong><span className="wrapany">{x.last_error}</span>{x.next_retry_at && <span className="small">Next automatic retry {ago(x.next_retry_at, now).replace(" ago", "")} from now</span>}</div></div>}
+      {x.last_error && <div className={`callout ${x.state === "failed" || x.state === "restart_required" || x.state === "degraded" ? "crit" : "warn"}`}><div className="body"><strong>{x.error_class ? `Last error (${x.error_class.replace(/_/g, " ")})` : "Last error"}</strong><span className="wrapany">{x.last_error}</span>{x.next_retry_at && <span className="small">{x.next_retry_at > now ? `Next automatic retry in ${duration(x.next_retry_at - now)}` : "Automatic retry due now"}</span>}</div></div>}
       <div className="grid cols-4">
         <Tile label="Target" value={<Trunc className="mono">{x.target_name}</Trunc>} sub={`Plugin ${x.plugin || "auto"} · ${count(x.table_count)} tables`} />
-        <Tile label="Backlog" value={x.backlog_bytes === undefined || x.backlog_bytes === null ? "—" : bytes(x.backlog_bytes)} sub={`Replay ${rate(live.replay_rate)}`} />
+        <Tile label="Backlog" value={backlogKnown(x) === undefined ? "—" : bytes(backlogKnown(x)!)} sub={`Replay ${rate(live.replay_rate)}`} />
         <Tile label="Slot" value={live.slot_retained_bytes === undefined ? "—" : bytes(live.slot_retained_bytes)} sub={`${ws ? `WAL ${ws}` : "No slot data"}${live.slot_headroom_bytes !== undefined ? ` · headroom ${bytes(live.slot_headroom_bytes)}` : ""}`} />
         <Tile label="Heartbeat" value={live.heartbeat_latency_s === undefined ? "—" : duration(live.heartbeat_latency_s * 1000)} sub={x.in_sync_since ? `In sync since ${time(x.in_sync_since, false)}` : "End-to-end latency"} />
       </div>
@@ -132,7 +134,14 @@ export function DatabaseScreen() {
         {d.data.attempts[0] && <details style={{ marginTop: 12 }}><summary>Engine command of attempt {d.data.attempts[0].number}</summary><pre className="cmd" style={{ marginTop: 8 }}>{d.data.attempts[0].command}</pre></details>}
       </Card>
       <WatchedTables mig={id} db={x.source_name} canEdit={can("operator") && !view.data?.migration.fixture} />
-      <Card title="Logs for this database"><LogViewer filter={{ migration: id, database: x.source_name, level: "info" }} height={320} label={`Logs for ${x.source_name}`} /></Card>
+      <Card title="Logs for this database" actions={d.data.attempts.length > 1 ? (
+        <label className="row small" style={{ gap: 6 }}>Attempt
+          <select value={att} onChange={(e) => setAtt(e.target.value)}>
+            <option value="">All attempts</option>
+            {d.data.attempts.map((a) => <option key={a.number} value={String(a.number)}>#{a.number} {a.kind}, {time(a.started_at)}</option>)}
+          </select>
+        </label>
+      ) : undefined}><LogViewer filter={{ migration: id, database: x.source_name, level: "info", attempt: att || undefined }} height={360} label={`Logs for ${x.source_name}`} /></Card>
       {restart && (
         <ConfirmDialog title={`Restart ${x.source_name} from zero`} danger typeToConfirm={x.source_name} confirmLabel="Restart from zero" onClose={() => setRestart(false)}
           onConfirm={async (t) => { await api.post(`/api/v1/migrations/${id}/databases/${encodeURIComponent(x.source_name)}/restart`, { confirm: t }); d.refresh(); }}>

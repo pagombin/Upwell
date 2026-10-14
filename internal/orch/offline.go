@@ -147,10 +147,13 @@ func (o *Orchestrator) offlineWorker(ctx context.Context, m Migration, dbs []Dat
 			if n := act.Changes - first[d.SourceName].Changes; n != 0 {
 				changing = append(changing, fmt.Sprintf("%s (%d row changes in %d s)", d.SourceName, n, secs))
 			}
-			if len(act.OpenWriters) > 0 {
-				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s): %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
+			if act.Fingerprint != first[d.SourceName].Fingerprint {
+				changing = append(changing, d.SourceName+" (a table was truncated or rewritten, or a sequence or large object changed)")
 			}
-			o.setDB(bg, d.ID, map[string]any{"writes_baseline": act.Changes})
+			if len(act.OpenWriters) > 0 {
+				changing = append(changing, fmt.Sprintf("%s (%d open write transaction(s), prepared ones included: %s)", d.SourceName, len(act.OpenWriters), strings.Join(limitStrings(act.OpenWriters, 3), "; ")))
+			}
+			o.setDB(bg, d.ID, map[string]any{"writes_baseline": act.Changes, "writes_fingerprint": act.Fingerprint})
 		}
 		if len(changing) > 0 {
 			// No override offline: a write during the copy is simply missing.

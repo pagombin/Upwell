@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/pg"
 	"github.com/pagombin/upwell/internal/pgpack"
 	"github.com/pagombin/upwell/internal/store"
@@ -680,6 +681,12 @@ func (a *alerter) evaluateHost(ctx context.Context) {
 
 // diskGuard stops the database with the largest staging directory.
 func (o *Orchestrator) diskGuard(ctx context.Context, pct float64) {
+	// O4: one database per 2 minutes (the volume's use is sampled every
+	// 30 s and a stopped engine's files stay until cleanup), not one per
+	// evaluation until every engine is stopped.
+	if !o.metrics.due("_host|disk-guard", 2*time.Minute) {
+		return
+	}
 	ms, _ := o.ListMigrations(ctx)
 	var bestM Migration
 	var bestD Database
@@ -688,9 +695,14 @@ func (o *Orchestrator) diskGuard(ctx context.Context, pct float64) {
 		if m.Fixture || !m.Flags.Started || m.Flags.CleanedUp {
 			continue
 		}
+		// Never in a running cutover: a database draining to its end position
+		// (or past it) is decided by the cutover, which ends NO-GO if needed.
+		if c := m.Flags.Cutover; c != nil && c.EndedAt == 0 {
+			continue
+		}
 		dbs, _ := o.ListDatabases(ctx, m.ID)
 		for _, d := range included(dbs) {
-			if !activeDB[d.State] {
+			if !activeDB[d.State] || d.State == DDraining || d.State == DPreparing {
 				continue
 			}
 			var size int64
@@ -708,9 +720,30 @@ func (o *Orchestrator) diskGuard(ctx context.Context, pct float64) {
 	if best < 0 {
 		return
 	}
+	// Under the migration's lock, like every other stop; skipped (and tried
+	// again in 2 minutes) while a long operation holds it.
+	unlock, ok := o.tryLock(bestM.ID)
+	if !ok {
+		return
+	}
+	defer unlock()
+	if cur, err := o.GetDatabase(ctx, bestM.ID, bestD.ID); err != nil || cur.State != bestD.State {
+		return
+	} else {
+		bestD = cur
+	}
 	o.mustStop(ctx, bestM, bestD, "disk guard")
 	o.endAttempt(ctx, bestD, nil, "disk guard")
-	o.setDB(ctx, bestD.ID, map[string]any{"state": DStopped, "next_retry_at": nil, "last_error": fmt.Sprintf("Stopped by the disk guard: the work volume reached %.0f%%", pct)})
+	msg := fmt.Sprintf("Stopped by the disk guard: the work volume reached %.0f%%", pct)
+	if !bestD.BaseCopyDone {
+		// A stopped base copy cannot resume: say so, and release its slot
+		// instead of leaving a Stopped database that resuming would break (O4).
+		o.setDB(ctx, bestD.ID, map[string]any{"state": DRestartRequired, "error_class": engine.FailBaseCopy, "next_retry_at": nil,
+			"last_error": msg + " during the base copy, which cannot resume. Free space on the work volume, then restart it from zero."})
+		go o.releaseFailedCopySlot(context.WithoutCancel(ctx), bestM, bestD)
+	} else {
+		o.setDB(ctx, bestD.ID, map[string]any{"state": DStopped, "next_retry_at": nil, "last_error": msg + ". Free space on the work volume, then resume it."})
+	}
 	o.Event(ctx, bestM.ID, bestD.SourceName, "disk_guard", "critical", fmt.Sprintf("Disk guard stopped %s (largest staging, %s) at %.0f%% work-volume use", bestD.SourceName, humanSize(best), pct), nil)
 }
 

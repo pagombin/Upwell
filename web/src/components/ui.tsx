@@ -115,13 +115,17 @@ export function StaleBadge({ updatedAt, now, limitMs = 30000 }: { updatedAt: num
 export function Dialog({ title, onClose, children, footer, wide }: { title: string; onClose: () => void; children: ReactNode; footer?: ReactNode; wide?: boolean }) {
   const id = useId();
   const ref = useRef<HTMLDivElement>(null);
+  // U3: callers pass a new onClose on every render (pages poll every few
+  // seconds); held in a ref so focus is set once, when the dialog opens.
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
     const el = ref.current;
     const first = el?.querySelector<HTMLElement>("input, select, textarea, button:not(.ghost)");
     first?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") close.current();
       if (e.key === "Tab" && el) {
         const items = Array.from(el.querySelectorAll<HTMLElement>("a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex='-1'])"));
         if (!items.length) return;
@@ -132,7 +136,7 @@ export function Dialog({ title, onClose, children, footer, wide }: { title: stri
     };
     document.addEventListener("keydown", onKey);
     return () => { document.removeEventListener("keydown", onKey); prev?.focus(); };
-  }, [onClose]);
+  }, []);
   return (
     <div className="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className={`dialog ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={id} ref={ref}>
@@ -241,7 +245,19 @@ export function useAction() {
       setBusy(null);
     }
   }, [toast]);
-  return { run, busy };
+  // must is run for a ConfirmDialog's action (U10): a failure is thrown, so
+  // the dialog stays open and shows it, instead of closing as if it worked.
+  const must = useCallback(async <T,>(name: string, f: () => Promise<T>, done?: string): Promise<T> => {
+    setBusy(name);
+    try {
+      const r = await f();
+      if (done) toast("ok", done);
+      return r;
+    } finally {
+      setBusy(null);
+    }
+  }, [toast]);
+  return { run, must, busy };
 }
 
 export function Field({ label: l, hint, children, htmlFor }: { label: string; hint?: string; children: ReactNode; htmlFor?: string }) {

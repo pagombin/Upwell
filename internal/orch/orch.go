@@ -184,7 +184,18 @@ type Operation struct {
 // key is reused.
 var ErrDuplicate = errors.New("operation already submitted")
 
+// opKey scopes a client's idempotency key to the migration (A9: matched
+// globally, a key reused on another migration returned that migration's
+// operation).
+func opKey(migrationID, key string) string {
+	if key == "" {
+		return ""
+	}
+	return migrationID + ":" + key
+}
+
 func (o *Orchestrator) newOp(ctx context.Context, migrationID, kind, key, by string, steps []Step, params map[string]any) (*Operation, error) {
+	key = opKey(migrationID, key)
 	if key != "" {
 		var id string
 		err := o.st.DB.QueryRowContext(ctx, `SELECT id FROM operations WHERE operation_key=?`, key).Scan(&id)

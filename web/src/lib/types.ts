@@ -9,7 +9,7 @@ export interface Flags {
 }
 export interface FreezeState {
   state: "applying" | "applied" | "undone"; applied_at: number; by: string; undone_at?: number; undone_by?: string; undo_reason?: string; undo_error?: string;
-  databases: { name: string; prior?: string; applied: boolean; terminated: number; not_terminated?: string[]; undone: boolean }[];
+  databases: { name: string; prior?: string; roles?: { role: string; applied?: boolean }[]; applied: boolean; terminated: number; not_terminated?: string[]; undone: boolean }[];
 }
 export interface FreezeTarget {
   database: string; owner: boolean; pg_signal_backend: boolean; available: boolean; reason?: string; prior?: string;

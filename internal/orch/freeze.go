@@ -30,12 +30,13 @@ type FreezeState struct {
 
 // FreezeDB is the freeze on one source database.
 type FreezeDB struct {
-	Name          string   `json:"name"`
-	Prior         string   `json:"prior,omitempty"`
-	Applied       bool     `json:"applied"`
-	Terminated    int      `json:"terminated"`
-	NotTerminated []string `json:"not_terminated,omitempty"`
-	Undone        bool     `json:"undone"`
+	Name          string              `json:"name"`
+	Prior         string              `json:"prior,omitempty"`
+	Roles         []pgpack.RoleFreeze `json:"roles,omitempty"`
+	Applied       bool                `json:"applied"`
+	Terminated    int                 `json:"terminated"`
+	NotTerminated []string            `json:"not_terminated,omitempty"`
+	Undone        bool                `json:"undone"`
 }
 
 // dbPrior returns a frozen database's setting from before the freeze.
@@ -115,18 +116,34 @@ func (o *Orchestrator) applyFreeze(ctx context.Context, m Migration, a audit.Act
 		}
 		targets = append(targets, t)
 	}
+	// A freeze already applied (a cutover continued after a restart whose
+	// undo failed) keeps the settings recorded before it: read now, they
+	// would be Upwell's own "on", and the undo would leave the source frozen
+	// (D83).
+	if cur, err := o.GetMigration(ctx, m.ID); err == nil && cur.Flags.Freeze.Active() {
+		for i := range targets {
+			for _, fd := range cur.Flags.Freeze.Databases {
+				if fd.Name == targets[i].Database {
+					targets[i].Prior = fd.Prior
+					targets[i].Roles = mergeRoles(fd.Roles, targets[i].Roles)
+				}
+			}
+		}
+	}
 	if _, err := o.audit.Append(ctx, a, "cutover.write_freeze", m.ID, nil, map[string]any{"databases": targets}); err != nil {
 		return fmt.Errorf("the write freeze was not applied because it could not be recorded in the audit log: %w", err)
 	}
 	st := &FreezeState{State: "applying", AppliedAt: store.Now(), By: a.Username}
 	for _, t := range targets {
-		st.Databases = append(st.Databases, FreezeDB{Name: t.Database, Prior: t.Prior})
+		st.Databases = append(st.Databases, FreezeDB{Name: t.Database, Prior: t.Prior, Roles: t.Roles})
 	}
 	// Record the intent before changing anything: a crash part-way leaves a
 	// state that the restart undoes.
 	o.updateFlags(ctx, m.ID, func(f *Flags) { f.Freeze = st })
 	for i, t := range targets {
-		res, err := pgpack.ApplyFreeze(ctx, src.WithDB(t.Database), t.Prior)
+		res, err := pgpack.ApplyFreeze(ctx, src.WithDB(t.Database), t.Prior, t.Roles)
+		// Record which roles were frozen even on failure: the undo restores those.
+		st.Databases[i].Roles = res.Roles
 		st.Databases[i].Applied = err == nil || res.Terminated > 0
 		st.Databases[i].Terminated, st.Databases[i].NotTerminated = res.Terminated, res.NotTerminated
 		if err != nil {
@@ -136,8 +153,20 @@ func (o *Orchestrator) applyFreeze(ctx context.Context, m Migration, a audit.Act
 			return errors.Join(fmt.Errorf("applying the write freeze on %s: %w", t.Database, err), uerr)
 		}
 		op.Log("warn", "write freeze applied on %s: new sessions are read-only; %d client session(s) ended", t.Database, res.Terminated)
+		if len(res.Roles) > 0 {
+			var names []string
+			for _, r := range res.Roles {
+				names = append(names, r.Role)
+			}
+			op.Log("warn", "%s: also set default_transaction_read_only = on for %d role(s) whose own setting would override the freeze: %s", t.Database, len(names), strings.Join(names, ", "))
+		}
 		if len(res.NotTerminated) > 0 {
 			op.Log("warn", "%s: %d session(s) could not be ended: %s", t.Database, len(res.NotTerminated), strings.Join(limitStrings(res.NotTerminated, 3), "; "))
+			// F10: these sessions keep their read-write default and can still
+			// write; the writes checks catch it, but the operator should know
+			// why before the verdict says so.
+			o.Event(ctx, m.ID, t.Database, "write_freeze", "warning", fmt.Sprintf("%s: the write freeze could not end %d session(s), which can still write until they disconnect: %s. End them (or stop their applications); any write they make ends the cutover NO-GO.",
+				t.Database, len(res.NotTerminated), strings.Join(limitStrings(res.NotTerminated, 5), "; ")), map[string]any{"not_terminated": res.NotTerminated})
 		}
 	}
 	st.State = "applied"
@@ -174,6 +203,12 @@ func (o *Orchestrator) UndoFreeze(ctx context.Context, a audit.Actor, id string)
 var freezeLocks sync.Map
 
 func (o *Orchestrator) undoFreeze(ctx context.Context, migID, by, reason string) error {
+	return o.undoFreezeIf(ctx, migID, by, reason, nil)
+}
+
+// undoFreezeIf undoes the freeze only if cond, given the migration as read
+// under the lock, allows it (nil: always).
+func (o *Orchestrator) undoFreezeIf(ctx context.Context, migID, by, reason string, cond func(Migration) bool) error {
 	mu, _ := freezeLocks.LoadOrStore(migID, &sync.Mutex{})
 	mu.(*sync.Mutex).Lock()
 	defer mu.(*sync.Mutex).Unlock()
@@ -183,7 +218,7 @@ func (o *Orchestrator) undoFreeze(ctx context.Context, migID, by, reason string)
 		return err
 	}
 	st := m.Flags.Freeze
-	if !st.Active() {
+	if !st.Active() || (cond != nil && !cond(m)) {
 		return nil
 	}
 	src, _, err := o.Conns(ctx, m)
@@ -197,7 +232,7 @@ func (o *Orchestrator) undoFreeze(ctx context.Context, migID, by, reason string)
 			if d.Undone {
 				continue
 			}
-			n, uerr := pgpack.UndoFreeze(ctx, src.WithDB(d.Name), d.Prior, since)
+			n, uerr := pgpack.UndoFreeze(ctx, src.WithDB(d.Name), d.Prior, d.Roles, since)
 			if uerr != nil {
 				errs = append(errs, uerr)
 				continue
@@ -225,18 +260,26 @@ func (o *Orchestrator) undoFreeze(ctx context.Context, migID, by, reason string)
 // cutover is not running and did not end GO (a failed undo, or one the
 // restart could not finish). Called from supervision.
 func (o *Orchestrator) freezeJanitor(ctx context.Context, m Migration) {
-	if !m.Flags.Freeze.Active() || m.Flags.Verdict == "GO" || m.Flags.Verifying {
+	if !janitorMayUndo(m) || !o.metrics.due(m.ID+"|freeze-janitor", 30*time.Second) {
 		return
+	}
+	// F5: m was read at the start of the tick; a cutover can end GO, or a
+	// new one start, before the undo. Decided again under the freeze lock
+	// on a fresh read (a cutover's verdict is recorded before it leaves
+	// cutoverCancels).
+	_ = o.undoFreezeIf(ctx, m.ID, "Upwell", "the cutover is no longer running and did not end GO", janitorMayUndo)
+}
+
+func janitorMayUndo(m Migration) bool {
+	if !m.Flags.Freeze.Active() || m.Flags.Verdict == "GO" || m.Flags.Verifying {
+		return false
 	}
 	if c := m.Flags.Cutover; c != nil && c.EndedAt == 0 {
 		if _, running := cutoverCancels.Load(c.OpID); running {
-			return
+			return false
 		}
 	}
-	if !o.metrics.due(m.ID+"|freeze-janitor", 30*time.Second) {
-		return
-	}
-	_ = o.undoFreeze(ctx, m.ID, "Upwell", "the cutover is no longer running and did not end GO")
+	return true
 }
 
 // MigrationSecrets returns the stored passwords of a migration's connections,
@@ -260,3 +303,24 @@ func (o *Orchestrator) MigrationSecrets(ctx context.Context, m Migration) []stri
 
 // EngineLogPath is a database's engine log file.
 func (o *Orchestrator) EngineLogPath(d Database) string { return o.runLog(d) }
+
+// mergeRoles keeps the roles recorded by an earlier freeze (with their prior
+// settings) and adds any found now.
+func mergeRoles(recorded, now []pgpack.RoleFreeze) []pgpack.RoleFreeze {
+	out := append([]pgpack.RoleFreeze(nil), recorded...)
+	for _, r := range now {
+		found := false
+		for _, x := range recorded {
+			if x.Role == r.Role {
+				found = true
+			}
+		}
+		if !found {
+			out = append(out, r)
+		}
+	}
+	for i := range out {
+		out[i].Applied = false
+	}
+	return out
+}

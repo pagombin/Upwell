@@ -118,3 +118,57 @@ func TestTemplate0LaunchExplains(t *testing.T) {
 		e.waitOp(r.OperationID, 3*time.Minute)
 	}
 }
+
+// The droplet (2026-10-14): preflight blocked with "Collations differ
+// (source en_US.UTF-8, target en_US.utf-8)", two names Upwell already treats
+// as the same locale. The difference was elsewhere (the collation library's
+// version, glibc on the source against the Percona image's), the message did
+// not say so, and the same difference passed silently when Upwell created the
+// target database itself. The engine builds every index on the target, so a
+// version difference cannot leave an index out of order there; it can change
+// how a few strings sort, which is a warning.
+func TestCollationVersionDifferenceWarns(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_collver")
+	seedDB(t, db, 100)
+	superSQL(t, dstPort, "postgres", "CREATE DATABASE "+db+" OWNER doadmin TEMPLATE template0 LOCALE 'C.UTF-8'")
+	superSQL(t, srcPort, "postgres", "UPDATE pg_database SET datcollversion = '2.31-test' WHERE datname = '"+db+"'")
+	superSQL(t, dstPort, "postgres", "UPDATE pg_database SET datcollversion = '2.39-test' WHERE datname = '"+db+"'")
+	id := e.defineMigration("Collation version", []string{db}, nil)
+	pv := e.preflight(id)
+	var got string
+	for _, r := range pv.Results {
+		if r.CheckID == "collation" {
+			got = r.Level + ": " + r.Message
+		}
+	}
+	t.Logf("existing target database: %s", got)
+	if !strings.HasPrefix(got, "warning: ") || !strings.Contains(got, "2.31-test") || !strings.Contains(got, "2.39-test") {
+		t.Fatalf("want a warning naming both collation versions, got %q", got)
+	}
+
+	// The same difference when Upwell will create the target database (from
+	// template1, whose version the new database takes).
+	superSQL(t, dstPort, "postgres", "DROP DATABASE "+db)
+	prev := superSQL(t, dstPort, "postgres", "SELECT COALESCE(datcollversion, '') FROM pg_database WHERE datname = 'template1'")
+	superSQL(t, dstPort, "postgres", "UPDATE pg_database SET datcollversion = '2.39-test' WHERE datname = 'template1'")
+	t.Cleanup(func() {
+		v := "NULL"
+		if prev != "" {
+			v = "'" + prev + "'"
+		}
+		superSQL(t, dstPort, "postgres", "UPDATE pg_database SET datcollversion = "+v+" WHERE datname = 'template1'")
+	})
+	pv = e.preflight(id)
+	got = ""
+	for _, r := range pv.Results {
+		if r.CheckID == "collation" {
+			got = r.Level + ": " + r.Message
+		}
+	}
+	t.Logf("target database to be created: %s", got)
+	if !strings.HasPrefix(got, "warning: ") || !strings.Contains(got, "2.31-test") || !strings.Contains(got, "2.39-test") {
+		t.Fatalf("want the same warning when the target database will be created, got %q", got)
+	}
+	e.cleanup(id, "Collation version")
+}

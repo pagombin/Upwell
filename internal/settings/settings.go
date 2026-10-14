@@ -7,8 +7,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 
 	"github.com/pagombin/upwell/internal/store"
 )
@@ -162,9 +164,21 @@ func Validate(key string, v any) (any, error) {
 		if len(s) > 200 {
 			return nil, fmt.Errorf("%s is too long", key)
 		}
+		// A6: passed to pgcopydb as is, so anything else failed the launch.
+		if key == "split_tables_larger_than" {
+			s = strings.TrimSpace(s)
+			if l := strings.ToLower(s); l == "auto" || l == "off" {
+				s = l
+			}
+			if !splitRe.MatchString(s) {
+				return nil, fmt.Errorf("%s needs auto, off, or a size such as 50GB (kB, MB, GB or TB)", key)
+			}
+		}
 		return s, nil
 	}
 }
+
+var splitRe = regexp.MustCompile(`^(auto|off|[1-9][0-9]{0,6}(kB|MB|GB|TB))$`)
 
 // Values is a resolved settings map.
 type Values map[string]any

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -124,6 +125,14 @@ func (o *Orchestrator) superviseMigration(ctx context.Context, m Migration) {
 			break
 		}
 		timed("engine status of "+d.SourceName, func() { o.superviseDB(ctx, m, d) })
+		// A failed base copy's slot only keeps source WAL until someone
+		// restarts it from zero, which creates a new slot (D81). Also covers a
+		// database that failed before this release, and (O3) every other way
+		// into Restart required before the copy finished: a reboot, a failed
+		// launch or resume, the disk guard.
+		if d.State == DRestartRequired && !d.BaseCopyDone && o.metrics.due(d.ID+"|failslot", 5*time.Minute) {
+			go o.releaseFailedCopySlot(context.WithoutCancel(ctx), m, d)
+		}
 	}
 	if !m.Flags.Aborted && !m.Flags.Paused {
 		timed("scheduling", func() {
@@ -163,7 +172,15 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 	// New log lines: classify since the attempt started.
 	o.tails.attach(m.ID, d.SourceName, plan.LogFile, o.attemptNumber(ctx, d.ID))
 	classes := o.tails.poll(m.ID, d.SourceName)
-	st, _ := o.run.Status(ctx, d.Instance)
+	st, serr := o.run.Status(ctx, d.Instance)
+	if serr != nil {
+		// O1: an unreadable unit state is not "exited": acting on it would
+		// restart (or fail) a database whose engine may still be running.
+		if o.metrics.due(d.ID+"|status-error", 5*time.Minute) {
+			o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "could not read the engine unit's state, skipping this check: %v", serr)
+		}
+		return
+	}
 
 	if st.Active {
 		// Degraded: main process dead while the unit still has processes.
@@ -347,21 +364,17 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 		} else if (v.Bool("auto_restart_base_copy") || engineFlake) && underLimit {
 			o.setDB(ctx, d.ID, map[string]any{"auto_restarts": d.AutoRestarts + 1})
 			o.Event(ctx, m.ID, d.SourceName, "auto_restart", "warning", d.SourceName+": base copy failed ("+reason+"); restarting from zero automatically (under the size limit)", nil)
-			spec, err := o.dbSpec(ctx, m, d)
-			if err == nil {
-				if _, err = o.eng.Cleanup(ctx, spec, engine.CleanupOptions{RemoveWorkDir: true}); err == nil {
-					err = resetTargetDB(ctx, spec)
-				}
-			}
-			if err == nil {
-				o.setDB(ctx, d.ID, map[string]any{"state": DPending, "base_copy_done": 0, "last_error": reason, "error_class": cls})
-				return
-			}
-			// Copying again into a target that was not reset would mix data.
-			reason += "; the automatic restart could not reset the target: " + err.Error()
+			// O5: the reset runs outside the supervision tick (its 50 s
+			// deadline cut it off on a slow target). Until it succeeds the
+			// database stays in Restart required, so a console restart part-way
+			// never copies into a target that was not reset.
+			o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "last_error": "The base copy failed (" + reason + "); restarting it from zero automatically."})
+			go o.autoRestart(context.WithoutCancel(ctx), m, d, cls, reason)
+			return
 		}
 		o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "last_error": "The base copy failed: " + reason})
 		o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", d.SourceName+": the base copy failed ("+reason+"). Restart it from zero; resuming a base copy cannot guarantee consistency.", nil)
+		go o.releaseFailedCopySlot(context.WithoutCancel(ctx), m, d)
 	case engine.FailPermanent:
 		o.setDB(ctx, d.ID, map[string]any{"state": DFailed, "error_class": cls, "last_error": reason})
 		o.Event(ctx, m.ID, d.SourceName, "failed", "critical", d.SourceName+" failed: "+reason, nil)
@@ -442,11 +455,71 @@ func (o *Orchestrator) schedule(ctx context.Context, m Migration, limit int) {
 		}
 		if d.State == DPending {
 			running++
-			if err := o.launch(ctx, m, d); err != nil {
-				o.logf("error", "orchestrator", m.ID, d.SourceName, "", "launch failed: %v", err)
-			}
+			o.launchAsync(ctx, m, d)
 		}
 	}
+}
+
+// autoRestart resets a failed base copy and queues it again (O5).
+func (o *Orchestrator) autoRestart(ctx context.Context, m Migration, d Database, cls, reason string) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	unlock := o.lock(m.ID)
+	defer unlock()
+	cur, err := o.GetDatabase(ctx, m.ID, d.ID)
+	if err != nil || cur.State != DRestartRequired {
+		return // restarted, aborted or cleaned up meanwhile
+	}
+	spec, err := o.dbSpec(ctx, m, cur)
+	if err == nil {
+		if _, err = o.eng.Cleanup(ctx, spec, engine.CleanupOptions{RemoveWorkDir: true}); err == nil {
+			err = resetTargetDB(ctx, spec)
+		}
+	}
+	if err == nil {
+		o.setDB(ctx, d.ID, map[string]any{"state": DPending, "base_copy_done": 0, "last_error": reason, "error_class": cls})
+		return
+	}
+	// Copying again into a target that was not reset would mix data.
+	reason += "; the automatic restart could not reset the target: " + err.Error()
+	o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "last_error": "The base copy failed: " + reason})
+	o.Event(ctx, m.ID, d.SourceName, "base_copy_failed", "critical", d.SourceName+": the base copy failed ("+reason+"). Restart it from zero; resuming a base copy cannot guarantee consistency.", nil)
+}
+
+// launching holds the database IDs whose launch goroutine is running.
+var launching sync.Map
+
+// launchAsync launches a database outside the supervision tick (O2): a launch
+// (creating the target database, extensions, privilege checks, roles) can
+// take longer than the tick's 50 s deadline, which cut it off half-way. The
+// database is marked Preparing first, so neither the next tick nor
+// reconciliation launches it twice; the goroutine then waits for the
+// migration's lock (released when this tick ends) and launches only if the
+// migration was not paused or aborted meanwhile.
+func (o *Orchestrator) launchAsync(ctx context.Context, m Migration, d Database) {
+	if _, busy := launching.LoadOrStore(d.ID, true); busy {
+		return
+	}
+	o.setDB(ctx, d.ID, map[string]any{"state": DPreparing})
+	go func() {
+		defer launching.Delete(d.ID)
+		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Minute)
+		defer cancel()
+		unlock := o.lock(m.ID)
+		defer unlock()
+		cur, err := o.GetMigration(lctx, m.ID)
+		dc, derr := o.GetDatabase(lctx, m.ID, d.ID)
+		if err != nil || derr != nil || dc.State != DPreparing {
+			return
+		}
+		if cur.Flags.Paused || cur.Flags.Aborted || (cur.Flags.Cutover != nil && cur.Flags.Cutover.EndedAt == 0 && cur.Flags.Cutover.Phase != "copy") {
+			o.setDB(lctx, d.ID, map[string]any{"state": DPending})
+			return
+		}
+		if err := o.launch(lctx, cur, dc); err != nil {
+			o.logf("error", "orchestrator", m.ID, d.SourceName, "", "launch failed: %v", err)
+		}
+	}()
 }
 
 // dbFailed marks a database failed with a class.
@@ -547,7 +620,12 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			if !activeDB[d.State] {
 				continue
 			}
-			st, _ := o.run.Status(ctx, d.Instance)
+			st, serr := o.run.Status(ctx, d.Instance)
+			if serr != nil {
+				// O1: decided by the next supervision pass instead.
+				o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "could not read the engine unit's state at startup: %v", serr)
+				continue
+			}
 			if st.Active {
 				// Engines outlive the app: re-attach the log tailer at its stored offset.
 				o.tails.attach(m.ID, d.SourceName, o.runLog(d), o.attemptNumber(ctx, d.ID))

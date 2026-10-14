@@ -63,7 +63,11 @@ func (e *Engine) Version(ctx context.Context) (string, error) {
 	return e.ver, nil
 }
 
-func (e *Engine) supports(flag string) bool { return strings.Contains(e.help, flag) }
+func (e *Engine) supports(flag string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return strings.Contains(e.help, flag)
+}
 
 // Capabilities of pgcopydb 0.18 as proven in Phase 0.
 func (e *Engine) Capabilities() engine.Capabilities {
@@ -382,7 +386,7 @@ func ReleaseSlot(ctx context.Context, c pg.Conn, slot string, terminateAfter, gi
 func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine.CleanupOptions) ([]string, error) {
 	var done []string
 	p, _ := e.Plan(d, false)
-	if st, _ := e.Runner.Status(ctx, d.Instance); st.Active {
+	if st, serr := e.Runner.Status(ctx, d.Instance); serr != nil || st.Active {
 		if _, err := e.Stop(ctx, p, d); err != nil {
 			return done, fmt.Errorf("stopping the engine before cleanup: %w", err)
 		}

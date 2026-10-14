@@ -8,6 +8,8 @@ var redactions = []struct {
 }{
 	// passwords in connection URIs: scheme://user:secret@host
 	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]*:)[^@\s]*@`), `${1}****@`},
+	// JSON members: "password": "value" (A2: the quoted key escaped the rule below)
+	{regexp.MustCompile(`(?i)("(?:password|passwd|pwd|pgpassword|secret|token|api[_-]?key|current_password|new_password)"\s*:\s*)"(?:[^"\\]|\\.)*"`), `${1}"****"`},
 	// key=value and key: value pairs
 	{regexp.MustCompile(`(?i)\b(password|passwd|pwd|pgpassword|secret|token|api[_-]?key)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&]+)`), `${1}${2}****`},
 	// bearer headers

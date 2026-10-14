@@ -33,6 +33,7 @@ unix_socket_directories = '$ROOT'
 wal_level = logical
 max_replication_slots = 20
 max_wal_senders = 20
+max_prepared_transactions = 10
 max_slot_wal_keep_size = 1GB
 wal_sender_timeout = 60s
 log_line_prefix = '%m [%p] %u@%d '

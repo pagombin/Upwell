@@ -18,7 +18,9 @@ import (
 func TestSequenceSyncFailureShown(t *testing.T) {
 	var broken atomic.Bool
 	restore := pg.SetFaultHook(func(sql string) error {
-		if broken.Load() && strings.Contains(sql, "FROM pg_sequences") {
+		// The sync's own read (D83: the writes fingerprint reads pg_sequences
+		// too, and must keep working for the cutover to reach the sync).
+		if broken.Load() && strings.Contains(sql, "has_sequence_privilege") {
 			return errInjected
 		}
 		return nil

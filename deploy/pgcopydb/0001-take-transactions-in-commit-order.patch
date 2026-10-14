@@ -1,0 +1,143 @@
+Subject: [PATCH upwell-1] follow: take transactions in commit order
+
+pgcopydb 0.18 (and its main branch as of 2026-10-14) picks the next
+transaction to transform by its BEGIN LSN ("first BEGIN at or after the
+last applied commit LSN"), and the apply orders replay rows by BEGIN LSN
+while filtering them by commit LSN. A transaction's BEGIN carries its first
+LSN, which is lower than the commit LSN of any transaction that committed
+while it was open. With concurrent writers, every transaction that began
+before the previously applied one committed was skipped: committed changes
+never reached the target, and nothing reported it.
+
+Both stages now order transactions by commit LSN.
+
+Upwell (deploy/install.sh) applies this to the v0.18 tag and builds with
+VERSION=0.18+upwell.1; Upwell refuses online migrations with an engine that
+does not report "+upwell.1" or later.
+
+diff --git a/src/bin/pgcopydb/ld_store.c b/src/bin/pgcopydb/ld_store.c
+index df91b04..1bd9363 100644
+--- a/src/bin/pgcopydb/ld_store.c
++++ b/src/bin/pgcopydb/ld_store.c
+@@ -665,17 +665,39 @@ ld_store_lookup_output_after_lsn(DatabaseCatalog *catalog,
+ 	 * once the BEGIN has been found.  COMMIT and ROLLBACK are also
+ 	 * excluded — they are end-of-transaction anchors, not starting points.
+ 	 */
++	/*
++	 * Upwell patch (upwell-1): transactions are taken in COMMIT order.
++	 *
++	 * The cursor ($1) is the commit LSN of the last applied transaction.
++	 * A BEGIN carries the transaction's first LSN, which is lower than the
++	 * commit LSN of any transaction that committed while it was open.
++	 * Selecting "the first BEGIN at or after the cursor" therefore skipped
++	 * every transaction that began before the previous one committed: with
++	 * concurrent writers, committed transactions were silently lost.
++	 *
++	 * A complete transaction is now found by its COMMIT (or, when it has no
++	 * COMMIT, its ROLLBACK) after the cursor, in commit LSN order, and
++	 * returned as its BEGIN row.
++	 */
+ 	char *sql =
+ 		"select id, action, xid, lsn, timestamp, message, nspname, relname, old_type from ("
+-		"  select id, action, xid, lsn, timestamp, message, nspname, relname, old_type "
+-		"    from output "
+-		"   where lsn >= $1 and action = 'B' "
++		"  select b.id, b.action, b.xid, b.lsn, b.timestamp, b.message, b.nspname, b.relname, b.old_type, "
++		"         c.lsn as k, 0 as kind "
++		"    from output c join output b on b.action = 'B' and b.xid = c.xid "
++		"   where c.action = 'C' and c.lsn > $1 "
+ 		" union all "
+-		"  select id, action, xid, lsn, timestamp, message, nspname, relname, old_type "
++		"  select b.id, b.action, b.xid, b.lsn, b.timestamp, b.message, b.nspname, b.relname, b.old_type, "
++		"         c.lsn as k, 0 as kind "
++		"    from output c join output b on b.action = 'B' and b.xid = c.xid "
++		"   where c.action = 'R' and c.lsn > $1 "
++		"     and not exists (select 1 from output x where x.action = 'C' and x.xid = c.xid) "
++		" union all "
++		"  select id, action, xid, lsn, timestamp, message, nspname, relname, old_type, "
++		"         lsn as k, 1 as kind "
+ 		"    from output "
+ 		"   where lsn > $2 and action in ('K', 'X') "
+ 		") "
+-		"order by lsn asc, case when action = 'B' then 0 else 1 end, id asc "
++		"order by k asc, kind asc, id asc "
+ 		"limit 1";
+ 
+ 	log_debug("ld_store_lookup_output_after_lsn: %X/%X", LSN_FORMAT_ARGS(lsn));
+@@ -716,6 +738,46 @@ ld_store_lookup_output_after_lsn(DatabaseCatalog *catalog,
+ 		return false;
+ 	}
+ 
++	if (output->lsn != InvalidXLogRecPtr)
++	{
++		return true;
++	}
++
++	/*
++	 * Upwell patch (upwell-1): nothing complete after the cursor.  Return
++	 * the BEGIN of a transaction that has no COMMIT or ROLLBACK yet, so that
++	 * the caller can tell an endpos inside an open transaction.  Changes
++	 * arrive in commit order, so such a transaction's rows follow the last
++	 * COMMIT written; its BEGIN LSN may be below the cursor.
++	 */
++	char *pending_sql =
++		"select id, action, xid, lsn, timestamp, message, nspname, relname, old_type "
++		"  from output b "
++		" where b.action = 'B' "
++		"   and b.id > coalesce((select id from output "
++		"                         where action = 'C' "
++		"                           and lsn = (select max(lsn) from output where action = 'C')), 0) "
++		"   and not exists (select 1 from output x where x.xid = b.xid and x.action in ('C', 'R')) "
++		" order by b.id "
++		" limit 1";
++
++	SQLiteQuery pq = {
++		.errorOnZeroRows = false,
++		.context = output,
++		.fetchFunction = &ld_store_output_fetch
++	};
++
++	if (!catalog_sql_prepare(db, pending_sql, &pq))
++	{
++		/* errors have already been logged */
++		return false;
++	}
++
++	if (!catalog_sql_execute_once(&pq))
++	{
++		/* errors have already been logged */
++		return false;
++	}
+ 
+ 	return true;
+ }
+@@ -3009,17 +3071,26 @@ ld_store_replay_next_event(DatabaseCatalog *catalog,
+ 	 * next call uses $1=X.  With >=, the same KEEPALIVE is returned again
+ 	 * and apply spins.  With >, the same row is not returned a second time.
+ 	 */
++	/*
++	 * Upwell patch (upwell-1): order by the commit LSN (endlsn) of a
++	 * transaction, not its BEGIN LSN.  Ordered by BEGIN, a transaction that
++	 * began first but committed last was applied first, previousLSN moved
++	 * to its commit, and "endlsn > previousLSN" then excluded every
++	 * transaction that committed in between: they were never applied.
++	 */
+ 	char *sql =
+-		"select b.id, b.action, b.xid, b.lsn, b.endlsn, b.timestamp "
++		"select id, action, xid, lsn, endlsn, timestamp from ("
++		"select b.id, b.action, b.xid, b.lsn, b.endlsn, b.timestamp, b.endlsn as k "
+ 		"  from replay b "
+ 		"  join replay c on c.xid = b.xid and c.action in ('C', 'R') "
+ 		" where b.action = 'B' and b.endlsn > $1 "
+ 		"union all "
+-		"select id, action, xid, lsn, endlsn, timestamp "
++		"select id, action, xid, lsn, endlsn, timestamp, lsn as k "
+ 		"  from replay "
+ 		" where action = 'K' "            /* KEEPALIVE only — no ENDPOS rows */
+ 		"   and lsn > $1 "                /* strict: avoids re-delivering same row */
+-		"order by lsn asc, id asc "
++		") "
++		"order by k asc, id asc "
+ 		"limit 1";
+ 
+ 	bzero(s, sizeof(ReplayDBStmt));

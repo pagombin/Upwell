@@ -357,6 +357,14 @@ func (s *Service) UpdateUser(ctx context.Context, id string, ch UserChange) erro
 
 // DeleteUser removes a user.
 func (s *Service) DeleteUser(ctx context.Context, id string) error {
+	// A7: the user's API tokens end with the user (tokens record the
+	// creator's username).
+	var name string
+	if err := s.Store.DB.QueryRowContext(ctx, `SELECT username FROM users WHERE id=?`, id).Scan(&name); err == nil {
+		if _, err := s.Store.DB.ExecContext(ctx, `UPDATE api_tokens SET revoked_at=?, revoked_by=? WHERE created_by=? AND revoked_at IS NULL`, store.Now(), "user deleted", name); err != nil {
+			return err
+		}
+	}
 	_, err := s.Store.DB.ExecContext(ctx, `DELETE FROM users WHERE id=?`, id)
 	return err
 }
