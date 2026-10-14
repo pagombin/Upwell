@@ -1020,10 +1020,22 @@ func (s *Server) getMigration(w http.ResponseWriter, r *http.Request) error {
 	live := map[string]map[string]float64{}
 	for _, d := range dbs {
 		vals := map[string]float64{}
-		for _, n := range []string{"replay_rate", "slot_retained_bytes", "slot_headroom_bytes", "slot_active", "slot_wal_status", "heartbeat_latency_s", "target_size_bytes", "source_size_bytes", "log_errors"} {
-			if v, ok := s.Orch.LastValue(m.ID, d.SourceName, n); ok {
+		var newest int64
+		for _, n := range []string{"replay_rate", "slot_retained_bytes", "slot_headroom_bytes", "slot_active", "slot_wal_status", "heartbeat_latency_s", "target_size_bytes", "source_size_bytes", "log_errors", "backlog_bytes"} {
+			if v, at, ok := s.Orch.LastValueAt(m.ID, d.SourceName, n); ok {
 				vals[n] = v
+				ms := at.UnixMilli()
+				if ms > newest {
+					newest = ms
+				}
+				if n == "heartbeat_latency_s" {
+					vals["heartbeat_sampled_at"] = float64(ms)
+				}
 			}
+		}
+		// When this database was last sampled, so the page can show stale values as such.
+		if newest > 0 {
+			vals["sampled_at"] = float64(newest)
 		}
 		live[d.SourceName] = vals
 	}
@@ -1033,6 +1045,11 @@ func (s *Server) getMigration(w http.ResponseWriter, r *http.Request) error {
 		if v, ok := s.Orch.LastValue(m.ID, "", n); ok {
 			cl[n] = v
 		}
+	}
+	cl["source_stale_samples"] = float64(s.Orch.StaleSamples(m.ID, "source"))
+	cl["target_stale_samples"] = float64(s.Orch.StaleSamples(m.ID, "target"))
+	if _, at, ok := s.Orch.LastValueAt(m.ID, "", "src_wal_rate"); ok {
+		cl["sampled_at"] = float64(at.UnixMilli())
 	}
 	view["cluster"] = cl
 	view["now"] = store.Now()

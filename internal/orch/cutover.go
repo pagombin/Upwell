@@ -44,7 +44,11 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 	if err != nil {
 		return nil, false, err
 	}
-	dbs, _ := o.ListDatabases(ctx, m.ID)
+	dbs, err := o.ListDatabases(ctx, m.ID)
+	if err != nil {
+		// Not "every database ready" (an empty list would be).
+		return nil, false, err
+	}
 	v := o.Settings(ctx, m)
 	stable := int64(o.globalSettings(ctx).Int("cutover_stable_seconds")) * 1000
 	thr := int64(v.Int("cutover_lag_threshold_mb")) << 20
@@ -150,14 +154,22 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 		}
 		out = append(out, sc)
 	}
-	alerts, _ := o.ListAlerts(ctx, "firing", 100)
+	alerts, aerr := o.ListAlerts(ctx, "firing", 100)
 	crit := 0
 	for _, a := range alerts {
 		if a.Severity == "critical" && (a.MigrationID == m.ID || a.MigrationID == "") {
 			crit++
 		}
 	}
-	out = append(out, Condition{Key: "alerts", Label: "No critical alerts firing", OK: crit == 0, Detail: fmt.Sprintf("%d critical alert(s) firing", crit)})
+	if aerr != nil {
+		// Not "none firing" (fail closed).
+		out = append(out, Condition{Key: "alerts", Label: "No critical alerts firing", OK: false, Detail: "the alerts could not be read: " + aerr.Error()})
+	} else {
+		out = append(out, Condition{Key: "alerts", Label: "No critical alerts firing", OK: crit == 0, Detail: fmt.Sprintf("%d critical alert(s) firing", crit)})
+	}
+	if len(included(dbs)) == 0 {
+		out = append(out, Condition{Key: "databases", Label: "At least one database included", OK: false, Detail: "no database is included in this migration"})
+	}
 	hb := v.Bool("heartbeat")
 	out = append(out, Condition{Key: "heartbeat", Label: "Heartbeat on (proof the last writes arrive)", OK: true, Detail: map[bool]string{true: "On", false: "Off: accepted risk, GO relies on data comparison only"}[hb]})
 	for _, c := range out {
@@ -469,7 +481,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 			op.StepEnd("heartbeat", "skipped", "heartbeat is off for this migration (accepted risk)")
 		} else {
 			for _, d := range dbs {
-				cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+				cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+				if gerr != nil {
+					fail("heartbeat", fmt.Errorf("%s: reading its state: %w", d.SourceName, gerr))
+					return
+				}
 				if cur.HBToken != "" {
 					continue
 				}
@@ -504,7 +520,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 		deadline := time.Now().Add(limit)
 		pending := map[string]Database{}
 		for _, d := range dbs {
-			cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+			cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+			if gerr != nil {
+				fail("await", fmt.Errorf("%s: reading its state: %w", d.SourceName, gerr))
+				return
+			}
 			pending[d.SourceName] = cur
 		}
 		lastNudge := time.Now().Add(-4 * time.Second)
@@ -562,7 +582,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	if !past("endpos") {
 		var notStreaming []string
 		for _, d := range dbs {
-			cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+			cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+			if gerr != nil {
+				fail("endpos", fmt.Errorf("%s: reading its state: %w; no end position was set and streaming continues", d.SourceName, gerr))
+				return
+			}
 			if cur.EndPos == "" && cur.State != DInSync && cur.State != DCatchUp {
 				notStreaming = append(notStreaming, d.SourceName+" ("+Label(cur.State)+")")
 			}
@@ -577,8 +601,11 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	plans := map[string]engine.RunPlan{}
 	specs := map[string]engine.DatabaseSpec{}
 	for _, d := range dbs {
-		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
-		spec, err := o.dbSpec(bg, m, cur)
+		cur, err := o.GetDatabase(bg, m.ID, d.ID)
+		var spec engine.DatabaseSpec
+		if err == nil {
+			spec, err = o.dbSpec(bg, m, cur)
+		}
 		if err == nil {
 			var plan engine.RunPlan
 			if plan, err = o.eng.Plan(spec, true); err == nil {
@@ -607,7 +634,12 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	o.refreshState(bg, m.ID)
 	op.StepStart("endpos", "")
 	for _, d := range dbs {
-		cur, _ := o.GetDatabase(bg, m.ID, d.ID)
+		cur, gerr := o.GetDatabase(bg, m.ID, d.ID)
+		if gerr != nil {
+			op.StepEnd("endpos", "failed", fmt.Sprintf("%s: reading its state: %v", d.SourceName, gerr))
+			o.finishCutover(bg, m, op, a, gerr)
+			return
+		}
 		spec, plan := specs[d.ID], plans[d.ID]
 		if cur.EndPos == "" {
 			lsn, err := o.eng.SetEndPosition(bg, plan, spec)
@@ -646,7 +678,16 @@ func (o *Orchestrator) cutoverWorker(ctx context.Context, m Migration, dbs []Dat
 	for {
 		go o.Tick(bg)
 		time.Sleep(2 * time.Second)
-		cur, _ := o.ListDatabases(bg, m.ID)
+		cur, lerr := o.cutoverDBs(bg, m.ID)
+		if lerr != nil {
+			// Not "nothing left to drain" (Part 1, fail closed): wait, until the deadline.
+			op.Log("warn", "reading the databases' drain state failed: %v", lerr)
+			if time.Now().After(deadline) {
+				op.StepEnd("drain", "failed", "could not read the databases' drain state: "+lerr.Error())
+				break
+			}
+			continue
+		}
 		drained, broken := 0, []string{}
 		undrained = nil
 		for _, d := range included(cur) {
@@ -711,7 +752,11 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 		return
 	}
 	v := o.Settings(ctx, m)
-	dbs, _ := o.ListDatabases(ctx, m.ID)
+	dbs, lerr := o.cutoverDBs(ctx, m.ID)
+	if lerr != nil {
+		o.finishCutover(ctx, m, op, a, fmt.Errorf("the databases to verify could not be read: %w", lerr))
+		return
+	}
 	inc := included(dbs)
 	offline := v.Str("mode") == "offline"
 	hbOn := v.Bool("heartbeat") && !offline
@@ -924,8 +969,16 @@ func (o *Orchestrator) verifyPhase(ctx context.Context, m Migration, op *Operati
 // finishCutover computes the verdict from the stored per-database verdicts.
 func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Operation, a audit.Actor, ferr error) {
 	op.StepStart("verdict", "")
-	dbs, _ := o.ListDatabases(ctx, m.ID)
+	dbs, lerr := o.cutoverDBs(ctx, m.ID)
 	goAll := ferr == nil
+	// Fail closed: a verdict over databases that could not be read, or over
+	// none, is never GO.
+	if lerr != nil {
+		goAll = false
+		op.Log("error", "reading the databases' verdicts failed: %v", lerr)
+	} else if len(included(dbs)) == 0 {
+		goAll = false
+	}
 	if cur, err := o.GetMigration(ctx, m.ID); err != nil || cur.Flags.Aborted {
 		goAll = false
 	}
@@ -1184,4 +1237,15 @@ func (o *Orchestrator) writesSinceWritersStep(ctx context.Context, m Migration, 
 		res.Message = "No row changes on the source since writers were confirmed stopped, and no open write transaction."
 	}
 	return res
+}
+
+// cutoverDBs reads the migration's databases for the cutover's drain,
+// verification and verdict.
+func (o *Orchestrator) cutoverDBs(ctx context.Context, id string) ([]Database, error) {
+	if o.testHooks.CutoverReadErr != nil {
+		if err := o.testHooks.CutoverReadErr(); err != nil {
+			return nil, err
+		}
+	}
+	return o.ListDatabases(ctx, id)
 }

@@ -12,6 +12,7 @@ import { DataTable } from "../components/table";
 import { MIG_TABS } from "../components/shell";
 import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction } from "../components/ui";
 import { Stepper } from "./home";
+import { lagOf, safetySignals, sampleAge, SafetyStrip, StatusSummary, statusSummary, TrendsCard } from "../components/overview";
 
 interface MigCtx { view: Loaded<MigrationView>; id: string; metrics: Loaded<Series[]>; lastEvent: number }
 const Ctx = createContext<MigCtx>(null as unknown as MigCtx);
@@ -142,6 +143,9 @@ export function OverviewTab() {
   const now = useNow(5000);
   const alerts = useApi<Alert[]>(`/api/v1/alerts`, 15000);
   const events = useApi<EventRow[]>(`/api/v1/migrations/${id}/events?limit=12`, 10000);
+  // Trends over the run (at most the last 24 hours), aligned to the minute.
+  const runFrom = Math.floor(Math.max(m.started_at || now - 3600e3, now - 24 * 3600e3) / 60000) * 60000;
+  const trends = useApi<Series[]>(`/api/v1/migrations/${id}/metrics?names=backlog_bytes,heartbeat_latency_s,replay_rate,src_wal_rate&from=${runFrom}`, 60000);
   const prog = overallProgress(v);
   const eta = copyEtaMs(v, metrics.data);
   const open = (alerts.data || []).filter((a) => a.migration_id === m.id && a.state !== "resolved");
@@ -155,12 +159,16 @@ export function OverviewTab() {
   }).filter((f) => f.hoursLeft !== undefined).sort((a, b) => a.hoursLeft! - b.hoursLeft!);
   const inSync = v.state_counts["in_sync"] || 0;
   const backlog = inc.reduce((a, d) => a + (backlogKnown(d) || 0), 0);
+  const summary = statusSummary(v, metrics.data, now);
+  const signals = safetySignals(v, now);
   return (
     <div className="stack" style={{ gap: 24 }}>
-      <Card><Stepper index={lifecycleIndex(v)} bad={lifecycleBad(v)} /></Card>
+      <StatusSummary s={summary} />
+      <SafetyStrip signals={signals} />
       {m.state === "needs_attention" && (
-        <div className="callout crit" role="alert"><div className="body"><strong>Needs attention</strong><span>{inc.filter((d) => ["failed", "degraded", "restart_required"].includes(d.state)).map((d) => `${d.source_name}: ${d.last_error || d.state}`).join(" · ") || "Open a database below to see what happened."}</span></div></div>
+        <div className="callout crit" role="alert"><div className="body"><strong>Why</strong><span className="wrapany">{inc.filter((d) => ["failed", "degraded", "restart_required"].includes(d.state)).map((d) => `${d.source_name}: ${d.last_error || d.state}`).join(" · ") || "Open a database below to see what happened."}</span></div></div>
       )}
+      <Card><Stepper index={lifecycleIndex(v)} bad={lifecycleBad(v)} /></Card>
       <div className="grid cols-4">
         <Tile label="Base copy" value={pct(prog * 100)} sub={<ProgressBar value={prog} label="Overall base copy progress" />} />
         <Tile label="Copy ETA" value={eta ? duration(eta) : prog >= 1 ? "Done" : m.flags.started ? "Measuring" : "Not started"} sub={eta ? `around ${time(now + eta, false)}` : "From target growth over 5 minutes"} />
@@ -180,6 +188,8 @@ export function OverviewTab() {
             { key: "progress", label: "Copied", width: 130, sort: (d) => dbCopyFraction(d, v.live?.[d.source_name]), render: (d) => { const f = dbCopyFraction(d, v.live?.[d.source_name]); return <span className="row" style={{ gap: 6, flexWrap: "nowrap" }}><ProgressBar value={f} label={`${d.source_name} copied`} /><span className="small" style={{ width: 36, textAlign: "right" }}>{pct(f * 100)}</span></span>; } },
             { key: "rows", label: "Rows", num: true, optional: true, sort: (d) => d.rows_estimate, render: (d) => <span title={d.rows_estimate.toLocaleString("en-US")}>{count(d.rows_estimate)}</span> },
             { key: "eta", label: "Copy ETA", num: true, sort: (d) => dbCopyEtaMs(d, v.live?.[d.source_name], metrics.data) ?? (d.state === "base_copy" ? Infinity : -1), render: (d) => { const e = dbCopyEtaMs(d, v.live?.[d.source_name], metrics.data); return e ? <span title={`around ${time(Date.now() + e, false)}`}>{duration(e)}</span> : d.state === "base_copy" ? <span className="muted">Measuring</span> : "—"; } },
+            { key: "behind", label: "Behind", num: true, sort: (d) => lagOf(v, d) ?? -1, render: (d) => { const l = lagOf(v, d); return l === undefined ? <span className="faint">—</span> : <span className={l > 300 ? "crit-text" : l > 60 ? "warn-text" : ""} title="Age of the last heartbeat on the target">{duration(l * 1000)}</span>; } },
+            { key: "updated", label: "Updated", num: true, sort: (d) => sampleAge(v, d, now) ?? Infinity, render: (d) => { const a = sampleAge(v, d, now); return a === undefined ? <span className="faint">—</span> : <span className={a > 60000 ? "warn-text" : "muted"} title={`Last sampled ${time(now - a)}`}>{duration(a)} ago</span>; } },
             { key: "backlog", label: "Backlog", num: true, sort: (d) => backlogKnown(d) ?? -1, render: (d) => { const b = backlogKnown(d); return b === undefined ? "—" : <span title={`${b.toLocaleString("en-US")} bytes`}>{bytes(b)}</span>; } },
             { key: "trend", label: "Trend", optional: true, render: (d) => <Sparkline points={last(metrics.data, "backlog_bytes", d.source_name).map((p) => p.v).slice(-60)} label={`${d.source_name} backlog trend`} /> },
             { key: "replay", label: "Replay", num: true, optional: true, sort: (d) => v.live?.[d.source_name]?.replay_rate ?? -1, render: (d) => rate(v.live?.[d.source_name]?.replay_rate) },
@@ -187,6 +197,7 @@ export function OverviewTab() {
             { key: "hb", label: "Heartbeat", num: true, optional: true, sort: (d) => v.live?.[d.source_name]?.heartbeat_latency_s ?? -1, render: (d) => { const h = v.live?.[d.source_name]?.heartbeat_latency_s; return h === undefined ? "—" : duration(h * 1000); } },
           ]} />
       </Card>
+      <TrendsCard metrics={trends.data} from={runFrom} to={now} />
       <div className="grid cols-2">
         <Card title="Forecasts">
           {forecasts.length === 0 ? <p className="muted">No slot is growing toward its limit. Forecasts appear when retained WAL grows for 10 minutes.</p> : (

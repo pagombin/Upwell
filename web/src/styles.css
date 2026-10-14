@@ -332,3 +332,10 @@ pre.cmd { font-family: var(--font-mono); font-size: 12px; background: var(--sunk
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+/* Data-safety tiles (docs/design/migration-overview.md) */
+.tile.tone-ok { border-left: 3px solid var(--ok); }
+.tile.tone-warn { border-left: 3px solid var(--warn); background: color-mix(in srgb, var(--warn-bg) 60%, var(--surface)); }
+.tile.tone-crit { border-left: 3px solid var(--crit); background: color-mix(in srgb, var(--crit-bg) 60%, var(--surface)); }
+.tile.tone-neutral { border-left: 3px solid var(--border); }
+.warn-text { color: var(--warn); }
+.crit-text { color: var(--crit); }

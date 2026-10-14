@@ -309,3 +309,25 @@ test("logs: older lines, dates, search highlight, error navigation (D86)", async
   await page.getByLabel("Search messages").fill("orders");
   await expect(page.locator(".logrow mark").first()).toHaveText("orders");
 });
+
+test("migration overview: the first view answers safe, on track, needs me, next (D92)", async ({ page }) => {
+  const I = await ids(page.request);
+  await page.goto(`/migrations/${I.mig}`);
+  const summary = page.getByTestId("status-summary");
+  await expect(summary).toBeVisible();
+  await expect(summary).toContainText("Next:");
+  const strip = page.getByLabel("Data safety");
+  for (const l of ["Target behind by", "Data freshness", "Keeping up", "Verification"]) await expect(strip.getByText(l, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Trends over the run" })).toBeVisible();
+  for (const name of ["Target behind by", "Backlog", "Applied against source writes"]) await expect(page.getByRole("heading", { name, exact: true }).first()).toBeVisible();
+  // A database whose sample is old is shown as such, not hidden.
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}` || u.pathname.endsWith(`/migrations/${I.mig}`), async (r) => {
+    const real = await (await r.fetch()).json();
+    for (const k of Object.keys(real.live || {})) real.live[k].sampled_at = Date.now() - 5 * 60_000;
+    real.cluster = { ...(real.cluster || {}), source_stale_samples: 3 };
+    await r.fulfill({ json: real });
+  });
+  await page.reload();
+  await expect(strip.getByText("Stale", { exact: true })).toBeVisible();
+  await expect(strip).toContainText("did not answer");
+});

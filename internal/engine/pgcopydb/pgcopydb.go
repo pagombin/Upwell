@@ -406,8 +406,13 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 	}
 	if src != nil {
 		_, _, _ = ReleaseSlot(ctx, d.SourceConn.WithDB(d.Source), d.SlotName, 2*time.Second, 20*time.Second)
+		// A failed check is not "already gone": cleanup would report success
+		// with the slot still keeping WAL on the source.
 		var n int
-		src.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&n)
+		if err := src.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1`, d.SlotName).Scan(&n); err != nil {
+			src.Close(ctx)
+			return done, fmt.Errorf("checking for slot %s: %w", d.SlotName, err)
+		}
 		if n > 0 {
 			if _, err := src.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, d.SlotName); err != nil {
 				src.Close(ctx)
@@ -415,7 +420,10 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 			}
 			done = append(done, "dropped slot "+d.SlotName)
 		}
-		src.QueryRow(ctx, `SELECT count(*) FROM pg_publication WHERE pubname=$1`, d.SlotName).Scan(&n)
+		if err := src.QueryRow(ctx, `SELECT count(*) FROM pg_publication WHERE pubname=$1`, d.SlotName).Scan(&n); err != nil {
+			src.Close(ctx)
+			return done, fmt.Errorf("checking for publication %s: %w", d.SlotName, err)
+		}
 		if n > 0 {
 			if _, err := src.Exec(ctx, `DROP PUBLICATION IF EXISTS `+pg.QuoteIdent(d.SlotName)); err != nil {
 				src.Close(ctx)
@@ -437,7 +445,10 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		return done, fmt.Errorf("target: %w", err)
 	}
 	var n int
-	dst.QueryRow(ctx, `SELECT count(*) FROM pg_replication_origin WHERE roname=$1`, d.OriginName).Scan(&n)
+	if err := dst.QueryRow(ctx, `SELECT count(*) FROM pg_replication_origin WHERE roname=$1`, d.OriginName).Scan(&n); err != nil {
+		dst.Close(ctx)
+		return done, fmt.Errorf("checking for origin %s: %w", d.OriginName, err)
+	}
 	if n > 0 {
 		if _, err := dst.Exec(ctx, `SELECT pg_replication_origin_drop($1)`, d.OriginName); err != nil {
 			dst.Close(ctx)

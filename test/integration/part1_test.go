@@ -230,9 +230,13 @@ var holdCommit func()
 func TestP1LargeTransactions(t *testing.T) {
 	forPlugins(t, scenario{name: "bigtx", wantGO: true,
 		schema: `CREATE TABLE big(id bigint PRIMARY KEY, v text); CREATE TABLE sp(id int PRIMARY KEY, v int); CREATE TABLE lng(id int PRIMARY KEY, v text);
-			INSERT INTO big SELECT g, md5(g::text) FROM generate_series(1, 1000) g;`,
-		before: func(t *testing.T, e *Env, id, db string) func() {
-			// Opened before the start, committed once the database is in sync.
+			CREATE TABLE pad(id bigint PRIMARY KEY, v text);
+			INSERT INTO big SELECT g, md5(g::text) FROM generate_series(1, 1000) g;
+			INSERT INTO pad SELECT g, md5(g::text) FROM generate_series(1, 1500000) g;`,
+		// Opened during the base copy (after the slot exists: creating a
+		// logical slot waits for every running transaction), committed once
+		// the database is in sync.
+		during: func(t *testing.T, e *Env, id, db string) func() {
 			longCommit = holdTx(t, db, `INSERT INTO lng SELECT g, 'long ' || g FROM generate_series(1, 5000) g`)
 			return nil
 		},

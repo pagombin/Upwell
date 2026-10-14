@@ -62,6 +62,9 @@ type TestHooks struct {
 	AfterVerify func(ctx context.Context, db Database)
 	// FailVerificationStore makes storing verification results fail.
 	FailVerificationStore bool
+	// CutoverReadErr, when it returns an error, makes the cutover's reads
+	// of its databases fail (a store that cannot be read).
+	CutoverReadErr func() error
 }
 
 // Deps bundles constructor arguments.

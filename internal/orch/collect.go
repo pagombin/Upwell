@@ -161,7 +161,11 @@ func (c *collector) sample(ctx context.Context, m Migration, dbs []Database) {
 	defer scn.Close(ctx)
 	c.clearStale(m.ID, "source")
 	var cur string
-	pg.QueryRow(ctx, scn, `SELECT pg_current_wal_lsn()::text`).Scan(&cur)
+	if err := pg.QueryRow(ctx, scn, `SELECT pg_current_wal_lsn()::text`).Scan(&cur); err != nil {
+		// A sample that could not be taken is stale, never zero.
+		c.markStale(ctx, m, "source", err)
+		return
+	}
 	if p, ok := c.prev[m.ID+"|wal"]; ok && cur != "" {
 		dt := now.Sub(p.ts).Seconds()
 		if dt > 0 {
@@ -565,6 +569,19 @@ func (o *Orchestrator) LastMetricWrite() time.Time {
 // LastValue returns the newest in-memory value of a series.
 func (o *Orchestrator) LastValue(mig, db, name string) (float64, bool) {
 	return o.metrics.Last(mig, db, name)
+}
+
+// LastValueAt is LastValue with the time the value was sampled.
+func (o *Orchestrator) LastValueAt(mig, db, name string) (float64, time.Time, bool) {
+	return o.metrics.LastAt(mig, db, name)
+}
+
+// StaleSamples is how many samples in a row of one side ("source" or
+// "target") of a migration could not be taken.
+func (o *Orchestrator) StaleSamples(mig, side string) int {
+	o.metrics.mu.Lock()
+	defer o.metrics.mu.Unlock()
+	return o.metrics.stale[mig+"|"+side]
 }
 
 // ---------- alerts

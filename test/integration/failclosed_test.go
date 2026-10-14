@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pagombin/upwell/internal/check"
+	"github.com/pagombin/upwell/internal/orch"
 	"github.com/pagombin/upwell/internal/pg"
 	"github.com/pagombin/upwell/internal/pgpack"
 	"github.com/pagombin/upwell/internal/settings"
@@ -75,4 +78,39 @@ func TestPreflightFailsClosed(t *testing.T) {
 		t.Error(v)
 	}
 	t.Logf("%d of %d injected failures were reported as a blocker", total-len(violations), total)
+}
+
+// Part 1, general rule: no check may pass when it could not run. When the
+// store could not be read from the drain on, the cutover listed no database,
+// called the drain done, verified nothing and ended GO.
+func TestCutoverStoreReadFailureNeverGO(t *testing.T) {
+	var failing atomic.Bool
+	e := newEnv(t, "", orch.TestHooks{CutoverReadErr: func() error {
+		if failing.Load() {
+			return errors.New("injected: database is locked")
+		}
+		return nil
+	}})
+	db := uniq("it_storefail")
+	id := streamingMigration(t, e, "Store read failure", db)
+	exec1(t, srcConn, db, `INSERT INTO orders(customer, amount, note) VALUES (1, 1, 'before cutover')`)
+	time.Sleep(10 * time.Second)
+	go func() {
+		for i := 0; i < 600; i++ {
+			m := e.migration(id).Migration
+			if c := m.Flags.Cutover; c != nil && (c.Phase == "endpos" || c.Phase == "drain") {
+				failing.Store(true)
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+	e.startCutover(id)
+	v := e.migration(id).Migration.Flags.Verdict
+	t.Logf("verdict with the store unreadable from the drain on: %q", v)
+	if v == "GO" {
+		t.Fatal("GO although the cutover could not read its databases")
+	}
+	failing.Store(false)
+	e.abortAndClean(id, "Store read failure")
 }
