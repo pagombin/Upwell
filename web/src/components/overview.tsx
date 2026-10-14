@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
-import { dbCopyEtaMs, readyForCutover } from "../lib/derive";
-import { bytes, duration, rate, time } from "../lib/format";
+import { backlogKnown, dbCopyEtaMs, dbCopyFraction, readyForCutover } from "../lib/derive";
+import { bytes, duration, pct, rate, time } from "../lib/format";
 import type { Database, MigrationView, Series, SnapshotBlocker } from "../lib/types";
 import { CrosshairProvider, seriesFor, TimeChart } from "./charts";
 import { Card, label } from "./ui";
@@ -204,4 +204,86 @@ export function TrendsCard({ metrics, from, to }: { metrics: Series[] | undefine
       </CrosshairProvider>
     </Card>
   );
+}
+
+// ---------- one database (the database page's first view)
+
+export interface DBUnit { active: boolean; main_pid?: number }
+
+// dbSummary answers, for one database: what state it is in, whether it is on
+// track, what needs the operator, and what happens next.
+export function dbSummary(v: MigrationView, d: Database, live: Record<string, number>, metrics: Series[] | undefined, now: number): Summary {
+  const base = `/migrations/${v.migration.short_id}/databases/${encodeURIComponent(d.source_name)}`;
+  const actions: Summary["actions"] = [];
+  const lag = lagOf(v, d);
+  const behind = lag !== undefined ? `, ${duration(lag * 1000)} behind the source` : "";
+  const wait = v.snapshot_waits?.[d.source_name];
+  let state = label(d.state), tone: Tone = "ok", next = "";
+  switch (d.state) {
+    case "preparing":
+    case "base_copy": {
+      const f = dbCopyFraction(d, live), eta = dbCopyEtaMs(d, live, metrics);
+      state = d.state === "preparing" ? "Preparing the base copy" : `Base copy ${pct(f * 100)}${eta !== undefined ? `, about ${duration(eta)} left` : ""}`;
+      if (wait) {
+        tone = "warn";
+        actions.push({ db: d.source_name, to: base, text: `cannot start its base copy: the slot creation has waited ${duration(now - wait.since)} for ${wait.blockers.length} open transaction${wait.blockers.length === 1 ? "" : "s"} (below). Ask the customer to end ${wait.blockers.length === 1 ? "it" : "them"}.` });
+      }
+      next = eta !== undefined ? `The copy should finish around ${time(now + eta, false)}; then the database catches up on the changes made meanwhile.` : "Once the copy finishes, the database catches up on the changes made meanwhile. The ETA appears after a few minutes of target growth.";
+      break;
+    }
+    case "catch_up": {
+      const b = backlogKnown(d);
+      state = `Catching up${b !== undefined ? `: ${bytes(b)} to apply` : ""}${behind}`;
+      next = "In sync once the backlog is small and steady; the cutover needs every database in sync.";
+      break;
+    }
+    case "in_sync":
+      state = `In sync${d.in_sync_since ? ` for ${duration(now - d.in_sync_since)}` : ""}${behind}`;
+      next = v.migration.flags.verdict ? "" : "Ready for the cutover once every database is in sync (Cutover tab).";
+      break;
+    case "stopped":
+      tone = d.next_retry_at ? "warn" : "crit";
+      state = d.next_retry_at ? `Stopped; retrying ${d.next_retry_at > now ? `in ${duration(d.next_retry_at - now)}` : "now"}` : "Stopped";
+      if (!d.next_retry_at) actions.push({ db: d.source_name, to: base, text: "is stopped. Its slot keeps source WAL while it is: resume it." });
+      next = "Resuming continues from the slot; nothing is copied again.";
+      break;
+    case "failed":
+    case "degraded":
+      tone = "crit";
+      actions.push({ db: d.source_name, to: base, text: `${label(d.state).toLowerCase()}: read the last error below, fix its cause, then resume.` });
+      next = "Resuming continues from the slot.";
+      break;
+    case "restart_required":
+      tone = "crit";
+      actions.push({ db: d.source_name, to: base, text: "must restart from zero: the reason is below. Upwell never does this by itself." });
+      next = "Restart from zero drops this database's tables on the target and copies it again.";
+      break;
+    default:
+      next = "";
+  }
+  if (v.migration.flags.verdict) {
+    next = d.verdict === "GO" ? "Verified: applications can be switched once the migration's verdict is GO." : d.verdict === "NO-GO" ? "NO-GO: see the Verification tab for the failed checks." : next;
+  }
+  return { state, tone, actions, next };
+}
+
+export function dbSignals(v: MigrationView, d: Database, live: Record<string, number>, unit: DBUnit | null, now: number): Signal[] {
+  const out: Signal[] = [];
+  const lag = lagOf(v, d);
+  const hbAt = v.live?.[d.source_name]?.heartbeat_sampled_at;
+  out.push(lag === undefined
+    ? { label: "Target behind by", value: "—", sub: STREAMING.has(d.state) ? "waiting for the first heartbeat" : "measured once the database streams", tone: "neutral" }
+    : { label: "Target behind by", value: duration(lag * 1000), sub: hbAt ? `heartbeat read ${duration(Math.max(0, now - hbAt))} ago` : "age of the last heartbeat on the target", tone: lag > 300 ? "crit" : lag > 60 ? "warn" : "ok" });
+  const age = sampleAge(v, d, now);
+  out.push(age === undefined
+    ? { label: "Data freshness", value: "—", sub: "waiting for the first sample", tone: "neutral" }
+    : { label: "Data freshness", value: `${duration(age)} ago`, sub: age > STALE_MS ? "older than a minute: values may be out of date" : "last sample of this database", tone: age > STALE_MS ? "warn" : "ok" });
+  const ws = ["reserved", "extended", "unreserved", "lost"][live.slot_wal_status ?? -1];
+  out.push(ws === undefined
+    ? { label: "Slot", value: "—", sub: "no slot data yet", tone: "neutral" }
+    : { label: "Slot", value: ws === "lost" ? "WAL lost" : bytes(live.slot_retained_bytes ?? 0), sub: ws === "lost" ? "restart from zero required" : `WAL ${ws}${live.slot_headroom_bytes !== undefined ? ` · headroom ${bytes(live.slot_headroom_bytes)}` : ""}`, tone: ws === "lost" ? "crit" : ws === "unreserved" ? "warn" : "ok", title: "WAL the source keeps for this database's slot, and how much more it may keep before the slot is at risk." });
+  const running = !!unit?.active;
+  const expect = STREAMING.has(d.state) || d.state === "base_copy" || d.state === "preparing";
+  out.push({ label: "Engine", value: running ? "Running" : "Not running", sub: `${d.retry_count} automatic retr${d.retry_count === 1 ? "y" : "ies"}${unit?.main_pid ? ` · pid ${unit.main_pid}` : ""}`, tone: expect && !running ? "crit" : d.retry_count > 0 ? "warn" : running ? "ok" : "neutral" });
+  return out;
 }

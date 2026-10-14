@@ -6,10 +6,10 @@ import { backlogKnown } from "../lib/derive";
 import { useApi, useDebounced, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
 import type { Database, EventRow, Migration, Series, SnapshotWait } from "../lib/types";
-import { blockerText } from "../components/overview";
+import { blockerText, dbSignals, dbSummary, SafetyStrip, StatusSummary } from "../components/overview";
 import { CrosshairProvider, seriesFor, TimeChart } from "../components/charts";
 import { LogViewer } from "../components/logview";
-import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, Tile, Trunc, useAction } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, label, Pill, ProgressBar, Skeleton, Tile, Trunc, useAction } from "../components/ui";
 import { EventList, useMig } from "./migration";
 
 const RANGES = [{ m: 30, l: "30 minutes" }, { m: 180, l: "3 hours" }, { m: 720, l: "12 hours" }, { m: 2880, l: "2 days" }, { m: 10080, l: "7 days" }];
@@ -48,7 +48,6 @@ export function DatabaseScreen() {
   const stoppable = ["preparing", "base_copy", "catch_up", "in_sync", "degraded"].includes(x.state);
   const resumable = ["stopped", "failed"].includes(x.state);
   const restartable = view.data!.migration.flags.started && !view.data!.migration.flags.verdict && !["draining", "drained", "verified"].includes(x.state);
-  const ws = ["reserved", "extended", "unreserved", "lost"][live.slot_wal_status ?? -1];
   return (
     <div className="stack" style={{ gap: 24 }}>
       <div className="row">
@@ -61,6 +60,8 @@ export function DatabaseScreen() {
           {restartable && <button className="danger" onClick={() => setRestart(true)}>Restart from zero</button>}
         </>}
       </div>
+      <StatusSummary s={dbSummary(view.data!, x, live, mx.data, now)} />
+      <SafetyStrip signals={dbSignals(view.data!, x, live, d.data.unit, now)} />
       {x.last_error && <div className={`callout ${x.state === "failed" || x.state === "restart_required" || x.state === "degraded" ? "crit" : "warn"}`}><div className="body"><strong>{x.error_class ? `Last error (${x.error_class.replace(/_/g, " ")})` : "Last error"}</strong><span className="wrapany">{x.last_error}</span>{x.next_retry_at && <span className="small">{x.next_retry_at > now ? `Next automatic retry in ${duration(x.next_retry_at - now)}` : "Automatic retry due now"}</span>}</div></div>}
       {d.data.snapshot_wait && (
         <div className="callout warn" data-testid="snapshot-wait"><div className="body">
@@ -73,8 +74,8 @@ export function DatabaseScreen() {
       <div className="grid cols-4">
         <Tile label="Target" value={<Trunc className="mono">{x.target_name}</Trunc>} sub={`Plugin ${x.plugin || "auto"} · ${count(x.table_count)} tables`} />
         <Tile label="Backlog" value={backlogKnown(x) === undefined ? "—" : bytes(backlogKnown(x)!)} sub={`Replay ${rate(live.replay_rate)}`} />
-        <Tile label="Slot" value={live.slot_retained_bytes === undefined ? "—" : bytes(live.slot_retained_bytes)} sub={`${ws ? `WAL ${ws}` : "No slot data"}${live.slot_headroom_bytes !== undefined ? ` · headroom ${bytes(live.slot_headroom_bytes)}` : ""}`} />
-        <Tile label="Heartbeat" value={live.heartbeat_latency_s === undefined ? "—" : duration(live.heartbeat_latency_s * 1000)} sub={x.in_sync_since ? `In sync since ${time(x.in_sync_since, false)}` : "End-to-end latency"} />
+        <Tile label="Size on the target" value={live.target_size_bytes === undefined ? "—" : bytes(live.target_size_bytes)} sub={`Source ${bytes(live.source_size_bytes ?? x.size_bytes)}`} />
+        <Tile label="State since" value={time(x.updated_at, false)} sub={x.in_sync_since ? `In sync since ${time(x.in_sync_since, false)}` : label(x.state)} />
       </div>
       <Card title="Positions">
         <dl className="kv">

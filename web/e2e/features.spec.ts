@@ -331,3 +331,64 @@ test("migration overview: the first view answers safe, on track, needs me, next 
   await expect(strip.getByText("Stale", { exact: true })).toBeVisible();
   await expect(strip).toContainText("did not answer");
 });
+
+test("a base copy held back by an open transaction is named on the overview and the database page (D94)", async ({ page }) => {
+  const I = await ids(page.request);
+  const wait = { since: Date.now() - 12 * 60_000, at: Date.now() - 4000, blockers: [{ pid: 4242, database: "reports", user: "doadmin", application: "batch-report", client: "10.0.0.7", state: "idle in transaction", open_seconds: 7200 }] };
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}`, async (r) => {
+    const real = await (await r.fetch()).json();
+    real.snapshot_waits = { [I.db]: wait };
+    await r.fulfill({ json: real });
+  });
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}/databases/${I.db}`, async (r) => {
+    const real = await (await r.fetch()).json();
+    real.snapshot_wait = wait;
+    await r.fulfill({ json: real });
+  });
+  await page.goto(`/migrations/${I.mig}`);
+  const summary = page.getByTestId("status-summary");
+  await expect(summary).toContainText("cannot start its base copy");
+  await expect(summary).toContainText("PID 4242 (batch-report)");
+  await page.goto(`/migrations/${I.mig}/databases/${I.db}`);
+  const callout = page.getByTestId("snapshot-wait");
+  await expect(callout).toContainText("waited 12m");
+  await expect(callout).toContainText("PID 4242 (batch-report), doadmin in reports, transaction open 2h");
+});
+
+test("database page: the first view gives state, safety signals with their age, and what is next (Part 3)", async ({ page }) => {
+  const I = await ids(page.request);
+  await page.goto(`/migrations/${I.mig}/databases/${I.db}`);
+  await expect(page.getByTestId("status-summary")).toContainText("Next:");
+  const strip = page.getByLabel("Data safety");
+  for (const l of ["Target behind by", "Data freshness", "Slot", "Engine"]) await expect(strip.getByText(l, { exact: true })).toBeVisible();
+});
+
+test("cutover page: a summary of readiness, and each measured condition shows its age (Part 3)", async ({ page }) => {
+  const I = await ids(page.request);
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}/cutover/readiness`, (r) => r.fulfill({ json: { ready: false, conditions: [
+    { key: "lag", label: "Lag under the threshold", ok: false, detail: "backlog 2 GB", database: I.db, sample_age_ms: 95_000 },
+    { key: "alerts", label: "No critical alerts firing", ok: true, detail: "0 critical alert(s) firing" },
+  ] } }));
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.mig}`, async (r) => {
+    const real = await (await r.fetch()).json();
+    real.migration.flags = { ...real.migration.flags, verdict: undefined, cutover: undefined };
+    await r.fulfill({ json: real });
+  });
+  await page.goto(`/migrations/${I.mig}/cutover`);
+  const summary = page.getByTestId("status-summary");
+  await expect(summary).toContainText("Not ready: 1 of 2 conditions failing");
+  await expect(summary).toContainText("Lag under the threshold: backlog 2 GB");
+  await expect(page.getByLabel("Readiness conditions").getByText("sampled 1m 35s ago")).toBeVisible();
+});
+
+test("verification: warnings and uncompared tables are never a plain Passed (Part 3)", async ({ page }) => {
+  const I = await ids(page.request);
+  await page.route((u) => u.pathname === `/api/v1/migrations/${I.go}/verification`, (r) => r.fulfill({ json: { results: [
+    { database: "shop", check_id: "row_counts", result: "ok", title: "Row counts match", detail: { message: "Exact counts match for 3 table(s)." }, ts: Date.now() },
+    { database: "shop", check_id: "coverage", result: "warning", title: "Every row compared", detail: { message: "1 of 3 table(s) were not compared row by row: public.events." }, ts: Date.now() },
+  ] } }));
+  await page.goto(`/migrations/${I.go}/verification`);
+  await expect(page.getByText("Passed with 1 warning")).toBeVisible();
+  await expect(page.getByTestId("coverage-line")).toContainText("public.events");
+  await expect(page.getByTestId("verification-counts")).toContainText("0 passed, 1 passed with warnings, 0 failed");
+});
