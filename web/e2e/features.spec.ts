@@ -297,7 +297,7 @@ test("logs: older lines, dates, search highlight, error navigation (D86)", async
     for (let s = top - 1999; s <= top; s++) out.push(line(s, s > 2000 ? now - (4000 - s) * 1000 : now - day - (2000 - s) * 1000));
     return r.fulfill({ json: out });
   });
-  await page.route((u) => u.pathname.startsWith("/api/v1/stream/logs"), (r) => r.abort());
+  await page.route((u) => u.pathname.startsWith("/api/v1/stream/logs"), (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body: ": no live lines in this test\n\n" }));
   await page.goto(`/migrations/${I.mig}/logs`);
   await expect(page.getByText(/^2,000 lines/)).toBeVisible();
   await page.getByRole("button", { name: "Load older lines" }).click();
