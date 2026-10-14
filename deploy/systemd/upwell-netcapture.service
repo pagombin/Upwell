@@ -1,0 +1,12 @@
+[Unit]
+Description=Upwell packet headers of cluster connections, for network diagnostics (D97)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/lib/upwell/upwell-netcapture
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

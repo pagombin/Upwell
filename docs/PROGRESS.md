@@ -4,6 +4,14 @@
 
 The request names `overnight-build-2`; that branch already exists, holds the earlier audit of 643e4c1 and is merged into `main`, and reusing it would need a force push, so this work continues on `claude/new-session-agkd2d`, which contains it. The audit document itself was not attached; its findings were fixed on `overnight-build-2` (sections below).
 
+### Droplet requests during the run
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| install.sh failed to build pgcopydb against PostgreSQL 18 headers (`cannot find -lreadline`) | fixed (D96) | build dependencies `libreadline-dev`, `libnuma-dev`; named check of `pg_config --libs` before building; not reproducible here (PGDG blocked by the network policy) |
+| Base copies of `migration_poc` closed by the target 2.5 to 6 minutes in ("SSL error: unexpected eof"); diagnostics to capture what closes them | done (D97) | socket samples, kernel counters, root packet-header capture (`upwell-netcapture`), incident report with a verdict, all in the support bundle; `internal/netdiag` tests, `TestNetworkIncidentOnClosedConnection` |
+| Every log download was named `upwell-logs.jsonl` | done (D97) | names carry the scope and time; `TestDownloadName` |
+
 ### Part 1: scenarios
 
 | # | Scenario | Test | Plugin | Result | Fixed |

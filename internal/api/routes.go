@@ -1486,9 +1486,10 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) error {
 	if mig == "" {
 		mig = q.Get("migration")
 	}
+	short := ""
 	if mig != "" {
 		if m, err := s.Orch.GetMigration(r.Context(), mig); err == nil {
-			mig = m.ID
+			mig, short = m.ID, m.ShortID
 		}
 	}
 	sqlq := `SELECT seq, ts, level, component, COALESCE(migration_id,''), COALESCE(database,''), COALESCE(attempt,0), COALESCE(step,''), COALESCE(table_name,''), COALESCE(op,''), msg, COALESCE(raw,'') FROM logs WHERE 1=1`
@@ -1561,7 +1562,13 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) error {
 	}
 	if q.Get("format") == "download" {
 		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.Header().Set("Content-Disposition", `attachment; filename="upwell-logs.jsonl"`)
+		// Each download gets its own name (scope, time, newest line), never
+		// upwell-logs.jsonl again and again.
+		var newest int64
+		if len(out) > 0 {
+			newest = out[len(out)-1].Seq
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="`+downloadName([]string{"logs", short, q.Get("database"), q.Get("level")}, fmt.Sprintf("-to%d.jsonl", newest))+`"`)
 		enc := json.NewEncoder(w)
 		for _, rec := range out {
 			enc.Encode(rec)
@@ -1632,7 +1639,7 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	name := "upwell-" + rep.Migration.ShortID
+	name := strings.TrimSuffix(downloadName([]string{"report", rep.Migration.ShortID}, ""), "-")
 	switch format {
 	case "pdf":
 		b, err := rep.PDF()
@@ -1727,7 +1734,7 @@ func (s *Server) auditList(w http.ResponseWriter, r *http.Request) error {
 	}
 	if r.URL.Query().Get("format") == "download" {
 		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.Header().Set("Content-Disposition", `attachment; filename="upwell-audit.jsonl"`)
+		w.Header().Set("Content-Disposition", `attachment; filename="`+downloadName([]string{"audit"}, ".jsonl")+`"`)
 		enc := json.NewEncoder(w)
 		for i := len(es) - 1; i >= 0; i-- {
 			enc.Encode(es[i])
@@ -1984,4 +1991,23 @@ func (s *Server) openapi(w http.ResponseWriter, r *http.Request) error {
 		},
 	}
 	return writeJSON(w, 200, doc)
+}
+
+// downloadName is "upwell-<parts>-<UTC time><suffix>", with each part kept to
+// letters, digits, dots, dashes and underscores, so that every download of a
+// log, report or audit trail has its own file name.
+func downloadName(parts []string, suffix string) string {
+	keep := []string{"upwell"}
+	for _, p := range parts {
+		p = strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == '_' {
+				return r
+			}
+			return '_'
+		}, p)
+		if p != "" {
+			keep = append(keep, p)
+		}
+	}
+	return strings.Join(keep, "-") + "-" + time.Now().UTC().Format("20060102T150405Z") + suffix
 }

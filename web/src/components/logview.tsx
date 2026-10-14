@@ -233,7 +233,10 @@ export function LogViewer({ filter, height = 420, live = true, label = "Logs" }:
     const blob = new Blob(rows.map((r) => JSON.stringify(r) + "\n"), { type: "application/x-ndjson" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `upwell-logs-${rows.length ? rows[0].seq : 0}-${rows.length ? rows[rows.length - 1].seq : 0}.jsonl`;
+    // Its own name every time: scope, the lines' range and the time of download.
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    const scope = [filter.migration, filter.database].filter(Boolean).map((x) => String(x).replace(/[^A-Za-z0-9._-]/g, "_")).join("-");
+    a.download = `upwell-logs-${scope ? scope + "-" : ""}${rows.length ? rows[0].seq : 0}-${rows.length ? rows[rows.length - 1].seq : 0}-${stamp}.jsonl`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   };

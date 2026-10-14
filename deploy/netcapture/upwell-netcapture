@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# upwell-netcapture: run as root by upwell-netcapture.service (D97).
+#
+# Connections to the clusters were closed under the engine ("SSL error:
+# unexpected eof while reading") and nothing on the droplet said by whom.
+# This captures the packet headers that answer it, for the cluster addresses
+# Upwell lists in /var/lib/upwell/firewall/clusters ("ip port" lines):
+#   - TCP SYN, FIN and RST, and zero-window packets (who opened and who
+#     closed each connection, and with which TTL);
+#   - ICMP to or from those addresses, and ICMP unreachable and time
+#     exceeded from anywhere (the network path).
+# Headers only (snap length 128), never the data of a COPY. Files rotate
+# every 5 minutes (names ending in .pcap: Ubuntu's AppArmor profile lets
+# tcpdump write only those) and the oldest are removed beyond 200 MB or 48
+# hours. tcpdump drops to the upwell user after opening the interface, so
+# Upwell can read the files; it reads them into incident reports and the
+# support bundle. Restarts the capture when the list changes.
+set -uo pipefail
+LIST=${UPWELL_FIREWALL_DIR:-/var/lib/upwell/firewall}/clusters
+DIR=${UPWELL_CAPTURE_DIR:-/var/lib/upwell/diag/capture}
+MAX_MB=${UPWELL_CAPTURE_MAX_MB:-200}
+MAX_AGE_MIN=${UPWELL_CAPTURE_MAX_AGE_MIN:-2880}
+USER_=${UPWELL_CAPTURE_USER:-upwell}
+STATUS=$DIR/status
+
+install -d -m 0750 -o "$USER_" -g "$USER_" "$DIR"
+
+status() {
+  local tmp
+  tmp=$(mktemp "$DIR/.status.XXXXXX") || return
+  { echo "at $(date -u +%s) ($(date -u +%FT%TZ))"; printf '%s\n' "$@"; } >"$tmp"
+  chmod 0644 "$tmp"; chown "$USER_:$USER_" "$tmp" 2>/dev/null
+  mv -f "$tmp" "$STATUS"
+}
+
+valid_ip4() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do ((10#$o <= 255)) || return 1; done
+}
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+
+# filter prints the BPF filter for the listed IPv4 addresses (the TCP flag
+# offsets need IPv4; DigitalOcean clusters are reached over IPv4).
+filter() {
+  local tcp=() hosts=() ip port rest
+  declare -A seen=()
+  [[ -r $LIST ]] || return 0
+  while read -r ip port rest; do
+    [[ -z ${ip:-} || ${ip:0:1} == "#" || -n ${rest:-} ]] && continue
+    valid_ip4 "$ip" && valid_port "${port:-}" || continue
+    tcp+=("(host $ip and port $((10#$port)))")
+    [[ -n ${seen[$ip]:-} ]] || { hosts+=("host $ip"); seen[$ip]=1; }
+  done <"$LIST"
+  ((${#tcp[@]})) || return 0
+  local t h
+  t=$(printf ' or %s' "${tcp[@]}"); t=${t:4}
+  h=$(printf ' or %s' "${hosts[@]}"); h=${h:4}
+  printf '(tcp and (%s) and (tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0 or tcp[14:2] = 0)) or (icmp and (%s)) or icmp[icmptype] = icmp-unreach or icmp[icmptype] = icmp-timxceed' "$t" "$h"
+}
+
+prune() {
+  find "$DIR" -maxdepth 1 -name 'upwell-*.pcap' -mmin +"$MAX_AGE_MIN" -delete 2>/dev/null
+  local total=0 f s
+  while read -r f; do
+    s=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    total=$((total + s))
+    ((total > MAX_MB * 1024 * 1024)) && rm -f "$f"
+  done < <(ls -1t "$DIR"/upwell-*.pcap 2>/dev/null)
+}
+
+pid=""
+trap '[[ -n $pid ]] && kill "$pid" 2>/dev/null; exit 0' TERM INT
+while true; do
+  f=$(filter)
+  if [[ -z $f ]]; then
+    status "idle: no cluster address listed in $LIST"
+    sleep 30 & wait $!
+    continue
+  fi
+  if ! command -v tcpdump >/dev/null 2>&1; then
+    status "error: tcpdump is not installed"
+    sleep 60 & wait $!
+    continue
+  fi
+  mt=$(stat -c %Y "$LIST" 2>/dev/null || echo 0)
+  tcpdump -i any -nn -s 128 -U -Z "$USER_" -G 300 -w "$DIR/upwell-%Y%m%dT%H%M%SZ.pcap" "$f" 2>>"$DIR/tcpdump.log" &
+  pid=$!
+  sleep 2
+  if kill -0 "$pid" 2>/dev/null; then
+    status "running pid $pid" "filter $f"
+  else
+    wait "$pid"; code=$?
+    status "error: tcpdump exited with code $code (see $DIR/tcpdump.log)" "filter $f"
+    pid=""
+    sleep 30 & wait $!
+    continue
+  fi
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 15 & wait $! # interruptible: the TERM trap runs at once
+    prune
+    [[ $(stat -c %Y "$LIST" 2>/dev/null || echo 0) != "$mt" ]] && break
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  pid=""
+done

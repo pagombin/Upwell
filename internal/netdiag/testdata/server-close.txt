@@ -1,0 +1,16 @@
+2026-10-14 22:26:57.829222 IP (tos 0x0, ttl 64, id 7878, offset 0, flags [DF], proto TCP (6), length 60)
+    127.0.0.1.37078 > 127.0.0.1.55432: Flags [S], cksum 0xfe30 (incorrect -> 0x9418), seq 2895169572, win 65495, options [mss 65495,sackOK,TS val 3853907995 ecr 0,nop,wscale 10], length 0
+2026-10-14 22:26:57.829246 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    127.0.0.1.55432 > 127.0.0.1.37078: Flags [S.], cksum 0xfe30 (incorrect -> 0x8f12), seq 2976117409, ack 2895169573, win 65483, options [mss 65495,sackOK,TS val 2341393772 ecr 3853907995,nop,wscale 10], length 0
+2026-10-14 22:26:59.318459 IP (tos 0x0, ttl 64, id 37458, offset 0, flags [DF], proto TCP (6), length 60)
+    127.0.0.1.37084 > 127.0.0.1.55432: Flags [S], cksum 0xfe30 (incorrect -> 0x68b2), seq 1039769131, win 65495, options [mss 65495,sackOK,TS val 2712076315 ecr 0,nop,wscale 10], length 0
+2026-10-14 22:26:59.318478 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    127.0.0.1.55432 > 127.0.0.1.37084: Flags [S.], cksum 0xfe30 (incorrect -> 0x1f5e), seq 3110897805, ack 1039769132, win 65483, options [mss 65495,sackOK,TS val 1880528702 ecr 2712076315,nop,wscale 10], length 0
+2026-10-14 22:26:59.333805 IP (tos 0x0, ttl 64, id 37467, offset 0, flags [DF], proto TCP (6), length 52)
+    127.0.0.1.37084 > 127.0.0.1.55432: Flags [F.], cksum 0xfe28 (incorrect -> 0x4396), seq 366, ack 700, win 64, options [nop,nop,TS val 2712076330 ecr 1880528717], length 0
+2026-10-14 22:26:59.336151 IP (tos 0x0, ttl 64, id 937, offset 0, flags [DF], proto TCP (6), length 52)
+    127.0.0.1.55432 > 127.0.0.1.37078: Flags [F.], cksum 0xfe28 (incorrect -> 0xad99), seq 773, ack 260, win 64, options [nop,nop,TS val 2341395278 ecr 3853908009], length 0
+2026-10-14 22:26:59.336304 IP (tos 0x0, ttl 64, id 7886, offset 0, flags [DF], proto TCP (6), length 52)
+    127.0.0.1.37078 > 127.0.0.1.55432: Flags [F.], cksum 0xfe28 (incorrect -> 0xa7c3), seq 260, ack 774, win 64, options [nop,nop,TS val 3853909503 ecr 2341395277], length 0
+2026-10-14 22:26:59.336456 IP (tos 0x0, ttl 64, id 56358, offset 0, flags [DF], proto TCP (6), length 52)
+    127.0.0.1.55432 > 127.0.0.1.37084: Flags [F.], cksum 0xfe28 (incorrect -> 0x4392), seq 700, ack 367, win 64, options [nop,nop,TS val 1880528720 ecr 2712076330], length 0

@@ -108,13 +108,13 @@ backup_store() {
 if [[ $MODE == uninstall ]]; then
   n=$(engines_active)
   if [[ $n -gt 0 && $FORCE -eq 0 ]]; then fail "$n engine unit(s) are running. Finish or abort the migrations first, or pass --force."; fi
-  systemctl disable --now upwell.service upwell-health.timer upwell-firewall.path >/dev/null 2>&1 || true
+  systemctl disable --now upwell.service upwell-health.timer upwell-firewall.path upwell-netcapture.service >/dev/null 2>&1 || true
   systemctl stop 'upwell-eng@*' >/dev/null 2>&1 || true
   # The cluster rules Upwell added (D88); the conntrack setting reverts at the next boot.
   ufw show added 2>/dev/null | sed -nE "s/^ufw allow proto tcp from ([0-9a-fA-F.:]+) port ([0-9]+) comment 'upwell cluster'\$/\1 \2/p" | while read -r ip port; do
     ufw delete allow proto tcp from "$ip" port "$port" >/dev/null 2>&1 || true
   done
-  rm -f "$UNIT_DIR/upwell.service" "$UNIT_DIR/upwell-eng@.service" "$UNIT_DIR/upwell-health.service" "$UNIT_DIR/upwell-health.timer" "$UNIT_DIR/upwell-firewall.service" "$UNIT_DIR/upwell-firewall.path" /usr/local/lib/upwell/upwell-firewall /etc/sysctl.d/60-upwell-conntrack.conf /etc/modules-load.d/upwell.conf "$POLKIT" "$LOGROTATE" "$BIN" "$BIN.prev"
+  rm -f "$UNIT_DIR/upwell.service" "$UNIT_DIR/upwell-eng@.service" "$UNIT_DIR/upwell-health.service" "$UNIT_DIR/upwell-health.timer" "$UNIT_DIR/upwell-firewall.service" "$UNIT_DIR/upwell-firewall.path" /usr/local/lib/upwell/upwell-firewall "$UNIT_DIR/upwell-netcapture.service" /usr/local/lib/upwell/upwell-netcapture /etc/sysctl.d/60-upwell-conntrack.conf /etc/modules-load.d/upwell.conf "$POLKIT" "$LOGROTATE" "$BIN" "$BIN.prev"
   systemctl daemon-reload
   say "uninstall" "removed the service, units, polkit rule and binary"
   if [[ $PURGE -eq 1 ]]; then
@@ -141,7 +141,7 @@ fi
 # ---------- packages
 
 # sqlite3 takes consistent backups of the store before an upgrade.
-PKGS=(curl ca-certificates gnupg ufw chrony jq openssl sqlite3)
+PKGS=(curl ca-certificates gnupg ufw chrony jq openssl sqlite3 iproute2 tcpdump)
 # polkit lets the upwell user start and stop its engine units (the rule below).
 if apt-cache show polkitd >/dev/null 2>&1; then PKGS+=(polkitd); else PKGS+=(policykit-1); fi
 missing=()
@@ -373,6 +373,9 @@ mkdir -p /usr/local/lib/upwell
 place "$SELF_DIR/firewall/upwell-firewall" /usr/local/lib/upwell/upwell-firewall 0755 "firewall helper"
 place "$SELF_DIR/firewall/60-upwell-conntrack.conf" /etc/sysctl.d/60-upwell-conntrack.conf 0644 "conntrack setting"
 place "$SELF_DIR/firewall/upwell-modules.conf" /etc/modules-load.d/upwell.conf 0644 "conntrack module at boot"
+# Network diagnostics (D97): packet headers of the cluster connections.
+place "$SELF_DIR/systemd/upwell-netcapture.service" "$UNIT_DIR/upwell-netcapture.service" 0644 "unit upwell-netcapture.service"
+place "$SELF_DIR/netcapture/upwell-netcapture" /usr/local/lib/upwell/upwell-netcapture 0755 "capture helper"
 mkdir -p "$(dirname "$POLKIT")"
 place "$SELF_DIR/polkit/50-upwell.rules" "$POLKIT" 0644 "polkit rule"
 place "$SELF_DIR/logrotate/upwell" "$LOGROTATE" 0644 "log rotation"
@@ -455,6 +458,18 @@ if ! check; then
   systemctl enable --now upwell-firewall.path >>"$LOGFILE" 2>&1 || fail "enabling upwell-firewall.path failed"
   systemctl start upwell-firewall.service >>"$LOGFILE" 2>&1 || fail "upwell-firewall.service failed: journalctl -u upwell-firewall -n 20"
   say "cluster firewall" "$(grep -c '^allowed' "$DATA/firewall/status" 2>/dev/null || echo 0) cluster address(es) allowed"
+fi
+
+# ---------- network diagnostics (D97)
+
+if check; then
+  systemctl is-active upwell-netcapture.service >/dev/null 2>&1 && say "network capture" "unchanged (running)" || would "network capture" "enable and start upwell-netcapture.service"
+else
+  install -d -m 0750 -o upwell -g upwell "$DATA/diag" "$DATA/diag/capture" "$DATA/diag/net"
+  systemctl enable upwell-netcapture.service >>"$LOGFILE" 2>&1 || fail "enabling upwell-netcapture.service failed"
+  # Restarted so a changed helper takes effect; it captures headers only.
+  systemctl restart upwell-netcapture.service >>"$LOGFILE" 2>&1 || fail "upwell-netcapture.service failed: journalctl -u upwell-netcapture -n 20"
+  say "network capture" "running (headers of SYN, FIN, RST, zero-window and ICMP packets to the clusters; $DATA/diag/capture)"
 fi
 
 # ---------- service

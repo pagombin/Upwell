@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/pagombin/upwell/internal/config"
 	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/logx"
+	"github.com/pagombin/upwell/internal/netdiag"
 	"github.com/pagombin/upwell/internal/runner"
 	"github.com/pagombin/upwell/internal/secrets"
 	"github.com/pagombin/upwell/internal/settings"
@@ -26,6 +28,7 @@ import (
 
 // Orchestrator owns migration state.
 type Orchestrator struct {
+	net      *netdiag.Recorder // D97: connection samples and incident reports
 	cfg      config.Config
 	st       *store.Store
 	vault    *secrets.Vault
@@ -85,6 +88,7 @@ func New(d Deps) *Orchestrator {
 	o := &Orchestrator{cfg: d.Config, st: d.Store, vault: d.Vault, eng: d.Engine, run: d.Runner, log: d.Logger, bus: d.Bus, audit: d.Audit, settings: d.Settings, StartedAt: time.Now()}
 	o.tails = newTailers(o)
 	o.metrics = newCollector(o)
+	o.net = netdiag.New(filepath.Join(d.Config.DataDir, "diag", "net"))
 	o.alerts = newAlerter(o)
 	return o
 }

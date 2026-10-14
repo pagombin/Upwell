@@ -25,6 +25,12 @@ func (o *Orchestrator) firewallDir() string { return filepath.Join(o.cfg.DataDir
 // clusterAddrs resolves every source and target cluster of the migrations
 // that are not cleaned up, as "ip port" lines.
 func (o *Orchestrator) clusterAddrs(ctx context.Context) ([]string, []string) {
+	return o.clusterAddrList(ctx, false)
+}
+
+// clusterAddrList is clusterAddrs, optionally with loopback addresses (the
+// firewall never needs them; network diagnostics watch every cluster).
+func (o *Orchestrator) clusterAddrList(ctx context.Context, loopback bool) ([]string, []string) {
 	ms, err := o.ListMigrations(ctx)
 	if err != nil {
 		return nil, []string{err.Error()}
@@ -54,7 +60,7 @@ func (o *Orchestrator) clusterAddrs(ctx context.Context) ([]string, []string) {
 				continue
 			}
 			for _, ip := range ips {
-				if ip.IP.IsLoopback() {
+				if ip.IP.IsLoopback() && !loopback {
 					continue
 				}
 				l := ip.IP.String() + " " + strconv.Itoa(c.port)

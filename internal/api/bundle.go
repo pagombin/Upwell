@@ -31,6 +31,7 @@ type bundleFile struct {
 	Name       string `json:"name"`
 	Size       int    `json:"size"`
 	Redactions int    `json:"redactions"`
+	Binary     bool   `json:"binary,omitempty"` // packet captures: headers only, not redacted
 	data       []byte
 }
 
@@ -167,6 +168,51 @@ func (s *Server) buildBundle(ctx context.Context, id string) (orch.Migration, []
 			add("logs/engine-"+d.SourceName+".log", b)
 		}
 	}
+	// D97: network diagnostics. Incident reports of this migration, the
+	// connection samples, the capture unit's status and its recent packet
+	// headers (SYN, FIN, RST, zero window, ICMP; no payload).
+	diag := s.Orch.NetDiagDir()
+	if ents, err := os.ReadDir(diag); err == nil {
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), "incident-") && strings.Contains(e.Name(), "-"+m.ShortID+"-") {
+				if b, err := os.ReadFile(filepath.Join(diag, e.Name())); err == nil {
+					add("network/"+e.Name(), b)
+				}
+			}
+		}
+	}
+	if b := tailFile(filepath.Join(diag, "net", "sockets.jsonl"), 4<<20); len(b) > 0 {
+		add("network/sockets.jsonl", b)
+	}
+	if b, err := os.ReadFile(filepath.Join(diag, "capture", "status")); err == nil {
+		add("network/capture-status.txt", b)
+	} else {
+		add("network/capture-status.txt", []byte("no status: the root unit upwell-netcapture is not installed or has not run ("+err.Error()+")\n"))
+	}
+	if ents, err := os.ReadDir(filepath.Join(diag, "capture")); err == nil {
+		type pc struct {
+			name string
+			mod  time.Time
+			size int64
+		}
+		var caps []pc
+		for _, e := range ents {
+			if fi, err := e.Info(); err == nil && strings.HasPrefix(e.Name(), "upwell-") && strings.HasSuffix(e.Name(), ".pcap") && time.Since(fi.ModTime()) < 48*time.Hour {
+				caps = append(caps, pc{e.Name(), fi.ModTime(), fi.Size()})
+			}
+		}
+		sort.Slice(caps, func(i, j int) bool { return caps[i].mod.After(caps[j].mod) })
+		var total int64
+		for _, c := range caps {
+			if total+c.size > 40<<20 {
+				break
+			}
+			if b, err := os.ReadFile(filepath.Join(diag, "capture", c.name)); err == nil {
+				total += int64(len(b))
+				files = append(files, bundleFile{Name: "network/" + c.name, data: b, Binary: true})
+			}
+		}
+	}
 	engVer, _ := s.Orch.Engine().Version(ctx)
 	pgDump := ""
 	if out, err := exec.CommandContext(ctx, filepath.Join(s.Cfg.Engine.PgBinDir, "pg_dump"), "--version").Output(); err == nil {
@@ -181,7 +227,9 @@ func (s *Server) buildBundle(ctx context.Context, id string) (orch.Migration, []
 	}
 	sort.Slice(literals, func(i, j int) bool { return len(literals[i]) > len(literals[j]) })
 	for i := range files {
-		files[i].data, files[i].Redactions = redact(files[i].data, literals)
+		if !files[i].Binary {
+			files[i].data, files[i].Redactions = redact(files[i].data, literals)
+		}
 		files[i].Size = len(files[i].data)
 	}
 	manifest := map[string]any{"generated_at": store.Now(), "upwell": s.Version, "migration": m.ShortID, "name": m.Name, "redaction_rules": RedactionRules, "files": files}

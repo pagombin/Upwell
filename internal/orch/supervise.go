@@ -20,6 +20,7 @@ import (
 func (o *Orchestrator) Run(ctx context.Context) {
 	o.Reconcile(ctx)
 	go o.metrics.rollupLoop(ctx)
+	go o.netLoop(ctx)
 	for {
 		o.Tick(ctx)
 		iv := o.globalSettings(ctx).Int("sample_interval_seconds")

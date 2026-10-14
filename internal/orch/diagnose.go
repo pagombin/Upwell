@@ -14,7 +14,7 @@ import (
 // end whether its PostgreSQL server restarted during the attempt, which
 // tells a crash, an out-of-memory kill or a failover apart from a proxy or
 // load balancer closing one connection.
-func (o *Orchestrator) failureReason(ctx context.Context, m Migration, d Database, c classes) string {
+func (o *Orchestrator) failureReason(ctx context.Context, m Migration, d Database, c classes) (reason string) {
 	if c.connLost == "" {
 		return c.rootCause()
 	}
@@ -40,6 +40,12 @@ func (o *Orchestrator) failureReason(ctx context.Context, m Migration, d Databas
 	}
 	var started int64
 	o.st.DB.QueryRowContext(ctx, `SELECT started_at FROM attempts WHERE database_id=? ORDER BY number DESC LIMIT 1`, d.ID).Scan(&started)
+	// D97: what the droplet saw of the closed connection, in the background.
+	failedAt := time.Now()
+	defer func() {
+		why := reason
+		go o.netIncident(m, d, c.connLost, side.WithDB(d.SourceName), why, time.UnixMilli(started), failedAt)
+	}()
 	// The failure is often seen while the cluster is still coming back
 	// (a restart or failover takes seconds): keep trying for up to 30 s.
 	conn, err := pg.Connect(cctx, side, 10*time.Second)
