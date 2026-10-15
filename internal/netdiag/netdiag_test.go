@@ -2,6 +2,7 @@ package netdiag
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,10 +31,19 @@ func TestParseSS(t *testing.T) {
 		t.Fatalf("second socket: %+v", s[1])
 	}
 	v := strings.Join(sockVerdict(s), " ")
-	for _, want := range []string{"CLOSE-WAIT", "zero send window", "received nothing for 1m5s", "3 segment(s)"} {
+	for _, want := range []string{"CLOSE-WAIT", "zero send window"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("verdict %q lacks %q", v, want)
 		}
+	}
+	// A busy connection (data outstanding) receiving nothing is a COPY, not
+	// silence; an idle one receiving nothing is.
+	if strings.Contains(v, "received nothing") {
+		t.Errorf("silence reported on a busy connection: %s", v)
+	}
+	idle := parseSS("ESTAB 0 0 10.0.0.5:40001 159.89.220.21:5432\n\t rtt:30/2 lastrcv:65000 lastsnd:65000\n")
+	if v := strings.Join(sockVerdict(idle), " "); !strings.Contains(v, "received nothing for 1m5s") {
+		t.Errorf("idle silence not reported: %s", v)
 	}
 }
 
@@ -142,5 +152,39 @@ func TestHelperCaptureFormat(t *testing.T) {
 	}
 	if v := strings.Join(closeVerdict(pk, map[string]bool{"127.0.0.1.55432": true}, "target"), " "); !strings.Contains(v, "closed 1 connection(s) first") {
 		t.Fatalf("verdict %s", v)
+	}
+}
+
+// The droplet's samples (2026-10-15, addresses replaced): a COPY connection
+// to the target stopped being acknowledged at 14:19:28 and disappeared 120 s
+// later, when the kernel's TCP_USER_TIMEOUT ended it; two others stalled for
+// 10 to 25 s and recovered. The verdict must say the droplet ended it, not
+// that the target closed it, and name the bursts of loss.
+func TestStallVerdictFromDroplet(t *testing.T) {
+	b, err := os.ReadFile("testdata/droplet-stall.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var samples []Sample
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var s Sample
+		if err := json.Unmarshal([]byte(l), &s); err != nil {
+			t.Fatal(err)
+		}
+		samples = append(samples, s)
+	}
+	failed, _ := time.Parse(time.RFC3339, "2026-10-15T14:21:30Z")
+	v := strings.Join(stallVerdict(samples, map[string]bool{"198.51.100.20:5432": true}, failed, 120*time.Second), " ")
+	t.Log(v)
+	for _, want := range []string{"192.0.2.10:51326 -> 198.51.100.20:5432 stopped being acknowledged at 14:19:2", "when it disappeared", "ended here, not closed by the other end", "recovered by themselves"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("verdict lacks %q", want)
+		}
+	}
+	d := Deltas(samples)
+	cv := strings.Join(counterVerdict(d), " ")
+	t.Log(cv)
+	if !strings.Contains(cv, "retransmitted") || !strings.Contains(cv, "SYN") {
+		t.Errorf("counter verdict lacks the loss: %s", cv)
 	}
 }

@@ -26,6 +26,9 @@ type IncidentInput struct {
 	// could not be read.
 	ServerSessions []string
 	ServerErr      string
+	// UserTimeout is the engine connections' TCP_USER_TIMEOUT (0: the
+	// kernel's own limit), to explain a connection the kernel gave up on.
+	UserTimeout time.Duration
 }
 
 // Packet is one captured TCP control packet (or ICMP message).
@@ -205,6 +208,7 @@ func (r *Recorder) Incident(ctx context.Context, in IncidentInput) (string, stri
 	if len(samples) == 0 {
 		b.WriteString("no samples (the sampler starts with the first migration that has clusters)\n")
 	}
+	verdict = append(verdict, stallVerdict(samples, peerSet, in.FailedAt, in.UserTimeout)...)
 	verdict = append(verdict, sockVerdict(last)...)
 
 	// 3. Kernel counters that changed.
@@ -217,6 +221,7 @@ func (r *Recorder) Incident(ctx context.Context, in IncidentInput) (string, stri
 		b.WriteString("none\n")
 	}
 	verdict = append(verdict, counterVerdict(d)...)
+	verdict = append(verdict, linkVerdict(d)...)
 
 	// 4. Kernel log: firewall drops and conntrack trouble.
 	b.WriteString("\n== Kernel log (ufw blocks for these addresses, conntrack, TCP) ==\n")
@@ -418,7 +423,7 @@ func closeVerdict(pk []Packet, peers map[string]bool, side string) []string {
 
 func sockVerdict(last []Sock) []string {
 	var out []string
-	cw, zero, maxRcv, maxUnacked := 0, 0, 0, 0
+	cw, zero, maxRcv := 0, 0, 0
 	for _, k := range last {
 		if k.State == "CLOSE-WAIT" {
 			cw++
@@ -426,11 +431,10 @@ func sockVerdict(last []Sock) []string {
 		if k.Fields["snd_wnd"] == "0" {
 			zero++
 		}
-		if v, err := strconv.Atoi(k.Fields["lastrcv"]); err == nil && k.State == "ESTAB" && v > maxRcv {
+		// Silence matters only on an idle connection: during a COPY the
+		// server sends nothing back but acknowledgements.
+		if v, err := strconv.Atoi(k.Fields["lastrcv"]); err == nil && k.State == "ESTAB" && k.SendQ == 0 && k.Fields["unacked"] == "" && v > maxRcv {
 			maxRcv = v
-		}
-		if v, err := strconv.Atoi(k.Fields["unacked"]); err == nil && v > maxUnacked {
-			maxUnacked = v
 		}
 	}
 	if len(last) == 0 {
@@ -445,10 +449,122 @@ func sockVerdict(last []Sock) []string {
 	if maxRcv > 60000 {
 		out = append(out, fmt.Sprintf("One connection had received nothing for %s before the failure.", (time.Duration(maxRcv)*time.Millisecond).Round(time.Second)))
 	}
-	if maxUnacked > 0 {
-		out = append(out, fmt.Sprintf("Up to %d segment(s) were waiting for an acknowledgement.", maxUnacked))
+	return out
+}
+
+type stall struct {
+	conn       string
+	from, to   time.Time
+	acked      string
+	unacked    string
+	backoff    string
+	gone       bool // the connection disappeared while stalled
+	lastSample time.Time
+}
+
+// stallVerdict finds, from every sample, the connections whose sent data
+// stopped being acknowledged (bytes_acked unchanged while segments were
+// outstanding): how long, and whether they recovered or disappeared. A
+// connection that disappears stalled after the user timeout was ended by
+// this droplet's kernel, not closed by the other end.
+func stallVerdict(samples []Sample, peers map[string]bool, failedAt time.Time, userTimeout time.Duration) []string {
+	type st struct {
+		acked string
+		since time.Time
+		last  Sock
+		at    time.Time
+	}
+	cur := map[string]*st{}
+	var done []stall
+	seen := map[string]bool{}
+	for _, s := range samples {
+		now := map[string]bool{}
+		for _, k := range s.Socks {
+			if !peers[k.Peer] || k.State != "ESTAB" {
+				continue
+			}
+			key := k.Local + " -> " + k.Peer
+			now[key] = true
+			seen[key] = true
+			a := k.Fields["bytes_acked"]
+			c := cur[key]
+			stalled := k.Fields["unacked"] != "" && k.Fields["unacked"] != "0"
+			switch {
+			case c == nil:
+				cur[key] = &st{acked: a, last: k, at: s.At}
+			case a == c.acked && stalled:
+				if c.since.IsZero() {
+					c.since = c.at // stalled since the previous sample
+				}
+				c.last, c.at = k, s.At
+			default:
+				if !c.since.IsZero() && s.At.Sub(c.since) >= 10*time.Second {
+					done = append(done, stall{conn: key, from: c.since, to: s.At, acked: c.acked, unacked: c.last.Fields["unacked"], backoff: c.last.Fields["backoff"]})
+				}
+				cur[key] = &st{acked: a, last: k, at: s.At}
+			}
+		}
+		for key, c := range cur {
+			if now[key] {
+				continue
+			}
+			if !c.since.IsZero() {
+				done = append(done, stall{conn: key, from: c.since, to: c.at, acked: c.acked, unacked: c.last.Fields["unacked"], backoff: c.last.Fields["backoff"], gone: true, lastSample: c.at})
+			}
+			delete(cur, key)
+		}
+	}
+	for key, c := range cur {
+		if !c.since.IsZero() && c.at.Sub(c.since) >= 10*time.Second {
+			done = append(done, stall{conn: key, from: c.since, to: c.at, acked: c.acked, unacked: c.last.Fields["unacked"], backoff: c.last.Fields["backoff"]})
+		}
+	}
+	var out []string
+	recovered := 0
+	var longest time.Duration
+	for _, x := range done {
+		if x.gone {
+			s := fmt.Sprintf("Connection %s stopped being acknowledged at %s UTC (%s bytes acknowledged, %s segment(s) outstanding, retransmission backoff %s) and was still unacknowledged %s later, when it disappeared",
+				x.conn, x.from.Format("15:04:05"), x.acked, orQ(x.unacked), orQ(x.backoff), x.to.Sub(x.from).Round(time.Second))
+			if userTimeout > 0 {
+				s += fmt.Sprintf(": this droplet's kernel ends a connection after %s without an acknowledgement (engine_tcp_user_timeout_seconds), so it was ended here, not closed by the other end", userTimeout)
+			}
+			out = append(out, s+".")
+			continue
+		}
+		recovered++
+		if d := x.to.Sub(x.from); d > longest {
+			longest = d
+		}
+	}
+	if recovered > 0 {
+		out = append(out, fmt.Sprintf("%d other stall(s) of 10 s or more without any acknowledgement recovered by themselves (the longest about %s): the path drops packets in bursts.", recovered, longest.Round(time.Second)))
 	}
 	return out
+}
+
+func orQ(s string) string {
+	if s == "" {
+		return "?"
+	}
+	return s
+}
+
+// linkVerdict names packets dropped on this droplet's interfaces or queues.
+func linkVerdict(d map[string]int64) []string {
+	var parts []string
+	for _, k := range sortedKeys(d) {
+		if (strings.HasPrefix(k, "link.") && (strings.HasSuffix(k, "_dropped") || strings.HasSuffix(k, "_errors") || strings.HasSuffix(k, "_missed"))) ||
+			(strings.HasPrefix(k, "qdisc.") && strings.HasSuffix(k, ".drops")) {
+			if d[k] > 0 {
+				parts = append(parts, fmt.Sprintf("%s %+d", k, d[k]))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return []string{"No packet was dropped on this droplet's interfaces or queues in the window."}
+	}
+	return []string{"Packets were dropped on this droplet itself: " + strings.Join(parts, ", ") + "."}
 }
 
 func counterVerdict(d map[string]int64) []string {
@@ -458,6 +574,19 @@ func counterVerdict(d map[string]int64) []string {
 	}
 	if n := d["conntrack.invalid"] + d["conntrack.drop"] + d["conntrack.insert_failed"] + d["conntrack.early_drop"]; n > 0 {
 		out = append(out, fmt.Sprintf("conntrack marked or dropped %d packet(s) in the window (invalid %d, drop %d, insert_failed %d, early_drop %d).", n, d["conntrack.invalid"], d["conntrack.drop"], d["conntrack.insert_failed"], d["conntrack.early_drop"]))
+	}
+	if d["Tcp.OutSegs"] > 0 && d["Tcp.RetransSegs"] > 0 {
+		pct := float64(d["Tcp.RetransSegs"]) * 100 / float64(d["Tcp.OutSegs"])
+		s := fmt.Sprintf("This droplet retransmitted %d of %d TCP segments it sent in the window (%.1f%%)", d["Tcp.RetransSegs"], d["Tcp.OutSegs"], pct)
+		if pct >= 2 {
+			s += ": far above a healthy path (well under 1%), so packets are being lost between this droplet and the clusters"
+		}
+		out = append(out, s+".")
+	} else if d["Tcp.RetransSegs"] > 0 {
+		out = append(out, fmt.Sprintf("This droplet retransmitted %d TCP segment(s) in the window.", d["Tcp.RetransSegs"]))
+	}
+	if d["TcpExt.TCPSynRetrans"] > 0 {
+		out = append(out, fmt.Sprintf("%d connection attempt(s) had to resend their SYN (the first packet was lost).", d["TcpExt.TCPSynRetrans"]))
 	}
 	if d["Tcp.EstabResets"] > 0 {
 		out = append(out, fmt.Sprintf("%d established connection(s) on this droplet were reset in the window (Tcp.EstabResets).", d["Tcp.EstabResets"]))

@@ -35,8 +35,11 @@ type DatabaseSpec struct {
 	Plugin      string // empty: engine default
 	RunDir      string
 	TableJobs   int
-	IndexJobs   int
-	SplitLarger string
+	// TCPUserTimeout ends an engine connection whose data goes unacknowledged
+	// this long (0: the kernel's own limit). D90, D98.
+	TCPUserTimeout time.Duration
+	IndexJobs      int
+	SplitLarger    string
 	// DropIfExists cleans the target of every object in the source's schema
 	// before restoring it: set on a launch that follows an earlier attempt
 	// (a restart from zero), whose objects may still be on the target.

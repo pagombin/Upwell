@@ -52,7 +52,8 @@ func (o *Orchestrator) netIncident(m Migration, d Database, side string, conn pg
 	if !o.globalSettings(ctx).Bool("network_diagnostics") || !o.metrics.due(d.ID+"|netincident", time.Minute) {
 		return // off, or this failure already has its report
 	}
-	in := netdiag.IncidentInput{Migration: m.ShortID, Database: d.SourceName, Side: side, Reason: reason, AttemptStart: attemptStart, FailedAt: failedAt}
+	in := netdiag.IncidentInput{Migration: m.ShortID, Database: d.SourceName, Side: side, Reason: reason, AttemptStart: attemptStart, FailedAt: failedAt,
+		UserTimeout: time.Duration(o.Settings(ctx, m).Int("engine_tcp_user_timeout_seconds")) * time.Second}
 	if ips, err := net.DefaultResolver.LookupIPAddr(ctx, conn.Host); err == nil {
 		for _, ip := range ips {
 			in.Peers = append(in.Peers, netdiag.Peer{IP: ip.IP.String(), Port: conn.Port})

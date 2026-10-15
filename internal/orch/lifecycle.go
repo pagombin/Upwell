@@ -568,7 +568,8 @@ func (o *Orchestrator) dbSpec(ctx context.Context, m Migration, d Database) (eng
 	spec := engine.DatabaseSpec{MigrationID: m.ID, Source: d.SourceName, Target: d.TargetName, SourceConn: src, TargetConn: dst,
 		Instance: d.Instance, SlotName: d.SlotName, OriginName: d.OriginName, Plugin: d.Plugin,
 		RunDir: filepath.Join(o.cfg.RunsDir(), d.Instance), TableJobs: tj, IndexJobs: ij, SplitLarger: v.Str("split_tables_larger_than"),
-		Offline: v.Str("mode") == "offline",
+		TCPUserTimeout: time.Duration(v.Int("engine_tcp_user_timeout_seconds")) * time.Second,
+		Offline:        v.Str("mode") == "offline",
 	}
 	// Under a write freeze the source database's properties include
 	// default_transaction_read_only = on, which pgcopydb would copy to the

@@ -135,7 +135,7 @@ func Sockets(ctx context.Context, peers []Peer) ([]Sock, error) {
 // interesting are the kernel counters worth watching around a closed
 // connection (all others are dropped to keep the record small).
 var interesting = map[string]bool{
-	"Tcp.ActiveOpens": true, "Tcp.AttemptFails": true, "Tcp.EstabResets": true, "Tcp.RetransSegs": true, "Tcp.InErrs": true, "Tcp.OutRsts": true, "Tcp.InCsumErrors": true,
+	"Tcp.ActiveOpens": true, "Tcp.OutSegs": true, "Tcp.AttemptFails": true, "Tcp.EstabResets": true, "Tcp.RetransSegs": true, "Tcp.InErrs": true, "Tcp.OutRsts": true, "Tcp.InCsumErrors": true,
 	"TcpExt.TCPAbortOnData": true, "TcpExt.TCPAbortOnClose": true, "TcpExt.TCPAbortOnMemory": true, "TcpExt.TCPAbortOnTimeout": true, "TcpExt.TCPAbortOnLinger": true, "TcpExt.TCPAbortFailed": true,
 	"TcpExt.TCPTimeouts": true, "TcpExt.TCPLossProbes": true, "TcpExt.TCPSynRetrans": true, "TcpExt.TCPRcvQDrop": true, "TcpExt.TCPZeroWindowDrop": true,
 	"TcpExt.TCPToZeroWindowAdv": true, "TcpExt.TCPFromZeroWindowAdv": true, "TcpExt.TCPWantZeroWindowAdv": true, "TcpExt.TCPBacklogDrop": true, "TcpExt.ListenDrops": true,
@@ -173,6 +173,59 @@ func Counters(root string) map[string]int64 {
 	for k := range out {
 		if !interesting[k] {
 			delete(out, k)
+		}
+	}
+	return out
+}
+
+// LinkCounters reads each interface's drop and error counters (ip -s link)
+// and each queueing discipline's drops and overlimits (tc -s qdisc): packets
+// dropped on the droplet itself, for instance by traffic shaping, which the
+// TCP counters do not show.
+func LinkCounters(ctx context.Context) map[string]int64 {
+	out := map[string]int64{}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if b, err := exec.CommandContext(cctx, "ip", "-s", "-j", "link").Output(); err == nil {
+		var links []struct {
+			Name  string `json:"ifname"`
+			Stats struct {
+				RX map[string]int64 `json:"rx"`
+				TX map[string]int64 `json:"tx"`
+			} `json:"stats64"`
+		}
+		if json.Unmarshal(b, &links) == nil {
+			for _, l := range links {
+				if l.Name == "lo" {
+					continue
+				}
+				for dir, m := range map[string]map[string]int64{"rx": l.Stats.RX, "tx": l.Stats.TX} {
+					for _, k := range []string{"packets", "dropped", "errors", "missed", "over_errors", "carrier_errors"} {
+						if v, ok := m[k]; ok {
+							out["link."+l.Name+"."+dir+"_"+k] = v
+						}
+					}
+				}
+			}
+		}
+	}
+	if b, err := exec.CommandContext(cctx, "tc", "-s", "-j", "qdisc", "show").Output(); err == nil {
+		var qs []struct {
+			Kind       string `json:"kind"`
+			Handle     string `json:"handle"`
+			Dev        string `json:"dev"`
+			Drops      int64  `json:"drops"`
+			Overlimits int64  `json:"overlimits"`
+		}
+		if json.Unmarshal(b, &qs) == nil {
+			for _, q := range qs {
+				if q.Dev == "lo" {
+					continue
+				}
+				k := "qdisc." + q.Dev + "." + q.Kind + "." + strings.TrimSuffix(q.Handle, ":")
+				out[k+".drops"] += q.Drops
+				out[k+".overlimits"] += q.Overlimits
+			}
 		}
 	}
 	return out
@@ -246,6 +299,9 @@ func (r *Recorder) Tick(ctx context.Context) {
 		return
 	}
 	s := Sample{At: time.Now().UTC(), Counters: Counters(r.ProcRoot)}
+	for k, v := range LinkCounters(ctx) {
+		s.Counters[k] = v
+	}
 	socks, err := Sockets(ctx, peers)
 	if err != nil {
 		s.Err = err.Error()
