@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api } from "../lib/api";
-import { ago, bytes, count, duration, rate, time } from "../lib/format";
+import { api, lastTotal } from "../lib/api";
+import { ago, bytes, clock, count, duration, rate, time } from "../lib/format";
 import { backlogKnown } from "../lib/derive";
 import { useApi, useDebounced, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
@@ -9,8 +9,8 @@ import type { Database, EventRow, Migration, Series, SnapshotWait } from "../lib
 import { blockerText, dbSignals, dbSummary, SafetyStrip, StatusSummary } from "../components/overview";
 import { CrosshairProvider, seriesFor, TimeChart } from "../components/charts";
 import { LogViewer } from "../components/logview";
-import { Card, ConfirmDialog, Dialog, Empty, ErrorState, label, Pill, ProgressBar, Skeleton, Tile, Trunc, useAction } from "../components/ui";
-import { EventList, useMig } from "./migration";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, label, LongText, Pill, ProgressBar, Skeleton, Tile, Trunc, useAction } from "../components/ui";
+import { useMig } from "./migration";
 
 const RANGES = [{ m: 30, l: "30 minutes" }, { m: 180, l: "3 hours" }, { m: 720, l: "12 hours" }, { m: 2880, l: "2 days" }, { m: 10080, l: "7 days" }];
 
@@ -281,16 +281,126 @@ export function MigrationLogsTab() {
   );
 }
 
+// D102: the timeline pages, searches and filters, and says how long each
+// base copy took.
+const EVENT_KINDS: Record<string, string> = {
+  db_state: "Phase", state: "Migration", started: "Started", base_copy_done: "Base copy", base_copy_failed: "Base copy",
+  alert: "Alert", alert_resolved: "Alert resolved", network_incident: "Network", engine_failed: "Engine", retry: "Retry",
+  resume: "Resume", restart: "Restart", apply_stalled_restart: "Apply", connection_changed: "Connection", target_db: "Target database",
+  extensions: "Extensions", roles: "Roles", slot_released: "Slot", created: "Created", preflight: "Preflight",
+};
+function kindLabel(t: string) { return EVENT_KINDS[t] || t.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()); }
+
 export function MigrationEventsTab() {
-  const { id } = useMig();
-  const ev = useApi<EventRow[]>(`/api/v1/migrations/${id}/events?limit=500`, 15000);
+  const { id, view } = useMig();
+  const v = view.data!;
+  const [q, setQ] = useState("");
+  const [query, setQuery] = useState("");
+  const [sev, setSev] = useState("");
+  const [db, setDb] = useState("");
+  const [size, setSize] = useState(50);
+  const [page, setPage] = useState(0);
+  useEffect(() => { const t = window.setTimeout(() => { setQuery(q.trim()); setPage(0); }, 300); return () => window.clearTimeout(t); }, [q]);
+  const params = new URLSearchParams({ limit: String(size), offset: String(page * size) });
+  if (query) params.set("q", query);
+  if (sev) params.set("severity", sev);
+  if (db) params.set("database", db);
+  const path = `/api/v1/migrations/${id}/events?${params}`;
+  const ev = useApi<EventRow[]>(path, 15000);
+  const total = lastTotal(path) ?? ev.data?.length ?? 0;
+  const pages = Math.max(1, Math.ceil(total / size));
   const now = useNow(10000);
+  const dbs = v.databases.filter((d) => d.include).map((d) => d.source_name);
+  const filtered = !!(query || sev || db);
   return (
-    <Card title="Timeline">
-      {ev.error ? <ErrorState error={ev.error} retry={ev.refresh} /> : !ev.data ? <Skeleton lines={8} /> : ev.data.length === 0 ? <Empty title="No events yet">Phase changes, operations, alerts and operator actions appear here.</Empty> : <EventList rows={ev.data} now={now} />}
+    <div className="stack" style={{ gap: 24 }}>
+      <BaseCopyCard />
+      <Card title="Timeline" actions={<span className="small muted">{total.toLocaleString("en-US")} event{total === 1 ? "" : "s"}{filtered ? " match" : ""}</span>}>
+        <div className="stack">
+          <div className="row" style={{ gap: 12, flexWrap: "wrap" }} role="search">
+            <input type="search" aria-label="Search events" placeholder="Search messages, kinds and databases" value={q} onChange={(e) => setQ(e.target.value)} style={{ flex: "1 1 260px", minWidth: 200 }} />
+            <select aria-label="Severity" value={sev} onChange={(e) => { setSev(e.target.value); setPage(0); }}>
+              <option value="">All severities</option>
+              <option value="critical,error,warning">Warnings and worse</option>
+              <option value="critical,error">Critical only</option>
+              <option value="info">Info only</option>
+            </select>
+            <select aria-label="Database" value={db} onChange={(e) => { setDb(e.target.value); setPage(0); }}>
+              <option value="">All databases</option>
+              {dbs.map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+            <select aria-label="Page size" value={size} onChange={(e) => { setSize(Number(e.target.value)); setPage(0); }}>
+              {[25, 50, 100, 200].map((n) => <option key={n} value={n}>{n} a page</option>)}
+            </select>
+          </div>
+          {ev.error ? <ErrorState error={ev.error} retry={ev.refresh} /> : !ev.data ? <Skeleton lines={8} /> : ev.data.length === 0
+            ? <Empty title={filtered ? "No matching events" : "No events yet"}>{filtered ? "Change the search or the filters." : "Phase changes, operations, alerts and operator actions appear here."}</Empty>
+            : <EventTable rows={ev.data} now={now} />}
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="small muted">{total === 0 ? "" : `${(page * size + 1).toLocaleString("en-US")}–${Math.min(total, (page + 1) * size).toLocaleString("en-US")} of ${total.toLocaleString("en-US")}, newest first`}</span>
+            <div className="row" style={{ gap: 8 }} aria-label="Pages">
+              <button onClick={() => setPage(0)} disabled={page === 0}>Newest</button>
+              <button onClick={() => setPage(page - 1)} disabled={page === 0}>Newer</button>
+              <span className="small muted">Page {page + 1} of {pages}</span>
+              <button onClick={() => setPage(page + 1)} disabled={page + 1 >= pages}>Older</button>
+              <button onClick={() => setPage(pages - 1)} disabled={page + 1 >= pages}>Oldest</button>
+            </div>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function BaseCopyCard() {
+  const { view } = useMig();
+  const v = view.data!;
+  const inc = v.databases.filter((d) => d.include);
+  const took = v.base_copy_ms || {};
+  if (!inc.length) return null;
+  return (
+    <Card title="Base copy">
+      <div className="tablewrap">
+        <table className="data" aria-label="Base copy durations">
+          <thead><tr><th>Database</th><th className="num">Size on the source</th><th className="num">Took</th><th className="num">Average</th></tr></thead>
+          <tbody>{inc.map((d) => {
+            const ms = took[d.source_name];
+            return (
+              <tr key={d.source_name}>
+                <td className="mono">{d.source_name}</td>
+                <td className="num">{bytes(d.size_bytes)}</td>
+                <td className="num">{ms ? duration(ms) : d.base_copy_done ? "Finished (before durations were recorded)" : "Not finished"}</td>
+                <td className="num">{ms && d.size_bytes ? `${bytes(d.size_bytes / (ms / 1000))}/s` : "—"}</td>
+              </tr>
+            );
+          })}</tbody>
+        </table>
+      </div>
+      <p className="small muted">From the launch that started the copy (a base copy restarts from zero, it does not resume) to the moment the engine started applying changes.</p>
     </Card>
   );
 }
+
+export function EventTable({ rows, now }: { rows: EventRow[]; now: number }) {
+  return (
+    <div className="tablewrap">
+      <table className="data events" aria-label="Events">
+        <thead><tr><th style={{ width: 150 }}>Time</th><th style={{ width: 96 }}>Severity</th><th style={{ width: 150 }}>Database</th><th style={{ width: 120 }}>Kind</th><th>Message</th></tr></thead>
+        <tbody>{rows.map((e) => (
+          <tr key={e.id} className={`sev-stripe ${sevClass(e.severity)}`}>
+            <td title={time(e.ts)}><div>{clock(e.ts)}</div><div className="small muted">{ago(e.ts, now)}</div></td>
+            <td><Pill kind={sevClass(e.severity) === "crit" ? "crit" : sevClass(e.severity) === "warn" ? "warn" : "neutral"} text={e.severity} /></td>
+            <td style={{ maxWidth: 150 }}>{e.database ? <Trunc className="mono small">{e.database}</Trunc> : <span className="muted">—</span>}</td>
+            <td className="small">{kindLabel(e.type)}</td>
+            <td><LongText text={e.message} /></td>
+          </tr>
+        ))}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function sevClass(s: string) { return s === "critical" || s === "error" ? "crit" : s === "warning" ? "warn" : "info"; }
 
 interface Watched { id: string; database: string; schema: string; table: string; added_by: string; added_at: number; source_rows?: number; target_rows?: number; counted_at?: number; count_error?: string }
 

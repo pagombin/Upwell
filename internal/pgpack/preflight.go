@@ -315,6 +315,12 @@ func (r *Runner) hostChecks(ctx context.Context) {
 		} else {
 			ok(r, "engine_commit_order", "", "", "pgcopydb "+e.EngineVersion+" applies transactions in commit order.", ev, t)
 		}
+		if EngineCommitOrderFixed(e.EngineVersion) && !EngineApplyUnthrottled(e.EngineVersion) {
+			r.emit("engine_apply_rate", "", "", check.Warning, false, "pgcopydb "+e.EngineVersion+" waits 100 ms before applying each transaction, so it applies at most about ten transactions a second (D103): a busy source can build a backlog that takes days to drain.",
+				"Run install.sh again when no engine runs; it builds pgcopydb "+EngineBuildRequired+".", ev, t)
+		} else if EngineApplyUnthrottled(e.EngineVersion) {
+			ok(r, "engine_apply_rate", "", "", "pgcopydb "+e.EngineVersion+" applies transactions back to back.", ev, t)
+		}
 	}
 	r.networkCheck()
 	t = time.Now()
@@ -1363,13 +1369,24 @@ var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
 
 // EngineBuildRequired is the pgcopydb build deploy/install.sh makes: the
 // v0.18 tag with the patches in deploy/pgcopydb.
-const EngineBuildRequired = "0.18+upwell.3"
+const EngineBuildRequired = "0.18+upwell.4"
 
 var enginePatchRe = regexp.MustCompile(`\+upwell\.(\d+)`)
 
 // EngineCommitOrderFixed reports whether a pgcopydb version is Upwell's
 // build with the commit-order fix (D84): upstream 0.18 and its main branch
 // skip transactions whose BEGIN precedes the previous one's COMMIT.
+// EngineApplyUnthrottled reports whether the build applies transactions
+// back to back (patch 0004, D103) instead of waiting 100 ms before each.
+func EngineApplyUnthrottled(v string) bool {
+	m := enginePatchRe.FindStringSubmatch(v)
+	if m == nil {
+		return false
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n >= 4
+}
+
 func EngineCommitOrderFixed(v string) bool {
 	m := enginePatchRe.FindStringSubmatch(v)
 	if m == nil {

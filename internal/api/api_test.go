@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -679,4 +680,59 @@ func TestSavedLogViews(t *testing.T) {
 	if code, _, _ := a.req("DELETE", "/api/v1/log-views/"+fmt.Sprint(views[0]["id"]), k(), nil); code != 200 {
 		t.Fatalf("delete: %d", code)
 	}
+}
+
+// D102: the Events tab pages, searches and filters; the operator had 500
+// events in one list with no way to find one.
+func TestEventsPagingAndSearch(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	pw := "correct-horse-battery-staple"
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	a.login("admin", pw)
+	_, m, _ := a.req("POST", "/api/v1/migrations", k(), map[string]any{"name": "Events test"})
+	id := fmt.Sprint(m["id"])
+	st := testStore(t, srv)
+	base := len(eventsPage(t, a, "/api/v1/migrations/"+id+"/events?limit=2000"))
+	for i := 0; i < 30; i++ {
+		sev, db, msg := "info", "shop", fmt.Sprintf("Phase change %d", i)
+		if i%10 == 0 {
+			sev, db, msg = "critical", "migration_db", fmt.Sprintf("The base copy of migration_db failed (%d)", i)
+		}
+		st.DB.Exec(`INSERT INTO events(id,seq,migration_id,database,type,severity,message,data,ts) VALUES (?,?,?,?,?,?,?,?,?)`,
+			store.NewID(), 100000+i, id, db, "db_state", sev, msg, "{}", time.Now().UnixMilli()+int64(i))
+	}
+	// Pages of 10, newest first, with the total in a header.
+	code, total, rows := eventsReq(t, a, "/api/v1/migrations/"+id+"/events?limit=10&offset=10")
+	if code != 200 || len(rows) != 10 || total != 30+base || rows[0]["message"] != "Phase change 19" {
+		t.Fatalf("page 2: %d, total %d, %d rows, first %v", code, total, len(rows), rows)
+	}
+	// Search and filters combine; the total counts the matches.
+	_, total, rows = eventsReq(t, a, "/api/v1/migrations/"+id+"/events?q=base+copy&severity=critical&database=migration_db&limit=2")
+	if total != 3 || len(rows) != 2 || rows[0]["message"] != "The base copy of migration_db failed (20)" {
+		t.Fatalf("search: total %d, rows %v", total, rows)
+	}
+	// LIKE wildcards in the search are taken literally.
+	if _, total, _ = eventsReq(t, a, "/api/v1/migrations/"+id+"/events?q=%25"); total != 0 {
+		t.Fatalf("a %% search matched %d events", total)
+	}
+}
+
+func eventsReq(t *testing.T, a *client, path string) (int, int, []map[string]any) {
+	t.Helper()
+	r, _ := http.NewRequest("GET", a.srv.URL+path, nil)
+	res, err := a.c.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var rows []map[string]any
+	json.NewDecoder(res.Body).Decode(&rows)
+	total, _ := strconv.Atoi(res.Header.Get("X-Total-Count"))
+	return res.StatusCode, total, rows
+}
+
+func eventsPage(t *testing.T, a *client, path string) []map[string]any {
+	_, _, rows := eventsReq(t, a, path)
+	return rows
 }

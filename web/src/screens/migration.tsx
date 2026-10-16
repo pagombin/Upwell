@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
-import { backlogKnown, copyEtaMs, dbCopyEtaMs, dbCopyFraction, lifecycleBad, lifecycleIndex, overallProgress, rateFrom, readyForCutover } from "../lib/derive";
+import { backlogKnown, catchUps, copyEtaMs, dbCopyEtaMs, dbCopyFraction, lifecycleBad, lifecycleIndex, overallProgress, rateFrom, readyForCutover } from "../lib/derive";
 import { ago, bytes, count, duration, pct, rate, time } from "../lib/format";
 import { type Loaded, useApi, useNow, useStream } from "../lib/hooks";
 import { useSession } from "../lib/session";
@@ -10,7 +10,7 @@ import { Sparkline } from "../components/charts";
 import { useOps } from "../components/ops";
 import { DataTable } from "../components/table";
 import { MIG_TABS } from "../components/shell";
-import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Field, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction, useToast } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Field, LongText, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction, useToast } from "../components/ui";
 import { Stepper } from "./home";
 import { lagOf, safetySignals, sampleAge, SafetyStrip, StatusSummary, statusSummary, TrendsCard } from "../components/overview";
 
@@ -230,6 +230,8 @@ export function OverviewTab() {
   const inSync = v.state_counts["in_sync"] || 0;
   const backlog = inc.reduce((a, d) => a + (backlogKnown(d) || 0), 0);
   const summary = statusSummary(v, metrics.data, now);
+  const catchup = catchUps(v, metrics.data);
+  const worst = catchup[0];
   const signals = safetySignals(v, now);
   return (
     <div className="stack" style={{ gap: 24 }}>
@@ -243,8 +245,15 @@ export function OverviewTab() {
         <Tile label="Base copy" value={pct(prog * 100)} sub={<ProgressBar value={prog} label="Overall base copy progress" />} />
         <Tile label="Copy ETA" value={eta ? duration(eta) : prog >= 1 ? "Done" : m.flags.started ? "Measuring" : "Not started"} sub={eta ? `around ${time(now + eta, false)}` : "From target growth over 5 minutes"} />
         <Tile label="In sync" value={`${inSync} of ${v.included}`} sub={readyForCutover(v) ? <Link to="cutover">Ready for cutover</Link> : "Cutover needs every database in sync"} />
-        <Tile label="Total backlog" value={bytes(backlog)} title={`${backlog.toLocaleString("en-US")} bytes`} sub={`Source WAL ${rate(v.cluster?.src_wal_rate)}`} />
+        <Tile label="Total backlog" value={bytes(backlog)} title={`${backlog.toLocaleString("en-US")} bytes`} sub={worst ? (worst.growing ? `Growing ${rate(-(worst.drain || 0))} (${worst.db})` : worst.etaMs ? `Draining ${rate(worst.drain)}: about ${duration(worst.etaMs)}` : `Source WAL ${rate(v.cluster?.src_wal_rate)}`) : `Source WAL ${rate(v.cluster?.src_wal_rate)}`} />
       </div>
+      {catchup.filter((c) => c.restartFaster || c.growing).map((c) => (
+        <div key={c.db} className="callout warn" role="status"><div className="body">
+          <strong>{c.db}: {c.growing ? "the backlog is growing" : `catching up will take about ${duration(c.etaMs)}`}</strong>
+          <span>{bytes(c.backlog)} of changes wait to be applied, {c.growing ? `and the backlog grew by ${rate(-(c.drain || 0))} over the last 15 minutes: the engine applies changes more slowly than the source writes them.` : `draining at ${rate(c.drain)}.`}{c.baseCopyMs ? ` Its last base copy took ${duration(c.baseCopyMs)}.` : ""}</span>
+          {c.restartFaster && <span>Restarting {c.db} from zero (open it below, then Restart from zero) would likely be faster. The new copy starts from a fresh snapshot, but it will fall behind again if the source keeps writing at this rate.</span>}
+        </div></div>
+      ))}
       <Card title="Databases">
         <DataTable label="Databases" rows={inc} rowKey={(d) => d.id} csvName={`upwell-${m.short_id}-databases`}
           filterText={(d) => d.source_name + " " + d.state}
@@ -299,7 +308,7 @@ export function EventList({ rows, now }: { rows: EventRow[]; now: number }) {
           <div className="row" style={{ gap: 8 }}>
             <span className="small muted" title={time(e.ts)} style={{ width: 90 }}>{ago(e.ts, now)}</span>
             {e.database && <span className="mono small" style={{ maxWidth: 220 }}><Trunc>{e.database}</Trunc></span>}
-            <span className="wrapany" style={{ flex: 1, minWidth: 200 }}>{e.message}</span>
+            <span style={{ flex: 1, minWidth: 200 }}><LongText text={e.message} /></span>
           </div>
         </li>
       ))}

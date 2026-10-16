@@ -36,6 +36,7 @@ export interface MigrationView {
   permission?: Permission | null; source?: Connection; target?: Connection; settings_effective?: Record<string, unknown>;
   preflight?: PreflightRun | null; live?: Record<string, Record<string, number>>; cluster?: Record<string, number>; now?: number;
   snapshot_waits?: Record<string, SnapshotWait>;
+  base_copy_ms?: Record<string, number>;
 }
 export interface SnapshotBlocker { pid: number; database: string; user: string; application: string; client: string; state: string; open_seconds: number }
 export interface SnapshotWait { since: number; at: number; blockers: SnapshotBlocker[] }

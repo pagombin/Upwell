@@ -1,0 +1,78 @@
+diff --git a/src/bin/pgcopydb/catalog.c b/src/bin/pgcopydb/catalog.c
+index 8d6e810..3f61ddf 100644
+--- a/src/bin/pgcopydb/catalog.c
++++ b/src/bin/pgcopydb/catalog.c
+@@ -1529,6 +1529,28 @@ catalog_init(DatabaseCatalog *catalog)
+ 		return false;
+ 	}
+ 
++	/*
++	 * Upwell patch (upwell-4): the CDC files (output and replay) are not the
++	 * durable record of the stream. The replication slot is: a restart
++	 * streams again from the slot, which only advances to what the apply has
++	 * committed on the target. A full fsync after every decoded message (one
++	 * per row, twice: output then replay) capped the receive process at a
++	 * few hundred rows a second on a droplet's disk. In WAL mode, NORMAL
++	 * still keeps the file consistent; a power loss can only lose the last
++	 * commits, which the slot sends again.
++	 */
++	if (catalog->type == DATABASE_CATALOG_TYPE_OUTPUT ||
++		catalog->type == DATABASE_CATALOG_TYPE_REPLAY)
++	{
++		if (!catalog_execute(catalog, "PRAGMA synchronous = NORMAL"))
++		{
++			/* errors have already been logged */
++			sqlite3_close(catalog->db);
++			catalog->db = NULL;
++			return false;
++		}
++	}
++
+ 	if (createSchema)
+ 	{
+ 		/*
+diff --git a/src/bin/pgcopydb/ld_apply.c b/src/bin/pgcopydb/ld_apply.c
+index 1119f4a..b097b58 100644
+--- a/src/bin/pgcopydb/ld_apply.c
++++ b/src/bin/pgcopydb/ld_apply.c
+@@ -240,6 +240,14 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 
+ 	int syncCounter = 0;
+ 
++	/*
++	 * Upwell patch (upwell-4): idle is set only when the previous pass found
++	 * nothing to apply or transform. The select() below used to wait up to
++	 * 100 ms before every transaction, which capped the apply at about ten
++	 * transactions a second however much work was waiting.
++	 */
++	bool idle = false;
++
+ 	for (;;)
+ 	{
+ 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+@@ -254,7 +262,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 			fd_set rfds;
+ 			FD_ZERO(&rfds);
+ 			FD_SET(pipe_rd, &rfds);
+-			struct timeval tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
++			struct timeval tv = { .tv_sec = 0, .tv_usec = idle ? 100 * 1000 : 0 };
+ 
+ 			int nready = select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
+ 			if (nready < 0 && errno != EINTR)
+@@ -278,6 +286,8 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 			}
+ 		}
+ 
++		idle = false;
++
+ 		/*
+ 		 * Lock the replayDB only while querying for the next event.
+ 		 * This allows the inline transform (ld_store_iter_output in the
+@@ -461,6 +471,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 			{
+ 				pg_usleep(100 * 1000);  /* 100 ms */
+ 			}
++			idle = true;
+ 			continue;
+ 		}
+ 

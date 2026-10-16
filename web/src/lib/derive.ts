@@ -96,3 +96,28 @@ export function readyForCutover(v: MigrationView): boolean {
 }
 
 export function verdictOf(v: MigrationView): string | undefined { return v.migration.flags.verdict || undefined; }
+
+// D102: how long the change backlog of each streaming database will take to
+// drain at its current pace (the backlog's trend over 15 minutes), and how
+// that compares with its last base copy. A copy that streams far slower than
+// the source writes can take days to catch up while a fresh copy takes an
+// hour.
+export interface CatchUp { db: string; backlog: number; drain?: number; etaMs?: number; growing: boolean; baseCopyMs?: number; restartFaster: boolean }
+
+export function catchUps(v: MigrationView, metrics?: Series[]): CatchUp[] {
+  const out: CatchUp[] = [];
+  for (const d of v.databases) {
+    if (!d.include || !d.base_copy_done || ["draining", "copied", "cutover_done"].includes(d.state)) continue;
+    const backlog = backlogKnown(d) || 0;
+    if (backlog < 64 << 20) continue;
+    const pts = metrics?.find((s) => s.name === "backlog_bytes" && (s.database || "") === d.source_name)?.points || [];
+    const r = rateFrom(pts, 15 * 60e3);
+    if (r === undefined) continue;
+    const drain = -r;
+    const etaMs = drain > 0 ? (backlog / drain) * 1000 : undefined;
+    const baseCopyMs = v.base_copy_ms?.[d.source_name];
+    out.push({ db: d.source_name, backlog, drain, etaMs, growing: r > 0, baseCopyMs,
+      restartFaster: !!baseCopyMs && etaMs !== undefined && etaMs > 2 * baseCopyMs && etaMs > 3600e3 });
+  }
+  return out.sort((a, b) => (b.etaMs ?? Infinity) - (a.etaMs ?? Infinity));
+}

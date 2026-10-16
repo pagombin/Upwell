@@ -1050,6 +1050,7 @@ func (s *Server) getMigration(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	view["snapshot_waits"] = waits
+	view["base_copy_ms"] = s.Orch.BaseCopyDurations(r.Context(), m.ID) // D102
 	cl := map[string]float64{}
 	for _, n := range []string{"src_wal_rate", "src_connections", "dst_connections", "src_oldest_xact_s", "src_xmin_age"} {
 		if v, ok := s.Orch.LastValue(m.ID, "", n); ok {
@@ -1580,23 +1581,53 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) error {
 
 func (s *Server) events(w http.ResponseWriter, r *http.Request) error {
 	mig := r.PathValue("id")
-	q := `SELECT id, seq, COALESCE(migration_id,''), COALESCE(database,''), type, severity, message, data, ts FROM events`
+	// D102: filters (q searches the message, type and database; severity,
+	// database and type may each list several values, comma-separated),
+	// offset paging, and the number of matches in X-Total-Count.
+	var where []string
 	var args []any
 	if mig != "" {
 		m, err := s.Orch.GetMigration(r.Context(), mig)
 		if err != nil {
 			return err
 		}
-		q += ` WHERE migration_id=?`
+		where = append(where, "migration_id=?")
 		args = append(args, m.ID)
 	}
-	q += ` ORDER BY seq DESC LIMIT ?`
+	if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
+		like := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(strings.ToLower(q)) + "%"
+		where = append(where, `(lower(message) LIKE ? ESCAPE '\' OR lower(type) LIKE ? ESCAPE '\' OR lower(COALESCE(database,'')) LIKE ? ESCAPE '\')`)
+		args = append(args, like, like, like)
+	}
+	for _, f := range []struct{ param, col string }{{"severity", "severity"}, {"database", "COALESCE(database,'')"}, {"type", "type"}} {
+		var vals []string
+		for _, v := range strings.Split(r.URL.Query().Get(f.param), ",") {
+			if v = strings.TrimSpace(v); v != "" {
+				vals = append(vals, v)
+			}
+		}
+		if len(vals) == 0 {
+			continue
+		}
+		where = append(where, f.col+" IN ("+strings.TrimSuffix(strings.Repeat("?,", len(vals)), ",")+")")
+		for _, v := range vals {
+			args = append(args, v)
+		}
+	}
+	cond := ""
+	if len(where) > 0 {
+		cond = " WHERE " + strings.Join(where, " AND ")
+	}
+	var total int
+	if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT count(*) FROM events`+cond, args...).Scan(&total); err != nil {
+		return err
+	}
 	limit := qint(r, "limit")
 	if limit <= 0 || limit > 2000 {
 		limit = 500
 	}
-	args = append(args, limit)
-	rows, err := s.Store.DB.QueryContext(r.Context(), q, args...)
+	offset := max(qint(r, "offset"), 0)
+	rows, err := s.Store.DB.QueryContext(r.Context(), `SELECT id, seq, COALESCE(migration_id,''), COALESCE(database,''), type, severity, message, data, ts FROM events`+cond+` ORDER BY seq DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		return err
 	}
@@ -1610,6 +1641,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) error {
 		json.Unmarshal([]byte(data), &d)
 		out = append(out, map[string]any{"id": id, "seq": seq, "migration_id": migID, "database": db, "type": typ, "severity": sev, "message": msg, "data": d, "ts": ts})
 	}
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
 	return writeJSON(w, 200, out)
 }
 

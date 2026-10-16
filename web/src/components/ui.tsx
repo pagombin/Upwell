@@ -293,3 +293,16 @@ export function Icon({ name, size = 16 }: { name: string; size?: number }) {
     </svg>
   );
 }
+
+// LongText folds a long message to two lines with a toggle.
+export function LongText({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > 220;
+  return (
+    <div>
+      <div className={`wrapany${long && !open ? " clamp2" : ""}`}>{text}</div>
+      {long && <button className="ghost small linklike" onClick={() => setOpen(!open)} aria-expanded={open}>{open ? "Show less" : "Show more"}</button>}
+    </div>
+  );
+}
+

@@ -29,6 +29,21 @@ func TestHappyPath(t *testing.T) {
 	e.waitDBState(id, a, 3*time.Minute, orch.DInSync)
 	e.waitDBState(id, b, 3*time.Minute, orch.DInSync)
 	e.waitFor(30*time.Second, "migration state streaming", func() bool { return e.migration(id).Migration.State == orch.MStreaming })
+	// D102: the base copy's duration, in its event and in the view.
+	for _, ev := range eventsOf(t, e, id) {
+		if ev["type"] == "base_copy_done" && ev["database"] == a {
+			if msg, _ := ev["message"].(string); !strings.Contains(msg, "finished in ") || !strings.Contains(msg, "MiB/s") {
+				t.Errorf("base copy event without its duration: %s", msg)
+			}
+		}
+	}
+	var bv struct {
+		BaseCopyMs map[string]int64 `json:"base_copy_ms"`
+	}
+	e.do("GET", "/api/v1/migrations/"+id, nil, &bv, 200)
+	if bv.BaseCopyMs[a] <= 0 || bv.BaseCopyMs[b] <= 0 || bv.BaseCopyMs[a] > int64(3*time.Minute/time.Millisecond) {
+		t.Errorf("base copy durations in the view: %v", bv.BaseCopyMs)
+	}
 	w := startWriter(t, a)
 	time.Sleep(3 * time.Second)
 	// Stop and resume one database while writes continue.

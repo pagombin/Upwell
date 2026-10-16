@@ -274,7 +274,7 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		if pr.ApplyEnabled && !d.BaseCopyDone {
 			cols["base_copy_done"] = 1
 			d.BaseCopyDone = true
-			o.Event(ctx, m.ID, d.SourceName, "base_copy_done", "info", "Base copy of "+d.SourceName+" finished; streaming changes", nil)
+			o.baseCopyDone(ctx, m, d)
 		}
 		if d.BaseCopyDone && d.State != DDraining {
 			backlog := o.backlog(ctx, spec, pr.ReplayLSN)

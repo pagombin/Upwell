@@ -14,6 +14,10 @@ export class ApiError extends Error {
 // Connection health: when requests keep failing, every screen shows how old its data is.
 export const health = { lastOk: Date.now(), lastFail: 0 };
 
+// X-Total-Count of the latest response for each path (paged lists, D102).
+const totals = new Map<string, number>();
+export function lastTotal(path: string): number | undefined { return totals.get(path); }
+
 let csrf = "";
 export function setCsrf(t: string) { csrf = t; }
 let onUnauthenticated: () => void = () => {};
@@ -38,6 +42,8 @@ async function request<T>(method: string, path: string, body?: unknown, key?: st
     health.lastFail = Date.now();
     throw new ApiError(0, "network", "Upwell is not reachable. Check that the service is running and your network connection.");
   }
+  const tc = res.headers.get("X-Total-Count");
+  if (tc !== null) totals.set(path, Number(tc));
   const text = await res.text();
   let data: any = null;
   if (text) {
