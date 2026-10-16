@@ -12,6 +12,7 @@ import { MigrationLayout, OverviewTab } from "./screens/migration";
 import { DatabaseScreen, MigrationEventsTab, MigrationLogsTab, ReplicationTab, SourceHealthTab } from "./screens/mtabs";
 import { PreflightScreen } from "./screens/preflight";
 import { NewMigrationScreen } from "./screens/wizard";
+import { RunsScreen } from "./screens/runs";
 import { useMig } from "./screens/migration";
 
 function Gate({ children }: { children: ReactNode }) {
@@ -57,6 +58,7 @@ export function App() {
               <Route path="logs" element={<MigrationLogsTab />} />
               <Route path="events" element={<MigrationEventsTab />} />
             </Route>
+            <Route path="runs" element={<RunsScreen />} />
             <Route path="logs" element={<LogsScreen />} />
             <Route path="events" element={<EventsScreen />} />
             <Route path="alerts" element={<AlertsScreen />} />

@@ -736,3 +736,30 @@ func eventsPage(t *testing.T, a *client, path string) []map[string]any {
 	_, _, rows := eventsReq(t, a, path)
 	return rows
 }
+
+// D107: the migration's Logs tab pages like the Events tab.
+func TestLogsPaged(t *testing.T) {
+	srv, token := newServer(t)
+	a := newClient(t, srv)
+	pw := "correct-horse-battery-staple"
+	a.req("POST", "/api/v1/setup", k(), map[string]any{"setup_token": token, "username": "admin", "password": pw})
+	a.login("admin", pw)
+	_, m, _ := a.req("POST", "/api/v1/migrations", k(), map[string]any{"name": "Logs test"})
+	id := fmt.Sprint(m["id"])
+	st := testStore(t, srv)
+	for i := 0; i < 40; i++ {
+		lvl, msg := "info", fmt.Sprintf("apply progress %d", i)
+		if i%10 == 0 {
+			lvl, msg = "error", fmt.Sprintf("connection lost %d", i)
+		}
+		st.DB.Exec(`INSERT INTO logs(ts, level, component, migration_id, database, msg) VALUES (?, ?, 'engine', ?, 'shop', ?)`, time.Now().UnixMilli()+int64(i), lvl, id, msg)
+	}
+	code, total, rows := eventsReq(t, a, "/api/v1/logs?migration="+id+"&paged=1&limit=10&offset=10")
+	if code != 200 || total != 40 || len(rows) != 10 || rows[0]["msg"] != "apply progress 29" {
+		t.Fatalf("page 2: %d total %d rows %d first %v", code, total, len(rows), rows[0])
+	}
+	_, total, rows = eventsReq(t, a, "/api/v1/logs?migration="+id+"&paged=1&level=error&q=lost&limit=2")
+	if total != 4 || len(rows) != 2 || rows[0]["msg"] != "connection lost 30" {
+		t.Fatalf("filtered: total %d rows %v", total, rows)
+	}
+}

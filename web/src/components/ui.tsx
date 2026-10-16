@@ -286,6 +286,7 @@ export function Icon({ name, size = 16 }: { name: string; size?: number }) {
     moon: <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />,
     bell: <><path d="M6 16V11a6 6 0 1 1 12 0v5l2 2H4z" /><path d="M10 21h4" /></>,
     migration: <><path d="M4 7h11l-3-3M20 17H9l3 3" /></>,
+    runs: <><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" /></>,
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

@@ -1,0 +1,144 @@
+--- a/src/bin/pgcopydb/catalog.c
++++ b/src/bin/pgcopydb/catalog.c
+@@ -619,6 +619,7 @@
+ 
+ 	"create unique index o_a_lsn on output(action, lsn)",
+ 	"create index o_a_xid on output(action, xid)",
++	"create index o_xid on output(xid)",
+ 
+ 	/*
+ 	 * pgoutput stores structured column data here instead of a text blob.
+@@ -652,6 +653,7 @@
+ 
+ 	"create index r_xid on replay(xid)",
+ 	"create index r_lsn on replay(lsn)",
++	"create index r_a_endlsn on replay(action, endlsn)",
+ };
+ 
+ 
+@@ -1530,7 +1532,7 @@
+ 	}
+ 
+ 	/*
+-	 * Upwell patch (upwell-4): the CDC files (output and replay) are not the
++	 * Upwell patch (upwell-5): the CDC files (output and replay) are not the
+ 	 * durable record of the stream. The replication slot is: a restart
+ 	 * streams again from the slot, which only advances to what the apply has
+ 	 * committed on the target. A full fsync after every decoded message (one
+@@ -1546,6 +1548,42 @@
+ 		{
+ 			/* errors have already been logged */
+ 			sqlite3_close(catalog->db);
++			catalog->db = NULL;
++			return false;
++		}
++	}
++
++	/*
++	 * Upwell patch (upwell-5): the apply finds the next transaction by its
++	 * commit LSN (endlsn); without this index every lookup scanned the whole
++	 * replay table. Created on open, so files made by an older build get it.
++	 */
++	if (!createSchema && catalog->type == DATABASE_CATALOG_TYPE_REPLAY)
++	{
++		if (!catalog_execute(catalog,
++							 "create index if not exists r_a_endlsn on replay(action, endlsn)"))
++		{
++			/* errors have already been logged */
++			sqlite3_close(catalog->db);
++			catalog->db = NULL;
++			return false;
++		}
++	}
++
++	/*
++	 * Upwell patch (upwell-5): the transform reads each transaction's
++	 * messages with "xid = $1 and id >= $2 order by id". The only index on
++	 * xid led with action, so every transaction walked the file from its
++	 * BEGIN to the end: 20 ms each on 130,000 messages, growing with the
++	 * backlog.
++	 */
++	if (!createSchema && catalog->type == DATABASE_CATALOG_TYPE_OUTPUT)
++	{
++		if (!catalog_execute(catalog,
++							 "create index if not exists o_xid on output(xid)"))
++		{
++			/* errors have already been logged */
++			sqlite3_close(catalog->db);
+ 			catalog->db = NULL;
+ 			return false;
+ 		}
+--- a/src/bin/pgcopydb/ld_store.c
++++ b/src/bin/pgcopydb/ld_store.c
+@@ -680,22 +680,35 @@
+ 	 * returned as its BEGIN row.
+ 	 */
+ 	char *sql =
++		/*
++		 * Upwell patch (upwell-5): each branch takes only its first row, in
++		 * the order of the (action, lsn) index, and the smallest of the three
++		 * is returned, which is the same row as before. Sorting every
++		 * transaction left in the file on each call made draining a backlog
++		 * of N transactions cost N squared row visits.
++		 */
+ 		"select id, action, xid, lsn, timestamp, message, nspname, relname, old_type from ("
++		" select * from ("
+ 		"  select b.id, b.action, b.xid, b.lsn, b.timestamp, b.message, b.nspname, b.relname, b.old_type, "
+ 		"         c.lsn as k, 0 as kind "
+ 		"    from output c join output b on b.action = 'B' and b.xid = c.xid "
+ 		"   where c.action = 'C' and c.lsn > $1 "
++		"   order by c.lsn asc, b.id asc limit 1) "
+ 		" union all "
++		" select * from ("
+ 		"  select b.id, b.action, b.xid, b.lsn, b.timestamp, b.message, b.nspname, b.relname, b.old_type, "
+ 		"         c.lsn as k, 0 as kind "
+ 		"    from output c join output b on b.action = 'B' and b.xid = c.xid "
+ 		"   where c.action = 'R' and c.lsn > $1 "
+ 		"     and not exists (select 1 from output x where x.action = 'C' and x.xid = c.xid) "
++		"   order by c.lsn asc, b.id asc limit 1) "
+ 		" union all "
++		" select * from ("
+ 		"  select id, action, xid, lsn, timestamp, message, nspname, relname, old_type, "
+ 		"         lsn as k, 1 as kind "
+ 		"    from output "
+ 		"   where lsn > $2 and action in ('K', 'X') "
++		"   order by lsn asc, id asc limit 1) "
+ 		") "
+ 		"order by k asc, kind asc, id asc "
+ 		"limit 1";
+@@ -3079,16 +3092,26 @@
+ 	 * transaction that committed in between: they were never applied.
+ 	 */
+ 	char *sql =
++		/*
++		 * Upwell patch (upwell-5): first row of each branch through the
++		 * (action, endlsn) and lsn indexes, then the smallest; the same row
++		 * as the previous form, which scanned and sorted the whole file on
++		 * every call.
++		 */
+ 		"select id, action, xid, lsn, endlsn, timestamp from ("
+-		"select b.id, b.action, b.xid, b.lsn, b.endlsn, b.timestamp, b.endlsn as k "
+-		"  from replay b "
+-		"  join replay c on c.xid = b.xid and c.action in ('C', 'R') "
+-		" where b.action = 'B' and b.endlsn > $1 "
+-		"union all "
+-		"select id, action, xid, lsn, endlsn, timestamp, lsn as k "
+-		"  from replay "
+-		" where action = 'K' "            /* KEEPALIVE only — no ENDPOS rows */
+-		"   and lsn > $1 "                /* strict: avoids re-delivering same row */
++		" select * from ("
++		"  select b.id, b.action, b.xid, b.lsn, b.endlsn, b.timestamp, b.endlsn as k "
++		"    from replay b "
++		"   where b.action = 'B' and b.endlsn > $1 "
++		"     and exists (select 1 from replay c where c.xid = b.xid and c.action in ('C', 'R')) "
++		"   order by b.endlsn asc, b.id asc limit 1) "
++		" union all "
++		" select * from ("
++		"  select id, action, xid, lsn, endlsn, timestamp, lsn as k "
++		"    from replay "
++		"   where action = 'K' "            /* KEEPALIVE only — no ENDPOS rows */
++		"     and lsn > $1 "                /* strict: avoids re-delivering same row */
++		"   order by lsn asc, id asc limit 1) "
+ 		") "
+ 		"order by k asc, id asc "
+ 		"limit 1";

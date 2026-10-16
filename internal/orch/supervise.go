@@ -279,6 +279,7 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		if d.BaseCopyDone && d.State != DDraining {
 			backlog := o.backlog(ctx, spec, pr.ReplayLSN)
 			cols["backlog_bytes"] = backlog
+			o.cdcProgress(ctx, m, d, pr.WriteLSN, pr.ReplayLSN, backlog)
 			thr := int64(o.Settings(ctx, m).Int("cutover_lag_threshold_mb")) << 20
 			if thr == 0 {
 				thr = 16 << 20

@@ -5,7 +5,7 @@ import { ago, bytes, clock, count, duration, rate, time } from "../lib/format";
 import { backlogKnown } from "../lib/derive";
 import { useApi, useDebounced, useNow } from "../lib/hooks";
 import { useSession } from "../lib/session";
-import type { Database, EventRow, Migration, Series, SnapshotWait } from "../lib/types";
+import type { Database, EventRow, LogRecord, Migration, Series, SnapshotWait } from "../lib/types";
 import { blockerText, dbSignals, dbSummary, SafetyStrip, StatusSummary } from "../components/overview";
 import { CrosshairProvider, seriesFor, TimeChart } from "../components/charts";
 import { LogViewer } from "../components/logview";
@@ -270,14 +270,68 @@ export function LogFilters({ value, onChange, databases }: { value: Record<strin
 export function MigrationLogsTab() {
   const { id, view } = useMig();
   const [f, setF] = useState<Record<string, string>>({ level: "info" });
+  const [mode, setMode] = useState<"live" | "pages">("live");
   const q = useDebounced(f.q || "", 400);
+  const filter = { migration: id, level: f.level, component: f.component, database: f.database, q };
   return (
-    <Card title="Logs">
+    <Card title="Logs" actions={
+      <div className="row" role="radiogroup" aria-label="Log view" style={{ gap: 4 }}>
+        <button className={mode === "live" ? "primary" : "ghost"} aria-pressed={mode === "live"} onClick={() => setMode("live")}>Live tail</button>
+        <button className={mode === "pages" ? "primary" : "ghost"} aria-pressed={mode === "pages"} onClick={() => setMode("pages")}>Pages</button>
+      </div>}>
       <div className="stack">
         <LogFilters value={f} onChange={setF} databases={view.data!.databases.filter((d) => d.include).map((d) => d.source_name)} />
-        <LogViewer filter={{ migration: id, level: f.level, component: f.component, database: f.database, q }} height={560} label="Migration logs" />
+        {mode === "live" ? <LogViewer filter={filter} height={560} label="Migration logs" /> : <LogPages filter={filter} />}
       </div>
     </Card>
+  );
+}
+
+// D107: the logs as pages, newest first, like the Events tab.
+function LogPages({ filter }: { filter: Record<string, string | undefined> }) {
+  const [size, setSize] = useState(100);
+  const [page, setPage] = useState(0);
+  const key = JSON.stringify(filter);
+  useEffect(() => setPage(0), [key]);
+  const params = new URLSearchParams({ paged: "1", limit: String(size), offset: String(page * size) });
+  for (const [k, v] of Object.entries(filter)) if (v) params.set(k, v);
+  const path = `/api/v1/logs?${params}`;
+  const lg = useApi<LogRecord[]>(path, 15000);
+  const total = lastTotal(path) ?? lg.data?.length ?? 0;
+  const pages = Math.max(1, Math.ceil(total / size));
+  const now = useNow(10000);
+  return (
+    <div className="stack">
+      {lg.error ? <ErrorState error={lg.error} retry={lg.refresh} /> : !lg.data ? <Skeleton lines={8} /> : lg.data.length === 0 ? <Empty title="No log lines match">Widen the level or clear the search.</Empty> : (
+        <div className="tablewrap">
+          <table className="data events" aria-label="Log lines">
+            <thead><tr><th style={{ width: 150 }}>Time</th><th style={{ width: 70 }}>Level</th><th style={{ width: 120 }}>Component</th><th style={{ width: 150 }}>Database</th><th>Message</th></tr></thead>
+            <tbody>{lg.data.map((r, i) => (
+              <tr key={(r.seq || 0) + ":" + i} className={`sev-stripe ${r.level === "error" || r.level === "fatal" ? "crit" : r.level === "warn" ? "warn" : "info"}`}>
+                <td title={time(r.ts)}><div>{clock(r.ts)}</div><div className="small muted">{ago(r.ts, now)}</div></td>
+                <td className={`small lv-${r.level}`}>{r.level}</td>
+                <td className="small muted">{r.component}{r.step ? <div className="faint">{r.step}</div> : null}</td>
+                <td style={{ maxWidth: 150 }}>{r.database ? <Trunc className="mono small">{r.database}</Trunc> : <span className="muted">—</span>}</td>
+                <td className="mono small"><LongText text={r.msg} /></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+      <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
+        <span className="small muted">{total === 0 ? "" : `${(page * size + 1).toLocaleString("en-US")}–${Math.min(total, (page + 1) * size).toLocaleString("en-US")} of ${total.toLocaleString("en-US")} lines, newest first`}</span>
+        <div className="row" style={{ gap: 8 }} aria-label="Pages">
+          <select aria-label="Page size" value={size} onChange={(e) => { setSize(Number(e.target.value)); setPage(0); }}>
+            {[50, 100, 200, 500].map((n) => <option key={n} value={n}>{n} a page</option>)}
+          </select>
+          <button onClick={() => setPage(0)} disabled={page === 0}>Newest</button>
+          <button onClick={() => setPage(page - 1)} disabled={page === 0}>Newer</button>
+          <span className="small muted">Page {page + 1} of {pages}</span>
+          <button onClick={() => setPage(page + 1)} disabled={page + 1 >= pages}>Older</button>
+          <button onClick={() => setPage(pages - 1)} disabled={page + 1 >= pages}>Oldest</button>
+        </div>
+      </div>
+    </div>
   );
 }
 

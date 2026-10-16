@@ -79,3 +79,26 @@ func TestPDFReport(t *testing.T) {
 		t.Fatalf("not a PDF (%d bytes)", len(b))
 	}
 }
+
+// D105: the report opens with the run's story: outcome, duration, data,
+// base copy, write pause and change apply, in HTML and Markdown.
+func TestReportHeadline(t *testing.T) {
+	r := &Report{
+		Migration: orch.Migration{Name: "300gmigration", ShortID: "mpaahv", Flags: orch.Flags{Verdict: "GO"}},
+		Summary: orch.RunSummary{Outcome: "GO", DurationMs: 3*3600e3 + 12*60e3, TotalBytes: 330_712_301_568, TotalRows: 1_465_000_000, BaseCopyMs: 3292e3,
+			CopyBytesPerSec: 100.5 * (1 << 20), WritePauseMs: 41e3, ApplyAvgBps: 2.5 * (1 << 20), ApplyPeakBps: 9 * (1 << 20), PeakBacklog: 137e9, PeakLagSeconds: 3720,
+			Databases: []orch.RunDB{{Name: "migration_db", Target: "migration_db", SizeBytes: 330_712_301_568, Tables: 91, BaseCopyMs: 3292e3, Verdict: "GO", Attempts: 2}}},
+	}
+	html, err := r.HTML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := string(r.Markdown())
+	for _, doc := range []string{string(html), md} {
+		for _, want := range []string{"3h12m0s", "308.0 GiB", "54m52s", "100.5 MiB/s", "41s", "2.5 MiB/s", "9.0 MiB/s", "1h2m0s", "migration_db"} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("report lacks %q", want)
+			}
+		}
+	}
+}

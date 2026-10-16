@@ -19,6 +19,11 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | The local incident test's verdict counts no long connection among those the target closed (its COPY connection's FIN is not attributed) | noted | same on the code before D101; for the Part 4 bug bashes |
 | How long did the 300 GB base copy take; Events tab paging, search and layout | done (D102) | 54 min 52 s on the droplet; duration in the `base_copy_done` event and a Base copy table; events API `q`, `severity`, `database`, `type`, `offset`, `X-Total-Count`; `TestEventsPagingAndSearch`, `TestBaseCopyDoneMessage`, `TestHappyPath` |
 | CDC far too slow under TPC-C (137 GB backlog, about 76 h to drain) | fixed in Upwell's build (D103) | patch 0004 (`0.18+upwell.4`): no 100 ms wait per transaction, indexed next-transaction lookups, no fsync per message; pgbench 204 applied transactions a second against 5–7; preflight `engine_apply_rate`; catch-up estimate on the overview |
+| CDC still slow after upwell.4 (18 m behind after 19 m of TPC-C) | fixed in Upwell's build (D106) | the shipped patch 0004 lacked the lookup fixes; patch 0005 (`0.18+upwell.5`) adds them and an `output(xid)` index; pgbench 30 s: 372 applied transactions a second (154 before the last index, 5–7 with upwell.3) |
+| Run a migration again in place, keeping its definition | done (D105) | Run again (records the run, stops engines, removes slots/origins, resets target databases safely, back to setup); refused once applications switched; `TestRerunInPlace` |
+| Start from anywhere once preflight passed | done (D104) | Start migration button and dialog; Continue setup resumes at the right step |
+| Run history with headline numbers; nicer report | done (D105) | Run history screen, stored reports, delete; report headline grid and Performance section; `TestReportHeadline` |
+| Logs tab like Events; more verbose CDC logging | done (D107) | Pages view with totals; per-minute CDC progress lines; `TestLogsPaged` |
 | One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios

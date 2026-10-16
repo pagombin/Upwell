@@ -478,3 +478,57 @@ Patch `0004-apply-without-waiting-and-cdc-files-without-fsync.patch`:
 - The CDC files (`output`, `replay`) use `synchronous = NORMAL`. That is safe because they are not the durable record. On restart pgcopydb streams again from the replication slot, which only advances to what the apply has committed on the target. In WAL mode, NORMAL keeps the file consistent; a power loss can only lose the last commits, which the slot sends again.
 Result, same machine and workload (pgbench, 8 clients, 10 s, 18,819 transactions): **204 transactions a second applied** with upwell.4, against 5 to 7 with upwell.3, with the same rows on both sides. A 20-second load (31,244 transactions) applied at 154 a second: a larger backlog still costs more, so there is room for further work. With upwell.4, these pass: `TestOverlappingTransactionsReachTarget`, `TestP1LargeTransactions` and `TestP1WritersUnderBothPlugins` (both plugins), `TestResumeEndsStaleApplySession`, `TestRestartWithLeftoverEngineSession` and `TestHappyPath`. Preflight's new `engine_apply_rate` check warns about builds before upwell.4 (`TestEngineApplyUnthrottled`). `install.sh` rebuilds the engine when no engine unit runs.
 What it means for the droplet: the backlog left over from the TPC-C run should drain much faster once the engine is rebuilt and `migration_db` restarted. A sustained TPC-C load is still at or above what one apply process can do (about 7,500 row changes a second at 250 transactions a second), so heavy write loads should pause before the cutover. When catching up would take far longer than a base copy, Restart from zero (D102 shows both numbers).
+
+## D104. Start from the migration page once preflight passed
+The operator left the preflight page while it ran (about a minute) and came back to a "Continue setup" button that opened the setup at its first step, with no hint that only Start was left. Now:
+- **Start button.** When preflight passed (`preflight_ok`, the latest run done and `can_start`), the migration's header shows **Start migration**. Its dialog states the preflight result (checks, warnings, blockers, accepted), the databases and size. It asks for the warning review when there are warnings, then starts. For an offline migration it opens the plan review, which asks to confirm or freeze writes.
+- **Wizard resume.** "Continue setup" is "Review setup" once preflight passed. The wizard opened without a step now resumes at the plan review when preflight passed, else at the first step still to do (never past preflight).
+The server's start rules are unchanged: the button only saves the walk through the setup.
+
+## D105. Run a migration again in place; the run history
+The operator re-tests the same pair of clusters repeatedly. After a cutover the only way to migrate again was to clean up, delete, and define a new migration from scratch: permission record, both connections, databases and options. Now:
+- **Run again** (migration header; `POST /migrations/{id}/rerun`, Operator, type the name) runs as an operation with these steps:
+  1. Record the finished run in the history.
+  2. Stop the engines and undo a write freeze.
+  3. For each database, remove the replication slot, publication, origin, heartbeat objects and work directory (the engine's clean up, without deleting the stored passwords).
+  4. Reset the target database (unless "keep the target databases" is ticked).
+  5. Return the migration to its definition: flags cleared (copied roles stay copied), `started_at` and the settings snapshot cleared, every database back to Pending.
+
+  The databases and options can change again, and preflight and Start run it anew. Events and logs of earlier runs are kept.
+- **Safeguards:**
+  - Refused once applications were marked as switched to the target (its databases are live), during a cutover, or while a clean up runs.
+  - Stops at the first failed step, saying where.
+  - A target database is dropped only when everything in it came from the source (`resetTargetDB`, as for Restart from zero); otherwise only the source's tables are dropped, so objects created on the target by anything else survive.
+  - After a clean up the stored passwords are gone; the error says to enter them again.
+- **Run history** (left rail, `GET /api/v1/runs`). A run is recorded at its verdict, at an abort, and when Run again replaces it, keyed by the run's start, so a NO-GO later turned GO updates the same entry. Each card's headline tells the story: outcome, duration, data, base copy time and rate, write pause. It also shows the average and peak apply rate, the average source WAL rate, the peak backlog and lag, critical and warning events, and per database the size, tables, base copy, rate, engine launches and verdict. The report is stored as it was at that moment (`GET /api/v1/runs/{id}/report`, HTML or Markdown). Runs survive the migration's deletion; an Operator can delete one (audited). Store migration 0014 adds the `runs` table.
+- **The report** opens with the same story: a headline sentence, a grid of eight figures, a contents line, and a per-database Performance table, in HTML and Markdown. The layout is refreshed, with print rules.
+Tests: `TestRerunInPlace`:
+- A migration reaches GO.
+- Run again is refused while applications are marked switched.
+- After the run again: no slot or origin is left, the target database is gone (including a row written on it), and the database is Pending.
+- The history holds the GO run with its base copy time and a stored report.
+- The selection gains a second database, and the second run reaches GO with identical counts.
+- The history holds two runs, numbered.
+Also `TestReportHeadline`.
+
+## D106. The next-transaction lookups are indexed (build 0.18+upwell.5); D103's figure came from a build that did not ship
+After installing upwell.4, the operator saw almost no change: 16 TPC-C threads for 19 minutes left the target 18½ minutes behind. The patch `0004` that shipped held only two of D103's fixes: the 100 ms wait, and `synchronous = NORMAL`. The rewritten lookup queries and the `replay(action, endlsn)` index were made after that patch file was written. The binary measured in D103 had them; the droplet's build did not. With the three per-transaction scans left in (the next COMMIT in `output.db`, the next BEGIN in `replay.db`, and the transaction's messages), each transaction cost tens of milliseconds on files the size of the droplet's: no better than before.
+
+Profiling upwell.4-with-the-lookups locally under a 30-second pgbench load found the last scan. The transform reads each transaction's messages with `xid = $1 and id >= $2 order by id`. The only index with `xid` led with `action`, so SQLite walked the file from the transaction's BEGIN to its end: 20.7 ms a transaction on a file of 130,000 messages. Every sampled read was under `ld_store_iter_output`.
+
+Patch `0005-indexed-next-transaction-lookups.patch` (build `0.18+upwell.5`):
+- the rewritten lookups from D103 (each branch takes its first row in index order);
+- the `replay(action, endlsn)` index;
+- an `output(xid)` index (SQLite appends the row id, so `xid = ? and id >= ?` is a range): 0.014 ms a transaction, same rows.
+
+Both indexes are created on open, so the droplet's existing CDC files get them at the first start of the new engine. The installer rebuilds because the version changed. Patch 0004 is kept exactly as shipped, and the five patches apply in order to a clean v0.18 and reproduce the tested source exactly. Preflight's `engine_apply_rate` now warns about every build before upwell.5.
+
+Result, pgbench 8 clients for 30 s (68,155 transactions): **372 transactions a second applied**, against 154 with the lookups alone and 5–7 with upwell.3. The apply now spends its time writing its own files and talking to the target, not scanning.
+
+Still ahead for a sustained TPC-C load (about 250 transactions and 7,500 row changes a second): one apply process sends one statement at a time and waits for each reply. On a VPC round trip of about 0.5 ms that alone allows only a few thousand statements a second. The next step would be libpq pipeline mode inside each transaction. It needs the droplet's numbers with upwell.5 first.
+
+## D107. CDC progress in the logs; the Logs tab pages
+- Once a minute, each streaming database logs (component `cdc`): "CDC last 1m0s: received 1.2 MiB/s, applied 1.1 MiB/s of source WAL; backlog 2.1 GiB (shrinking 96 KiB/s, about 6h12m to drain); Catching up". The Logs tab can be filtered to that component.
+- The migration's Logs tab offers **Live tail** (as before) and **Pages**: newest first, page sizes of 50 to 500, newest/newer/older/oldest, a total count, and the same filters. Long lines fold to two lines. The logs API takes `paged=1` and `offset` and returns `X-Total-Count`.
+- Events are already kept for a migration's whole life (deleted only with it). Logs older than `log_retention_days` (30) are pruned only for cleaned-up migrations. Run again keeps both.
+Tests: `TestLogsPaged`.

@@ -1029,6 +1029,7 @@ func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Opera
 	if f.Cutover != nil {
 		pause = f.Cutover.WritePauseMS
 	}
+	go o.archiveRun(context.WithoutCancel(ctx), m.ID, verdict) // D105: the run history
 	if verdict != "GO" {
 		// Applications stay on the source: give it its writes back.
 		if uerr := o.undoFreeze(ctx, m.ID, "Upwell", "the verdict is NO-GO"); uerr != nil {

@@ -130,6 +130,10 @@ func (s *Server) register() {
 	s.add("POST", "/api/v1/migrations/{id}/verify", operator, "Run verification again", s.verify)
 	s.add("GET", "/api/v1/migrations/{id}/verification", viewer, "Latest verification", s.verification)
 	s.add("POST", "/api/v1/migrations/{id}/cleanup", operator, "Clean up", s.cleanup)
+	s.add("POST", "/api/v1/migrations/{id}/rerun", operator, "Run the migration again with the same definition (resets its target databases)", s.rerun)
+	s.add("GET", "/api/v1/runs", viewer, "Run history: every finished run with its headline numbers", s.runs)
+	s.add("GET", "/api/v1/runs/{id}/report", viewer, "A finished run's report as it was (html or md)", s.runReport)
+	s.add("DELETE", "/api/v1/runs/{id}", operator, "Delete a run from the history", s.deleteRun)
 	s.add("POST", "/api/v1/migrations/{id}/apply-rate", operator, "Measure the engine's apply rate", s.measureApplyRate)
 	s.add("GET", "/api/v1/apply-rate", viewer, "Measured apply rates", s.applyRates)
 	s.add("GET", "/api/v1/migrations/{id}/metrics", viewer, "Time series", s.metrics)
@@ -1429,6 +1433,46 @@ func (s *Server) cleanup(w http.ResponseWriter, r *http.Request) error {
 	return opResponse(w, op, err)
 }
 
+func (s *Server) rerun(w http.ResponseWriter, r *http.Request) error {
+	var in orch.RerunOptions
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	op, err := s.Orch.Rerun(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"), in)
+	return opResponse(w, op, err)
+}
+
+func (s *Server) runs(w http.ResponseWriter, r *http.Request) error {
+	runs, err := s.Orch.ListRuns(r.Context())
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, 200, runs)
+}
+
+func (s *Server) runReport(w http.ResponseWriter, r *http.Request) error {
+	format := r.URL.Query().Get("format")
+	b, err := s.Orch.RunReport(r.Context(), r.PathValue("id"), format)
+	if err != nil {
+		return err
+	}
+	if format == "md" {
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	} else {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:")
+	}
+	_, err = w.Write(b)
+	return err
+}
+
+func (s *Server) deleteRun(w http.ResponseWriter, r *http.Request) error {
+	if err := s.Orch.DeleteRun(r.Context(), actor(r), r.PathValue("id")); err != nil {
+		return err
+	}
+	return writeJSON(w, 200, map[string]any{"deleted": true})
+}
+
 func (s *Server) measureApplyRate(w http.ResponseWriter, r *http.Request) error {
 	op, err := s.Orch.MeasureApplyRate(r.Context(), actor(r), r.PathValue("id"), r.Header.Get("Idempotency-Key"))
 	return opResponse(w, op, err)
@@ -1543,8 +1587,24 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) error {
 	if qint(r, "after") > 0 {
 		order = "ASC"
 	}
+	// D107: paged=1 returns a page newest first, with the number of matching
+	// lines in X-Total-Count.
+	paged := q.Get("paged") == "1"
+	if paged {
+		var total int
+		_, cond, _ := strings.Cut(sqlq, " FROM logs ")
+		if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT count(*) FROM logs `+cond, args...).Scan(&total); err != nil {
+			return err
+		}
+		w.Header().Set("X-Total-Count", strconv.Itoa(total))
+		order = "DESC"
+	}
 	sqlq += " ORDER BY seq " + order + " LIMIT ?"
 	args = append(args, limit)
+	if paged {
+		sqlq += " OFFSET ?"
+		args = append(args, max(qint(r, "offset"), 0))
+	}
 	rows, err := s.Store.DB.QueryContext(r.Context(), sqlq, args...)
 	if err != nil {
 		return err
@@ -1556,7 +1616,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) error {
 		rows.Scan(&rec.Seq, &rec.TS, &rec.Level, &rec.Component, &rec.Migration, &rec.Database, &rec.Attempt, &rec.Step, &rec.Table, &rec.Op, &rec.Msg, &rec.Raw)
 		out = append(out, rec)
 	}
-	if order == "DESC" {
+	if order == "DESC" && !paged {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]
 		}

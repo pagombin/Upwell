@@ -34,10 +34,15 @@ export function NewMigrationScreen() {
   const go = (n: number) => setSp({ step: String(n) });
   const v = view.data;
   const m = v?.migration;
+  const max = !v ? 0 : !v.permission ? 0 : !v.source ? 1 : !v.target ? 2 : !v.databases?.length ? 3 : 6;
+  // Opened without a step (Continue setup): the review step when preflight
+  // passed, else the first step that still needs something.
+  const noStep = !sp.get("step");
+  const resume = v ? (m?.flags.preflight_ok ? 6 : Math.min(max, 5)) : 0;
+  useEffect(() => { if (noStep && v && resume > 0) setSp({ step: String(resume) }, { replace: true }); }, [noStep, v, resume, setSp]);
   if (m && m.flags.started) {
     return <div className="page"><Empty title="This migration has started" action={<Link className="btn" to={`/migrations/${m.short_id}`}>Open its overview</Link>}>Its definition is frozen once it starts.</Empty></div>;
   }
-  const max = !v ? 0 : !v.permission ? 0 : !v.source ? 1 : !v.target ? 2 : !v.databases?.length ? 3 : 6;
   return (
     <div className="page">
       <div className="pagehead">

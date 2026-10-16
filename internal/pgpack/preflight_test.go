@@ -60,7 +60,7 @@ func TestEngineCommitOrderFixed(t *testing.T) {
 // (at most about ten a second); they lose nothing, so preflight warns.
 func TestEngineApplyUnthrottled(t *testing.T) {
 	for v, want := range map[string]bool{
-		"0.18": false, "0.18+upwell.1": false, "0.18+upwell.3": false, "0.18+upwell.4": true, "0.18+upwell.12": true, "0.19+upwell.4": true,
+		"0.18": false, "0.18+upwell.1": false, "0.18+upwell.3": false, "0.18+upwell.4": false, "0.18+upwell.5": true, "0.18+upwell.12": true, "0.19+upwell.5": true,
 	} {
 		if got := EngineApplyUnthrottled(v); got != want {
 			t.Errorf("EngineApplyUnthrottled(%q) = %v, want %v", v, got, want)

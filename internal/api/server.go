@@ -26,6 +26,7 @@ import (
 	"github.com/pagombin/upwell/internal/config"
 	"github.com/pagombin/upwell/internal/logx"
 	"github.com/pagombin/upwell/internal/orch"
+	"github.com/pagombin/upwell/internal/report"
 	"github.com/pagombin/upwell/internal/settings"
 	"github.com/pagombin/upwell/internal/store"
 	"github.com/pagombin/upwell/internal/tlsutil"
@@ -111,6 +112,18 @@ func New(s *Server) *Server {
 		s.userLimit = auth.NewRateLimiter(loginBurst, loginPeriod)
 	}
 	s.register()
+	// D105: a finished run keeps its report as it was.
+	if s.Orch != nil {
+		st, orc, ver := s.Store, s.Orch, s.Version
+		orch.RunReporter = func(ctx context.Context, migID string) ([]byte, []byte, error) {
+			rep, err := report.Build(ctx, orc, st, migID, ver)
+			if err != nil {
+				return nil, nil, err
+			}
+			h, err := rep.HTML()
+			return h, rep.Markdown(), err
+		}
+	}
 	return s
 }
 

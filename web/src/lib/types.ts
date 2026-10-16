@@ -57,3 +57,13 @@ export interface Point { ts: number; v: number; min?: number; max?: number }
 export interface Series { name: string; database?: string; points: Point[] }
 export interface VerificationRow { database: string; check_id: string; result: string; title: string; detail: { message?: string; evidence?: Record<string, unknown> }; ts: number }
 export interface AuditEntry { seq: number; id: string; ts: number; user_id?: string; username?: string; ip?: string; action: string; target?: string; before?: unknown; after?: unknown; prev_hash: string; hash: string }
+
+// D105: finished runs.
+export interface RunDB { name: string; target: string; size_bytes: number; rows_estimate: number; tables: number; base_copy_ms?: number; verdict?: string; state: string; attempts: number }
+export interface RunSummary {
+  name: string; short_id: string; mode: string; source: string; target: string; started_at: number; ended_at: number; duration_ms: number; outcome: string;
+  write_pause_ms?: number; unverified_count?: number; total_bytes: number; total_rows: number; base_copy_ms?: number; copy_bytes_per_s?: number;
+  apply_avg_bytes_per_s?: number; apply_peak_bytes_per_s?: number; source_wal_avg_bytes_per_s?: number; peak_backlog_bytes?: number; peak_lag_seconds?: number;
+  critical_events: number; warning_events: number; databases: RunDB[];
+}
+export interface Run { id: string; migration_id: string; number: number; outcome: string; started_at: number; ended_at: number; summary: RunSummary; has_report: boolean }

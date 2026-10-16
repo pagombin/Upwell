@@ -82,6 +82,63 @@ export function MigrationLayout() {
   );
 }
 
+// RerunDialog resets a started migration to its definition to run it again
+// (D105). The finished run stays in the run history.
+function RerunDialog({ v, onClose, onStarted }: { v: MigrationView; onClose: () => void; onStarted: (op: string) => void }) {
+  const m = v.migration;
+  const [keep, setKeep] = useState(false);
+  const inc = v.databases.filter((d) => d.include);
+  return (
+    <ConfirmDialog title="Run this migration again" danger typeToConfirm={m.name} confirmLabel="Run again" onClose={onClose}
+      onConfirm={async (t) => { const r = await api.post<{ operation_id: string }>(`/api/v1/migrations/${m.id}/rerun`, { confirm: t, keep_target: keep }); onStarted(r.operation_id); }}>
+      <p>The connections, permission record, settings and databases are kept. Upwell will:</p>
+      <ol>
+        <li>record this run in the run history{m.flags.verdict ? ` (verdict ${m.flags.verdict})` : m.flags.aborted ? " (aborted)" : ""}, with its report;</li>
+        <li>stop the engines{m.flags.freeze ? " and undo the write freeze" : ""};</li>
+        <li>remove each database's replication slot, publication, origin, heartbeat objects and work directory;</li>
+        <li>{keep ? "leave the target databases as they are (the next start overwrites what came from the source)" : <>reset the target databases <span className="mono">{inc.map((d) => d.target_name).join(", ")}</span>: a database is dropped only when everything in it came from the source, otherwise only the source's tables are dropped</>};</li>
+        <li>return the migration to its setup, where you can change databases or options, run preflight, and start.</li>
+      </ol>
+      <label className="check"><input type="checkbox" checked={keep} onChange={(e) => setKeep(e.target.checked)} />Keep the target databases as they are</label>
+      <p className="small muted">Not available once applications were marked as switched to the target, or during a cutover.</p>
+    </ConfirmDialog>
+  );
+}
+
+// StartDialog starts a migration whose preflight passed, from its page
+// (D104): no need to walk the setup again after leaving preflight running.
+function StartDialog({ v, onClose, onDone }: { v: MigrationView; onClose: () => void; onDone: () => void }) {
+  const m = v.migration;
+  const sum = v.preflight!.summary;
+  const offline = (v.settings_effective?.mode ?? "online") === "offline";
+  const [reviewed, setReviewed] = useState(false);
+  const [err, setErr] = useState<ApiError>();
+  const [busy, setBusy] = useState(false);
+  const nav = useNavigate();
+  const start = async () => {
+    setBusy(true); setErr(undefined);
+    try { await api.post(`/api/v1/migrations/${m.id}/start`, { warnings_reviewed: reviewed }); onDone(); onClose(); }
+    catch (e) { setErr(e as ApiError); } finally { setBusy(false); }
+  };
+  return (
+    <Dialog title="Start migration" onClose={onClose} footer={<>
+      <button onClick={onClose}>Cancel</button>
+      {offline
+        ? <button className="primary" onClick={() => nav(`/migrations/${m.short_id}/setup?step=6`)}>Open the plan review</button>
+        : <button className="primary" disabled={busy || (sum.needs_warning_review && !reviewed)} onClick={start}>{busy && <span className="spin" />}Start migration</button>}
+    </>}>
+      <div className="stack">
+        <p>Preflight passed {v.preflight?.ended_at ? time(v.preflight.ended_at) : ""}: {sum.ok} checks OK, {sum.warnings} warning{sum.warnings === 1 ? "" : "s"}, {sum.blockers} blocker{sum.blockers === 1 ? "" : "s"} ({sum.accepted || 0} accepted). {v.included} database{v.included === 1 ? "" : "s"}, {bytes(v.total_bytes)}.</p>
+        {offline
+          ? <p>This is an offline migration: the plan review asks you to confirm that writes have stopped, or to freeze them, before it starts.</p>
+          : <p>Each database gets its engine, replication slot and origin; the base copy starts right away (or waits for the run lock).</p>}
+        {sum.needs_warning_review && !offline && <label className="check"><input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} />I reviewed the {sum.warnings} preflight warnings (<Link to={`/migrations/${m.short_id}/preflight`}>see them</Link>)</label>}
+        {err && <ErrorState error={err} />}
+      </div>
+    </Dialog>
+  );
+}
+
 // Engines run in these states; an address change waits for them (D100).
 const ENGINE_STATES = ["preparing", "base_copy", "catch_up", "in_sync", "draining", "degraded"];
 
@@ -155,7 +212,7 @@ function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => voi
   const { run, busy } = useAction();
   const ops = useOps();
   const nav = useNavigate();
-  const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | "bundle" | "conn" | null>(null);
+  const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | "bundle" | "conn" | "start" | "rerun" | null>(null);
   const m = v.migration, f = m.flags;
   if (!can("operator")) return null;
   if (m.fixture) return <div className="actions"><span className="small muted">Demonstration data: actions are turned off</span></div>;
@@ -163,13 +220,19 @@ function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => voi
   const mid = m.id;
   return (
     <div className="actions">
-      {!f.started && !f.cleaned_up && <Link className="btn" to={`/migrations/${m.short_id}/setup`}>Continue setup</Link>}
+      {!f.started && !f.cleaned_up && f.preflight_ok && v.preflight?.state === "done" && v.preflight.summary.can_start && <button className="primary" onClick={() => setDlg("start")}>Start migration</button>}
+      {!f.started && !f.cleaned_up && <Link className="btn" to={`/migrations/${m.short_id}/setup`}>{f.preflight_ok ? "Review setup" : "Continue setup"}</Link>}
+      {dlg === "start" && <StartDialog v={v} onClose={() => setDlg(null)} onDone={refresh} />}
       {f.started && !f.paused && !f.aborted && !f.verdict && !inCutover && <button onClick={() => setDlg("pause")}>Pause</button>}
       {f.started && f.paused && !f.aborted && <button className="primary" disabled={!!busy} onClick={() => run("resume", () => api.post(`/api/v1/migrations/${mid}/resume`), "Resuming every database").then(refresh)}>Resume</button>}
       {f.started && !f.aborted && !f.verdict && !inCutover && <button className="danger" onClick={() => setDlg("abort")}>Abort</button>}
       {(f.aborted || f.verdict || !f.started) && !f.cleaned_up && !f.cleanup_running && <button onClick={() => setDlg("cleanup")}>Clean up</button>}
       {f.cleaned_up && <button className="danger" onClick={() => setDlg("delete")}>Delete</button>}
       {f.started && !f.aborted && !f.cleaned_up && !f.verdict && <button className="ghost" onClick={() => setDlg("conn")}>Connections</button>}
+      {f.started && !inCutover && !f.apps_switched && !f.cleanup_running && <button onClick={() => setDlg("rerun")}>Run again</button>}
+      {dlg === "rerun" && (
+        <RerunDialog v={v} onClose={() => setDlg(null)} onStarted={(op) => { ops.open(op, "Run again"); refresh(); }} />
+      )}
       <button className="ghost" onClick={() => setDlg("bundle")}>Support bundle</button>
       {dlg === "conn" && <ConnectionsDialog v={v} onClose={() => setDlg(null)} onDone={refresh} />}
       {dlg === "bundle" && <SupportBundleDialog mig={mid} onClose={() => setDlg(null)} />}

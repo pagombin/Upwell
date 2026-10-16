@@ -1352,6 +1352,7 @@ func (o *Orchestrator) Abort(ctx context.Context, a audit.Actor, id, confirm str
 		o.Event(ctx, m.ID, "", "write_freeze", "critical", err.Error(), nil)
 	}
 	o.Event(ctx, m.ID, "", "aborted", "warning", "Migration aborted by "+a.Username+"; clean up removes its slots, publications and origins", nil)
+	go o.archiveRun(context.WithoutCancel(ctx), m.ID, "aborted") // D105
 	o.refreshState(ctx, m.ID)
 	return o.GetMigration(ctx, m.ID)
 }

@@ -18,6 +18,7 @@ function Logo() {
 
 const NAV = [
   { to: "/", label: "Home", icon: "home", end: true },
+  { to: "/runs", label: "Run history", icon: "runs" },
   { to: "/logs", label: "Logs", icon: "logs" },
   { to: "/events", label: "Events and audit", icon: "events" },
   { to: "/alerts", label: "Alerts", icon: "alert" },
