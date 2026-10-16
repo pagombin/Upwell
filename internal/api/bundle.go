@@ -97,7 +97,7 @@ func tailFile(path string, max int64) []byte {
 	return b
 }
 
-func (s *Server) buildBundle(ctx context.Context, id string) (orch.Migration, []bundleFile, error) {
+func (s *Server) buildBundle(ctx context.Context, id, netMode string) (orch.Migration, []bundleFile, error) {
 	m, err := s.Orch.GetMigration(ctx, id)
 	if err != nil {
 		return m, nil, err
@@ -168,51 +168,8 @@ func (s *Server) buildBundle(ctx context.Context, id string) (orch.Migration, []
 			add("logs/engine-"+d.SourceName+".log", b)
 		}
 	}
-	// D97: network diagnostics. Incident reports of this migration, the
-	// connection samples, the capture unit's status and its recent packet
-	// headers (SYN, FIN, RST, zero window, ICMP; no payload).
-	diag := s.Orch.NetDiagDir()
-	if ents, err := os.ReadDir(diag); err == nil {
-		for _, e := range ents {
-			if strings.HasPrefix(e.Name(), "incident-") && strings.Contains(e.Name(), "-"+m.ShortID+"-") {
-				if b, err := os.ReadFile(filepath.Join(diag, e.Name())); err == nil {
-					add("network/"+e.Name(), b)
-				}
-			}
-		}
-	}
-	if b := tailFile(filepath.Join(diag, "net", "sockets.jsonl"), 4<<20); len(b) > 0 {
-		add("network/sockets.jsonl", b)
-	}
-	if b, err := os.ReadFile(filepath.Join(diag, "capture", "status")); err == nil {
-		add("network/capture-status.txt", b)
-	} else {
-		add("network/capture-status.txt", []byte("no status: the root unit upwell-netcapture is not installed or has not run ("+err.Error()+")\n"))
-	}
-	if ents, err := os.ReadDir(filepath.Join(diag, "capture")); err == nil {
-		type pc struct {
-			name string
-			mod  time.Time
-			size int64
-		}
-		var caps []pc
-		for _, e := range ents {
-			if fi, err := e.Info(); err == nil && strings.HasPrefix(e.Name(), "upwell-") && strings.HasSuffix(e.Name(), ".pcap") && time.Since(fi.ModTime()) < 48*time.Hour {
-				caps = append(caps, pc{e.Name(), fi.ModTime(), fi.Size()})
-			}
-		}
-		sort.Slice(caps, func(i, j int) bool { return caps[i].mod.After(caps[j].mod) })
-		var total int64
-		for _, c := range caps {
-			if total+c.size > 40<<20 {
-				break
-			}
-			if b, err := os.ReadFile(filepath.Join(diag, "capture", c.name)); err == nil {
-				total += int64(len(b))
-				files = append(files, bundleFile{Name: "network/" + c.name, data: b, Binary: true})
-			}
-		}
-	}
+	// D97, D101: network diagnostics, limited to this migration's failures.
+	files = append(files, s.bundleNetwork(ctx, m, events, netMode)...)
 	engVer, _ := s.Orch.Engine().Version(ctx)
 	pgDump := ""
 	if out, err := exec.CommandContext(ctx, filepath.Join(s.Cfg.Engine.PgBinDir, "pg_dump"), "--version").Output(); err == nil {
@@ -272,7 +229,7 @@ func hostFacts(dataDir string) map[string]any {
 }
 
 func (s *Server) bundlePreview(w http.ResponseWriter, r *http.Request) error {
-	_, files, err := s.buildBundle(r.Context(), r.PathValue("id"))
+	_, files, err := s.buildBundle(r.Context(), r.PathValue("id"), r.URL.Query().Get("network"))
 	if err != nil {
 		return err
 	}
@@ -284,36 +241,55 @@ func (s *Server) bundlePreview(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) bundleDownload(w http.ResponseWriter, r *http.Request) error {
-	m, files, err := s.buildBundle(r.Context(), r.PathValue("id"))
+	m, files, err := s.buildBundle(r.Context(), r.PathValue("id"), r.URL.Query().Get("network"))
 	if err != nil {
 		return err
 	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
+	// Streamed: the archive is compressed straight into the response
+	// instead of being built in memory first (D101).
 	prefix := "upwell-support-" + m.ShortID + "-" + time.Now().UTC().Format("20060102T150405Z")
-	for _, f := range files {
-		if err := tw.WriteHeader(&tar.Header{Name: prefix + "/" + f.Name, Mode: 0o600, Size: int64(len(f.data)), ModTime: time.Now()}); err != nil {
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+prefix+`.tar.gz"`)
+	w.WriteHeader(200)
+	cw := &countWriter{w: w}
+	gz := gzip.NewWriter(cw)
+	tw := tar.NewWriter(gz)
+	werr := func() error {
+		for _, f := range files {
+			if err := tw.WriteHeader(&tar.Header{Name: prefix + "/" + f.Name, Mode: 0o600, Size: int64(len(f.data)), ModTime: time.Now()}); err != nil {
+				return err
+			}
+			if _, err := tw.Write(f.data); err != nil {
+				return err
+			}
+		}
+		if err := tw.Close(); err != nil {
 			return err
 		}
-		if _, err := tw.Write(f.data); err != nil {
-			return err
-		}
-	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
+		return gz.Close()
+	}()
 	red := 0
 	for _, f := range files {
 		red += f.Redactions
 	}
-	s.Audit.Append(r.Context(), actor(r), "migration.support_bundle", m.ID, nil, map[string]any{"files": len(files), "bytes": buf.Len(), "redactions": red})
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+prefix+`.tar.gz"`)
-	w.WriteHeader(200)
-	_, err = w.Write(buf.Bytes())
-	return err
+	after := map[string]any{"files": len(files), "bytes": cw.n, "redactions": red, "network": r.URL.Query().Get("network")}
+	if werr != nil {
+		after["error"] = werr.Error()
+	}
+	s.Audit.Append(r.Context(), actor(r), "migration.support_bundle", m.ID, nil, after)
+	if werr != nil {
+		s.Log.Logf("warn", "api", m.ID, "support bundle download ended early: %v", werr)
+	}
+	return nil // the status is sent; an error now cannot be reported to the client
+}
+
+type countWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }

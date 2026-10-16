@@ -91,3 +91,25 @@ func (o *Orchestrator) netIncident(m Migration, d Database, side string, conn pg
 		fmt.Sprintf("%s: network diagnostics for the closed %s connection (%s, in the support bundle): %s", d.SourceName, side, filepath.Base(path), verdict),
 		map[string]any{"file": filepath.Base(path), "peers": len(in.Peers), "server_sessions": len(in.ServerSessions), "attempt_started": strconv.FormatInt(attemptStart.UnixMilli(), 10)})
 }
+
+// MigrationPeers resolves the addresses of a migration's source and target
+// as they are now (the support bundle keeps only their packets, D101).
+func (o *Orchestrator) MigrationPeers(ctx context.Context, m Migration) []netdiag.Peer {
+	src, dst, err := o.Conns(ctx, m)
+	if err != nil {
+		return nil
+	}
+	var out []netdiag.Peer
+	for _, c := range []pg.Conn{src, dst} {
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ips, err := net.DefaultResolver.LookupIPAddr(rctx, c.Host)
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			out = append(out, netdiag.Peer{IP: ip.IP.String(), Port: c.Port})
+		}
+	}
+	return out
+}

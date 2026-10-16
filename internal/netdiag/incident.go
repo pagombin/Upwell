@@ -33,22 +33,26 @@ type IncidentInput struct {
 
 // Packet is one captured TCP control packet (or ICMP message).
 type Packet struct {
-	At    time.Time
-	Src   string
-	Dst   string
-	Flags string // tcpdump's: S, S., F., R, R., P. ...
-	TTL   int
-	Line  string
+	At     time.Time
+	Src    string
+	Dst    string
+	Flags  string // tcpdump's: S, S., F., R, R., P. ...
+	TTL    int
+	Seq    uint32 // absolute (tcpdump -S); 0 when not shown
+	HasSeq bool
+	Line   string
 }
 
 var (
 	reHead  = regexp.MustCompile(`^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+) (?:\S+ +\S+ +)?IP6? \(.*?(?:ttl|hlim) (\d+)`)
 	reTCP   = regexp.MustCompile(`^\s*(\S+) > (\S+): Flags \[([^\]]+)\]`)
+	reSeq   = regexp.MustCompile(`, seq (\d+)`)
 	reShort = regexp.MustCompile(`^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+) (?:\S+ +\S+ +)?IP6? (\S+) > (\S+): (?:Flags \[([^\]]+)\]|(ICMP.*))`)
 )
 
-// parseTcpdump reads `tcpdump -nn -tttt -v -r` output (two lines a packet
-// with -v: the IP header with the TTL, then the TCP line).
+// parseTcpdump reads `tcpdump -nn -tttt -v -S -r` output (two lines a
+// packet with -v: the IP header with the TTL, then the TCP line; -S keeps
+// sequence numbers absolute, so an RST can be matched to either side's).
 func parseTcpdump(out string) []Packet {
 	var pk []Packet
 	lines := strings.Split(out, "\n")
@@ -71,6 +75,11 @@ func parseTcpdump(out string) []Packet {
 		if i+1 < len(lines) {
 			if t := reTCP.FindStringSubmatch(lines[i+1]); t != nil {
 				p.Src, p.Dst, p.Flags = t[1], t[2], t[3]
+				if q := reSeq.FindStringSubmatch(lines[i+1]); q != nil {
+					if v, err := strconv.ParseUint(q[1], 10, 32); err == nil {
+						p.Seq, p.HasSeq = uint32(v), true
+					}
+				}
 				p.Line += " | " + strings.TrimSpace(lines[i+1])
 				i++
 			} else if strings.Contains(lines[i+1], "ICMP") {
@@ -157,7 +166,7 @@ func (r *Recorder) Incident(ctx context.Context, in IncidentInput) (string, stri
 		}
 		for _, f := range files {
 			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			out, _ := exec.CommandContext(cctx, "tcpdump", "-nn", "-tttt", "-v", "-r", f, strings.Join(filt, " or ")).Output()
+			out, _ := exec.CommandContext(cctx, "tcpdump", "-nn", "-tttt", "-v", "-S", "-r", f, strings.Join(filt, " or ")).Output()
 			cancel()
 			for _, p := range parseTcpdump(string(out)) {
 				if !p.At.Before(from) && !p.At.After(in.FailedAt.Add(time.Minute)) {
@@ -308,6 +317,26 @@ type connClose struct {
 	synAt, closeAt time.Time
 	first          Packet
 	byPeer         bool
+	// ISNs from the handshake, and RSTs from the peer's address that carry
+	// this droplet's own sequence numbers (D101).
+	ownISN, peerISN uint32
+	hasOwn, hasPeer bool
+	reflected       int
+	firstReflected  Packet
+}
+
+// seqNear: b is a little ahead of a in sequence space (wrapping).
+func seqNear(a, b uint32) bool { return b-a < 1<<30 }
+
+// reflectedRST: an RST "from" the peer whose sequence number continues this
+// droplet's numbering, not the peer's: a device on the path built it from a
+// packet this droplet sent. The kernel ignores it (it is outside the window).
+func (c *connClose) reflectedRST(p Packet) bool {
+	if !strings.Contains(p.Flags, "R") || !p.HasSeq || !c.hasOwn || !seqNear(c.ownISN, p.Seq) {
+		return false
+	}
+	return !c.hasPeer || p.Seq-c.ownISN < p.Seq-c.peerISN // nearer this droplet's numbering
+
 }
 
 // closeVerdict reads, for each connection to the peer, who sent the first
@@ -346,6 +375,20 @@ func closeVerdict(pk []Packet, peers map[string]bool, side string) []string {
 			if !fromPeer && c.synAt.IsZero() {
 				c.synAt = p.At
 			}
+			if p.HasSeq {
+				if fromPeer {
+					c.peerISN, c.hasPeer = p.Seq, true
+				} else {
+					c.ownISN, c.hasOwn = p.Seq, true
+				}
+			}
+			continue
+		}
+		if fromPeer && c.reflectedRST(p) {
+			if c.reflected == 0 {
+				c.firstReflected = p
+			}
+			c.reflected++
 			continue
 		}
 		if strings.ContainsAny(p.Flags, "FR") && c.closeAt.IsZero() {
@@ -384,7 +427,32 @@ func closeVerdict(pk []Packet, peers map[string]bool, side string) []string {
 		}
 		return "open " + c.closeAt.Sub(c.synAt).Round(time.Millisecond).String()
 	}
+	var refl []*connClose
+	nRefl := 0
+	for _, c := range conns {
+		if c.reflected > 0 {
+			refl = append(refl, c)
+			nRefl += c.reflected
+		}
+	}
+	sort.Slice(refl, func(i, j int) bool { return refl[i].firstReflected.At.Before(refl[j].firstReflected.At) })
+	if len(refl) > 0 {
+		c := refl[0]
+		s := fmt.Sprintf("%d RST(s) arrived from the %s's address on %d connection(s) carrying this droplet's own sequence number, first at %s UTC on %s: a device on the path bounced this droplet's packets back, not from the %s itself. A stateful firewall or NAT that has forgotten a connection does this; the kernel ignores such an RST, so the connection stayed open with its data unacknowledged.",
+			nRefl, side, len(refl), c.firstReflected.At.Format("15:04:05.000"), strings.Replace(c.key, "|", " -> ", 1), side)
+		if c.firstReflected.TTL > 0 && len(synTTL) > 0 && !synTTL[c.firstReflected.TTL] {
+			var t []string
+			for x := range synTTL {
+				t = append(t, strconv.Itoa(x))
+			}
+			sort.Strings(t)
+			s += fmt.Sprintf(" Their TTL (%d) differs from the %s's handshake packets (%s): sent by a device nearer this droplet.", c.firstReflected.TTL, side, strings.Join(t, ", "))
+		}
+		out = append(out, s)
+	}
 	switch {
+	case len(peerFirst) == 0 && len(ownFirst) == 0 && len(refl) > 0:
+		out = append(out, "No FIN or RST from the "+side+" itself was captured: nothing it sent ended a connection.")
 	case len(peerFirst) == 0 && len(ownFirst) == 0:
 		out = append(out, "No FIN or RST to or from the "+side+" was captured around the failure: the connection did not end with a TCP packet that reached this droplet (a silent drop on the path, or the capture was not running).")
 	case len(peerFirst) == 0:
@@ -460,6 +528,17 @@ type stall struct {
 	backoff    string
 	gone       bool // the connection disappeared while stalled
 	lastSample time.Time
+	idle       time.Duration // nothing sent or received before the stall (D101)
+}
+
+// idleFor: how long a socket had neither sent nor received data.
+func idleFor(k Sock) time.Duration {
+	snd, err1 := strconv.ParseInt(k.Fields["lastsnd"], 10, 64)
+	rcv, err2 := strconv.ParseInt(k.Fields["lastrcv"], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	return time.Duration(min(snd, rcv)) * time.Millisecond
 }
 
 // stallVerdict finds, from every sample, the connections whose sent data
@@ -473,6 +552,7 @@ func stallVerdict(samples []Sample, peers map[string]bool, failedAt time.Time, u
 		since time.Time
 		last  Sock
 		at    time.Time
+		idle  time.Duration
 	}
 	cur := map[string]*st{}
 	var done []stall
@@ -495,6 +575,7 @@ func stallVerdict(samples []Sample, peers map[string]bool, failedAt time.Time, u
 			case a == c.acked && stalled:
 				if c.since.IsZero() {
 					c.since = c.at // stalled since the previous sample
+					c.idle = idleFor(c.last)
 				}
 				c.last, c.at = k, s.At
 			default:
@@ -509,7 +590,7 @@ func stallVerdict(samples []Sample, peers map[string]bool, failedAt time.Time, u
 				continue
 			}
 			if !c.since.IsZero() {
-				done = append(done, stall{conn: key, from: c.since, to: c.at, acked: c.acked, unacked: c.last.Fields["unacked"], backoff: c.last.Fields["backoff"], gone: true, lastSample: c.at})
+				done = append(done, stall{conn: key, from: c.since, to: c.at, acked: c.acked, unacked: c.last.Fields["unacked"], backoff: c.last.Fields["backoff"], gone: true, lastSample: c.at, idle: c.idle})
 			}
 			delete(cur, key)
 		}
@@ -529,7 +610,11 @@ func stallVerdict(samples []Sample, peers map[string]bool, failedAt time.Time, u
 			if userTimeout > 0 {
 				s += fmt.Sprintf(": this droplet's kernel ends a connection after %s without an acknowledgement (engine_tcp_user_timeout_seconds), so it was ended here, not closed by the other end", userTimeout)
 			}
-			out = append(out, s+".")
+			s += "."
+			if x.idle >= time.Minute {
+				s += fmt.Sprintf(" It had been idle for %s before (nothing sent or received): a firewall or NAT on the path forgets an idle connection after its own timeout unless keepalives refresh it, then answers nothing or bounces the next packet.", x.idle.Round(time.Second))
+			}
+			out = append(out, s)
 			continue
 		}
 		recovered++

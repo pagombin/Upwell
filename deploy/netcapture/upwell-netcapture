@@ -40,22 +40,26 @@ valid_ip4() {
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 
 # filter prints the BPF filter for the listed IPv4 addresses (the TCP flag
-# offsets need IPv4; DigitalOcean clusters are reached over IPv4).
+# offsets need IPv4; DigitalOcean clusters are reached over IPv4). Zero-window
+# packets are kept only from the clusters (D101): this droplet's own, sent
+# whenever a COPY outpaces the target, were most of every capture file and
+# show in the socket samples anyway.
 filter() {
-  local tcp=() hosts=() ip port rest
+  local tcp=() hosts=() srcs=() ip port rest
   declare -A seen=()
   [[ -r $LIST ]] || return 0
   while read -r ip port rest; do
     [[ -z ${ip:-} || ${ip:0:1} == "#" || -n ${rest:-} ]] && continue
-    valid_ip4 "$ip" && valid_port "${port:-}" || continue
+    if ! valid_ip4 "$ip" || ! valid_port "${port:-}"; then continue; fi
     tcp+=("(host $ip and port $((10#$port)))")
-    [[ -n ${seen[$ip]:-} ]] || { hosts+=("host $ip"); seen[$ip]=1; }
+    [[ -n ${seen[$ip]:-} ]] || { hosts+=("host $ip"); srcs+=("src host $ip"); seen[$ip]=1; }
   done <"$LIST"
   ((${#tcp[@]})) || return 0
-  local t h
+  local t h s
   t=$(printf ' or %s' "${tcp[@]}"); t=${t:4}
   h=$(printf ' or %s' "${hosts[@]}"); h=${h:4}
-  printf '(tcp and (%s) and (tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0 or tcp[14:2] = 0)) or (icmp and (%s)) or icmp[icmptype] = icmp-unreach or icmp[icmptype] = icmp-timxceed' "$t" "$h"
+  s=$(printf ' or %s' "${srcs[@]}"); s=${s:4}
+  printf '(tcp and (%s) and (tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0 or (tcp[14:2] = 0 and (%s)))) or (icmp and (%s)) or icmp[icmptype] = icmp-unreach or icmp[icmptype] = icmp-timxceed' "$t" "$s" "$h"
 }
 
 prune() {

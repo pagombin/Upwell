@@ -1,0 +1,68 @@
+2026-10-16 01:50:18.914946 ifb1  Out IP (tos 0x0, ttl 64, id 13283, offset 0, flags [DF], proto TCP (6), length 60)
+    192.0.2.10.39334 > 198.51.100.30.5432: Flags [S], cksum 0x1530 (incorrect -> 0x04b7), seq 3883930135, win 64240, options [mss 1460,sackOK,TS val 3519658262 ecr 0,nop,wscale 7], length 0
+2026-10-16 01:50:18.915798 ifb1  Out IP (tos 0x0, ttl 64, id 24097, offset 0, flags [DF], proto TCP (6), length 60)
+    192.0.2.10.39350 > 198.51.100.30.5432: Flags [S], cksum 0x1530 (incorrect -> 0x7ccf), seq 518677124, win 64240, options [mss 1460,sackOK,TS val 3519658263 ecr 0,nop,wscale 7], length 0
+2026-10-16 01:50:18.916525 ifb1  In  IP (tos 0x0, ttl 61, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [S.], cksum 0xa1f3 (correct), seq 536760907, ack 3883930136, win 65160, options [mss 1460,sackOK,TS val 209117274 ecr 3519658262,nop,wscale 7], length 0
+2026-10-16 01:50:18.916770 ifb1  In  IP (tos 0x0, ttl 61, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [S.], cksum 0x31cc (correct), seq 4264641355, ack 518677125, win 65160, options [mss 1460,sackOK,TS val 3675794116 ecr 3519658263,nop,wscale 7], length 0
+2026-10-16 01:59:57.148958 ifb1  In  IP (tos 0x0, ttl 63, id 24119, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520236496 ecr 3675794166], length 106
+2026-10-16 01:59:57.150556 ifb1  In  IP (tos 0x0, ttl 63, id 13305, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520236498 ecr 209117313], length 93
+2026-10-16 01:59:57.354453 ifb1  In  IP (tos 0x0, ttl 63, id 24120, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520236702 ecr 3675794166], length 106
+2026-10-16 01:59:57.354453 ifb1  In  IP (tos 0x0, ttl 63, id 13306, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520236702 ecr 209117313], length 93
+2026-10-16 01:59:57.562426 ifb1  In  IP (tos 0x0, ttl 63, id 24121, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520236910 ecr 3675794166], length 106
+2026-10-16 01:59:57.562426 ifb1  In  IP (tos 0x0, ttl 63, id 13307, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520236910 ecr 209117313], length 93
+2026-10-16 01:59:57.971418 ifb1  In  IP (tos 0x0, ttl 63, id 13308, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520237319 ecr 209117313], length 93
+2026-10-16 01:59:57.971418 ifb1  In  IP (tos 0x0, ttl 63, id 24122, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520237319 ecr 3675794166], length 106
+2026-10-16 01:59:58.826397 ifb1  In  IP (tos 0x0, ttl 63, id 13309, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520238174 ecr 209117313], length 93
+2026-10-16 01:59:58.826420 ifb1  In  IP (tos 0x0, ttl 63, id 24123, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520238174 ecr 3675794166], length 106
+2026-10-16 02:00:00.490512 ifb1  In  IP (tos 0x0, ttl 63, id 24124, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520239838 ecr 3675794166], length 106
+2026-10-16 02:00:00.492848 ifb1  In  IP (tos 0x0, ttl 63, id 13310, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520239838 ecr 209117313], length 93
+2026-10-16 02:00:03.754459 ifb1  In  IP (tos 0x0, ttl 63, id 24125, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520243102 ecr 3675794166], length 106
+2026-10-16 02:00:03.754459 ifb1  In  IP (tos 0x0, ttl 63, id 13311, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520243102 ecr 209117313], length 93
+2026-10-16 02:00:10.410589 ifb1  In  IP (tos 0x0, ttl 63, id 24126, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520249758 ecr 3675794166], length 106
+2026-10-16 02:00:10.410633 ifb1  In  IP (tos 0x0, ttl 63, id 13312, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520249758 ecr 209117313], length 93
+2026-10-16 02:00:23.722682 ifb1  In  IP (tos 0x0, ttl 63, id 24127, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520263070 ecr 3675794166], length 106
+2026-10-16 02:00:23.722769 ifb1  In  IP (tos 0x0, ttl 63, id 13313, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520263070 ecr 209117313], length 93
+2026-10-16 02:00:49.834909 ifb1  In  IP (tos 0x0, ttl 63, id 13314, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520289182 ecr 209117313], length 93
+2026-10-16 02:00:49.835350 ifb1  In  IP (tos 0x0, ttl 63, id 24128, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520289183 ecr 3675794166], length 106
+2026-10-16 02:01:44.618870 ifb1  In  IP (tos 0x0, ttl 63, id 24129, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520343966 ecr 3675794166], length 106
+2026-10-16 02:01:44.618870 ifb1  In  IP (tos 0x0, ttl 63, id 13315, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520343966 ecr 209117313], length 93
+2026-10-16 02:03:31.115851 ifb1  In  IP (tos 0x0, ttl 63, id 24130, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520450463 ecr 3675794166], length 106
+2026-10-16 02:03:31.115986 ifb1  In  IP (tos 0x0, ttl 63, id 13316, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520450463 ecr 209117313], length 93
+2026-10-16 02:05:33.994879 ifb1  In  IP (tos 0x0, ttl 63, id 24131, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520573342 ecr 3675794166], length 106
+2026-10-16 02:05:33.996530 ifb1  In  IP (tos 0x0, ttl 63, id 13317, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520573342 ecr 209117313], length 93
+2026-10-16 02:07:36.874780 ifb1  In  IP (tos 0x0, ttl 63, id 24132, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520696222 ecr 3675794166], length 106
+2026-10-16 02:07:36.874780 ifb1  In  IP (tos 0x0, ttl 63, id 13318, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520696222 ecr 209117313], length 93
+2026-10-16 02:09:39.754904 ifb1  In  IP (tos 0x0, ttl 63, id 13319, offset 0, flags [DF], proto TCP (6), length 145)
+    198.51.100.30.5432 > 192.0.2.10.39334: Flags [R], seq 3883931497:3883931590, win 482, options [nop,nop,TS val 3520819102 ecr 209117313], length 93
+2026-10-16 02:09:39.754904 ifb1  In  IP (tos 0x0, ttl 63, id 24133, offset 0, flags [DF], proto TCP (6), length 158)
+    198.51.100.30.5432 > 192.0.2.10.39350: Flags [R], seq 518678486:518678592, win 482, options [nop,nop,TS val 3520819102 ecr 3675794166], length 106

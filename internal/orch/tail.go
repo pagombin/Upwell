@@ -41,11 +41,19 @@ type classes struct {
 	connLost, connLostMsg string
 	failedTable           string
 	failedOID             string
+	// pendingLost: a connection error libpq logged without the side, which
+	// the next [SOURCE]/[TARGET] line names (D101). failedIndex: the CREATE
+	// INDEX the lost connection was running.
+	pendingLost string
+	failedIndex string
 }
 
 var (
 	connLostRe    = regexp.MustCompile(`^\[(SOURCE|TARGET)[^\]]*\] (.*(SSL error|SSL SYSCALL|server closed the connection|could not receive data from server|could not send data to server|unexpected eof|terminating connection|connection to server .* failed|no connection to the server).*)$`)
 	failedTableRe = regexp.MustCompile(`Failed to copy data for table with oid (\d+)`)
+	bareLostRe    = regexp.MustCompile(`^(SSL error|SSL SYSCALL|server closed the connection|could not receive data from server|could not send data to server|unexpected eof|terminating connection|no connection to the server)`)
+	sideRe        = regexp.MustCompile(`^\[(SOURCE|TARGET)[^\]]*\] `)
+	indexSQLRe    = regexp.MustCompile(`^\[TARGET[^\]]*\] SQL query: CREATE (?:UNIQUE )?INDEX (?:IF NOT EXISTS )?(\S+) ON (?:ONLY )?(\S+)`)
 )
 
 // note records one error line.
@@ -55,6 +63,15 @@ func (c *classes) note(msg string) {
 	}
 	if m := connLostRe.FindStringSubmatch(msg); m != nil && c.connLost == "" {
 		c.connLost, c.connLostMsg = strings.ToLower(m[1]), m[2]
+	}
+	if bareLostRe.MatchString(msg) && c.pendingLost == "" {
+		c.pendingLost = msg
+	}
+	if m := sideRe.FindStringSubmatch(msg); m != nil && c.pendingLost != "" && c.connLost == "" {
+		c.connLost, c.connLostMsg = strings.ToLower(m[1]), c.pendingLost
+	}
+	if m := indexSQLRe.FindStringSubmatch(msg); m != nil && c.connLost != "" && c.failedIndex == "" {
+		c.failedIndex = "index " + m[1] + " on " + m[2]
 	}
 	if m := failedTableRe.FindStringSubmatch(msg); m != nil && c.failedTable == "" {
 		c.failedTable = "table with oid " + m[1]
@@ -83,6 +100,8 @@ func (c classes) connLostSummary(table string) string {
 	}
 	if table != "" {
 		during = " while copying " + table
+	} else if c.failedIndex != "" {
+		during = " while creating " + c.failedIndex
 	}
 	return fmt.Sprintf("the connection to the %s was closed under the engine%s (%s)", c.connLost, during, c.connLostMsg)
 }

@@ -42,3 +42,32 @@ func TestRootCauseFirstError(t *testing.T) {
 		t.Fatalf("root cause %q", got)
 	}
 }
+
+// The droplet's 240 GB base copy (2026-10-16): both CREATE INDEX connections
+// timed out. libpq's error lines carry no [TARGET] prefix; only the lines
+// after them do. Upwell missed the lost connection, so no incident report
+// was written and the reason named only "Failed to get async query results".
+func TestRootCauseOfIndexConnectionTimeout(t *testing.T) {
+	var c classes
+	for _, m := range []string{
+		"Failed to get async query results:",
+		"could not receive data from server: Connection timed out",
+		"SSL SYSCALL error: Connection timed out",
+		"[TARGET 0] connection pointer is NULL",
+		"[TARGET 0] SQL query: CREATE INDEX fkey_stock_27 ON public.stock7 USING btree (s_i_id);",
+		"[TARGET 0] SQL params:",
+		"Failed to create index with oid 17132, see above for details",
+	} {
+		c.lastError = m
+		c.note(m)
+	}
+	if c.connLost != "target" {
+		t.Fatalf("lost connection not detected: %+v", c)
+	}
+	got := c.rootCause()
+	for _, want := range []string{"connection to the target was closed", "creating index fkey_stock_27 on public.stock7", "Connection timed out"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("root cause %q does not contain %q", got, want)
+		}
+	}
+}

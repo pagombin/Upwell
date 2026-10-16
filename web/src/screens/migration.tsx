@@ -312,10 +312,21 @@ interface BundlePreview { files: { name: string; size: number; redactions: numbe
 
 // The support bundle (overnight item 6): what it holds, previewed before download.
 function SupportBundleDialog({ mig, onClose }: { mig: string; onClose: () => void }) {
-  const pv = useApi<BundlePreview>(`/api/v1/migrations/${mig}/support-bundle`);
+  // D101: network captures limited to this migration's failures by default.
+  const [net, setNet] = useState<"" | "full" | "none">("");
+  const q = net ? `?network=${net}` : "";
+  const pv = useApi<BundlePreview>(`/api/v1/migrations/${mig}/support-bundle${q}`);
   return (
-    <Dialog title="Support bundle" wide onClose={onClose} footer={<><button onClick={onClose}>Close</button><a className="btn primary" href={`/api/v1/migrations/${mig}/support-bundle/download`} download>Download .tar.gz</a></>}>
-      <p>A .tar.gz for support: the migration's settings and connections (without passwords), databases, preflight, verification, operations, events, alerts, 24 hours of metrics, the report, Upwell's and the engine's logs, versions and host facts. Downloading it is recorded in the audit log.</p>
+    <Dialog title="Support bundle" wide onClose={onClose} footer={<><button onClick={onClose}>Close</button><a className="btn primary" href={`/api/v1/migrations/${mig}/support-bundle/download${q}`} download>Download .tar.gz</a></>}>
+      <p>A .tar.gz for support: the migration's settings and connections (without passwords), databases, preflight, verification, operations, events, alerts, 24 hours of metrics, the report, Upwell's and the engine's logs, network diagnostics, versions and host facts. Downloading it is recorded in the audit log.</p>
+      <label className="field" style={{ maxWidth: 520 }}>
+        <span className="lbl">Network captures</span>
+        <select value={net} onChange={(e) => setNet(e.target.value as "" | "full" | "none")}>
+          <option value="">Around this migration's failures, its clusters only (smallest)</option>
+          <option value="full">Everything from the last 48 hours, every cluster (up to 40 MB)</option>
+          <option value="none">None: incident reports only</option>
+        </select>
+      </label>
       {pv.error ? <ErrorState error={pv.error} retry={pv.refresh} /> : !pv.data ? <Skeleton lines={6} /> : <>
         <div className="tablewrap"><table className="data" aria-label="Support bundle files">
           <thead><tr><th>File</th><th>Size</th><th>Values removed</th></tr></thead>

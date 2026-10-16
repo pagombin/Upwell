@@ -17,3 +17,17 @@ func TestEngineURIUserTimeout(t *testing.T) {
 		t.Fatalf("0: %s", u)
 	}
 }
+
+// D101: the engine's connections carry libpq keepalives, since pgcopydb
+// applies its own defaults only to the URI it logs.
+func TestEngineURIKeepalives(t *testing.T) {
+	c := Conn{Host: "h", Port: 5432, User: "u", DBName: "d", SSLMode: "require"}
+	for _, ut := range []time.Duration{0, 600 * time.Second} {
+		u := c.EngineURI(ut)
+		for _, want := range []string{"keepalives=1", "keepalives_idle=10", "keepalives_interval=10", "keepalives_count=60"} {
+			if !strings.Contains(u, want) {
+				t.Errorf("%v: %s lacks %s", ut, u, want)
+			}
+		}
+	}
+}

@@ -60,9 +60,24 @@ func (c Conn) EngineURI(userTimeout time.Duration) string {
 	if userTimeout > 0 {
 		q.Set("tcp_user_timeout", strconv.FormatInt(userTimeout.Milliseconds(), 10))
 	}
+	// D101: a probe every 10 s on an idle connection. pgcopydb's own
+	// keepalive defaults reach only the URI it logs, so without these its
+	// connections used the kernel's 2 hours: idle CREATE INDEX workers went
+	// silent for minutes and a stateful device on the path forgot them. With
+	// a TCP_USER_TIMEOUT the kernel gives up on unanswered probes after it;
+	// without one, after 60 probes (about 10 minutes).
+	for k, v := range EngineKeepalives {
+		if q.Get(k) == "" {
+			q.Set(k, v)
+		}
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
+
+// EngineKeepalives are the libpq keepalive parameters of the engine's
+// connections (D101).
+var EngineKeepalives = map[string]string{"keepalives": "1", "keepalives_idle": "10", "keepalives_interval": "10", "keepalives_count": "60"}
 
 // connString includes the password, for pgx only.
 func (c Conn) connString() string {

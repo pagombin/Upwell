@@ -188,3 +188,47 @@ func TestStallVerdictFromDroplet(t *testing.T) {
 		t.Errorf("counter verdict lacks the loss: %s", cv)
 	}
 }
+
+// The droplet's 240 GB copy (2026-10-16, addresses replaced): two CREATE
+// INDEX connections to the target sat idle 9 m 40 s (no keepalive: the
+// kernel's 2 hours), then sent their statements at 01:59:57. Nothing was
+// acknowledged; every retransmission came back as an RST from the target's
+// address carrying this droplet's own sequence number and payload, 2 hops
+// nearer than the handshake (TTL 63 against 61), which the kernel rightly
+// ignored; it gave up 600 s later. The verdict must say the connections
+// were idle first, and that the RSTs were reflected by a device on the path.
+func TestIdleThenReflectedRST(t *testing.T) {
+	b, err := os.ReadFile("testdata/droplet-idle-rst.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := parseTcpdump(string(b))
+	peers := map[string]bool{"198.51.100.30.5432": true}
+	cv := strings.Join(closeVerdict(pk, peers, "target"), " ")
+	t.Log(cv)
+	for _, want := range []string{"TTL (63) differs", "this droplet's own sequence number", "not from the target"} {
+		if !strings.Contains(cv, want) {
+			t.Errorf("close verdict lacks %q", want)
+		}
+	}
+	raw, err := os.ReadFile("testdata/droplet-idle-rst.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var samples []Sample
+	for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var s Sample
+		if err := json.Unmarshal([]byte(l), &s); err != nil {
+			t.Fatal(err)
+		}
+		samples = append(samples, s)
+	}
+	failed, _ := time.Parse(time.RFC3339, "2026-10-16T02:09:57Z")
+	sv := strings.Join(stallVerdict(samples, map[string]bool{"198.51.100.30:5432": true}, failed, 600*time.Second), " ")
+	t.Log(sv)
+	for _, want := range []string{"stopped being acknowledged at 01:59:5", "idle for 9m", "ended here"} {
+		if !strings.Contains(sv, want) {
+			t.Errorf("stall verdict lacks %q", want)
+		}
+	}
+}
