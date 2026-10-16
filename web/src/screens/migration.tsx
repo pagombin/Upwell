@@ -1,16 +1,16 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { backlogKnown, copyEtaMs, dbCopyEtaMs, dbCopyFraction, lifecycleBad, lifecycleIndex, overallProgress, rateFrom, readyForCutover } from "../lib/derive";
 import { ago, bytes, count, duration, pct, rate, time } from "../lib/format";
 import { type Loaded, useApi, useNow, useStream } from "../lib/hooks";
 import { useSession } from "../lib/session";
-import type { Alert, EventRow, MigrationView, Series } from "../lib/types";
+import type { Alert, Connection, EventRow, MigrationView, Series } from "../lib/types";
 import { Sparkline } from "../components/charts";
 import { useOps } from "../components/ops";
 import { DataTable } from "../components/table";
 import { MIG_TABS } from "../components/shell";
-import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction } from "../components/ui";
+import { Card, ConfirmDialog, Dialog, Empty, ErrorState, Field, Pill, ProgressBar, Skeleton, StaleBadge, Tile, Trunc, useAction, useToast } from "../components/ui";
 import { Stepper } from "./home";
 import { lagOf, safetySignals, sampleAge, SafetyStrip, StatusSummary, statusSummary, TrendsCard } from "../components/overview";
 
@@ -82,12 +82,80 @@ export function MigrationLayout() {
   );
 }
 
+// Engines run in these states; an address change waits for them (D100).
+const ENGINE_STATES = ["preparing", "base_copy", "catch_up", "in_sync", "draining", "degraded"];
+
+// ConnectionsDialog changes a started migration's source or target
+// connection within the rules the server enforces (D100): a password at any
+// time, another address of the same cluster only with no engine running.
+function ConnectionsDialog({ v, onClose, onDone }: { v: MigrationView; onClose: () => void; onDone: () => void }) {
+  const [kind, setKind] = useState<"source" | "target">("source");
+  const c: Connection | undefined = kind === "source" ? v.source : v.target;
+  const init = (c?: Connection) => ({ host: c?.host || "", port: c?.port || 25060, user: c?.user || "doadmin", password: "", dbname: c?.dbname || "defaultdb", sslmode: c?.sslmode || "require", ca_cert: c?.ca_cert || "", storage_gb: c?.storage_gb || 0 });
+  const [f, setF] = useState(() => init(c));
+  const [err, setErr] = useState<ApiError>();
+  const [busy, setBusy] = useState(false);
+  const toast = useToast();
+  const m = v.migration;
+  const running = v.databases.filter((d) => d.include && ENGINE_STATES.includes(d.state));
+  const inCutover = !!m.flags.cutover && !m.flags.cutover.ended_at;
+  const pick = (k: "source" | "target") => { setKind(k); setF(init(k === "source" ? v.source : v.target)); setErr(undefined); };
+  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => setF({ ...f, [k]: e.target.value });
+  const endpoint = !!c && (f.host.trim() !== c.host || Number(f.port) !== c.port || f.user !== c.user || f.dbname !== c.dbname || f.sslmode !== c.sslmode || f.ca_cert.trim() !== (c.ca_cert || "").trim());
+  const changed = endpoint || !!f.password || (Number(f.storage_gb) || 0) !== (c?.storage_gb || 0);
+  const blocked = endpoint && (running.length > 0 || inCutover);
+  const save = async () => {
+    setBusy(true); setErr(undefined);
+    try {
+      await api.put(`/api/v1/migrations/${m.id}/connections/${kind}`, { ...f, host: f.host.trim(), port: Number(f.port), storage_gb: Number(f.storage_gb) || 0 });
+      toast("ok", `${kind === "source" ? "Source" : "Target"} connection changed`);
+      onDone(); onClose();
+    } catch (e) { setErr(e as ApiError); } finally { setBusy(false); }
+  };
+  return (
+    <Dialog title="Change a connection" onClose={onClose} wide footer={<>
+      <button onClick={onClose}>Cancel</button>
+      <button className="primary" onClick={save} disabled={busy || !changed || blocked || !f.host.trim()}>{busy && <span className="spin" />}Save</button>
+    </>}>
+      <div className="stack">
+        <div className="row" role="radiogroup" aria-label="Connection">
+          <label className="row small"><input type="radio" checked={kind === "source"} onChange={() => pick("source")} />Source</label>
+          <label className="row small"><input type="radio" checked={kind === "target"} onChange={() => pick("target")} />Target</label>
+        </div>
+        <div className="callout info"><div className="body">
+          <strong>What can change now</strong>
+          <span>A new password can change at any time; Upwell checks that it works first. Running engines keep their sessions, and their next connection uses it.{kind === "target" ? " So can the target storage size." : ""}</span>
+          <span>The host, port, user, database, TLS mode or CA can change only while no engine runs, and only to another address of the same cluster, for example the private hostname instead of the public one, or a connection pool. Upwell checks that it reaches the same cluster. A different cluster needs a new migration.</span>
+          {running.length > 0 && <span>Running now: {running.map((d) => d.source_name).join(", ")}. Stop them on the Databases tab, or pause the migration, to change the address.</span>}
+          {inCutover && <span>A cutover is in progress: only the password can change until it ends.</span>}
+        </div></div>
+        <div className="fieldgrid">
+          <Field label="Host"><input value={f.host} onChange={set("host")} spellCheck={false} /></Field>
+          <Field label="Port"><input type="number" value={f.port} onChange={set("port")} /></Field>
+          <Field label="User"><input value={f.user} onChange={set("user")} autoComplete="off" /></Field>
+          <Field label="New password" hint="Leave empty to keep the stored one."><input type="password" value={f.password} onChange={set("password")} autoComplete="new-password" /></Field>
+          <Field label="Maintenance database"><input value={f.dbname} onChange={set("dbname")} /></Field>
+          <Field label="TLS mode">
+            <select value={f.sslmode} onChange={set("sslmode")}>
+              <option value="verify-full">verify-full (needs the CA certificate)</option><option value="require">require</option><option value="prefer">prefer</option><option value="disable">disable (local testing only)</option>
+            </select>
+          </Field>
+          {kind === "target" && <Field label="Target storage (GB)"><input type="number" value={f.storage_gb} onChange={set("storage_gb")} /></Field>}
+        </div>
+        {f.sslmode === "verify-full" && <Field label="CA certificate (PEM)"><textarea className="mono" value={f.ca_cert} onChange={set("ca_cert")} spellCheck={false} /></Field>}
+        {blocked && <div className="callout warn" role="status"><div className="body">This changes where Upwell connects, which cannot happen while {inCutover ? "a cutover is in progress" : "an engine runs"}. Only a password change can be saved now.</div></div>}
+        {err && <ErrorState error={err} />}
+      </div>
+    </Dialog>
+  );
+}
+
 function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => void }) {
   const { can } = useSession();
   const { run, busy } = useAction();
   const ops = useOps();
   const nav = useNavigate();
-  const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | "bundle" | null>(null);
+  const [dlg, setDlg] = useState<"abort" | "cleanup" | "delete" | "pause" | "bundle" | "conn" | null>(null);
   const m = v.migration, f = m.flags;
   if (!can("operator")) return null;
   if (m.fixture) return <div className="actions"><span className="small muted">Demonstration data: actions are turned off</span></div>;
@@ -101,7 +169,9 @@ function MigrationActions({ v, refresh }: { v: MigrationView; refresh: () => voi
       {f.started && !f.aborted && !f.verdict && !inCutover && <button className="danger" onClick={() => setDlg("abort")}>Abort</button>}
       {(f.aborted || f.verdict || !f.started) && !f.cleaned_up && !f.cleanup_running && <button onClick={() => setDlg("cleanup")}>Clean up</button>}
       {f.cleaned_up && <button className="danger" onClick={() => setDlg("delete")}>Delete</button>}
+      {f.started && !f.aborted && !f.cleaned_up && !f.verdict && <button className="ghost" onClick={() => setDlg("conn")}>Connections</button>}
       <button className="ghost" onClick={() => setDlg("bundle")}>Support bundle</button>
+      {dlg === "conn" && <ConnectionsDialog v={v} onClose={() => setDlg(null)} onDone={refresh} />}
       {dlg === "bundle" && <SupportBundleDialog mig={mid} onClose={() => setDlg(null)} />}
       {dlg === "pause" && (
         <ConfirmDialog title="Pause every database" confirmLabel="Pause" onClose={() => setDlg(null)} onConfirm={async () => { await api.post(`/api/v1/migrations/${mid}/pause`); refresh(); }}>

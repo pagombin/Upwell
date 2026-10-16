@@ -29,7 +29,7 @@ export interface Database {
   hb_before_lsn?: string; hb_token?: string; endpos?: string; origin_lsn?: string; verdict?: string; retry_count: number; next_retry_at?: number;
   base_copy_done: boolean; created_at: number; updated_at: number;
 }
-export interface Connection { id: string; kind: string; host: string; port: number; user: string; dbname: string; sslmode: string; has_password: boolean; storage_gb?: number }
+export interface Connection { id: string; kind: string; host: string; port: number; user: string; dbname: string; sslmode: string; ca_cert?: string; has_password: boolean; storage_gb?: number }
 export interface Permission { customer: string; account_id: string; ticket: string; granted_by: string; granted_at: string; scope: string; notes?: string; locked_at?: number }
 export interface MigrationView {
   migration: Migration; databases: Database[]; included: number; state_counts: Record<string, number>; total_bytes: number;

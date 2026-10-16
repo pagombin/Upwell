@@ -155,15 +155,35 @@ func (o *Orchestrator) SetConnection(ctx context.Context, a audit.Actor, id, kin
 	if err != nil {
 		return Connection{}, err
 	}
-	if err := o.requireEditable(m); err != nil {
-		return Connection{}, err
-	}
 	if err := in.Validate(); err != nil {
 		return Connection{}, err
 	}
 	existingID := m.SourceConnID
 	if kind == "target" {
 		existingID = m.TargetConnID
+	}
+	// D100: after the start, only changes that cannot strand the migration.
+	var before *Connection
+	if m.Flags.Started {
+		if existingID == "" {
+			return Connection{}, uerr("conn_frozen", "This migration started without a "+kind+" connection.", "")
+		}
+		oldPG, old, err := o.PGConn(ctx, existingID)
+		if err != nil {
+			return Connection{}, err
+		}
+		unlock := o.lock(m.ID) // no launch or resume while this is decided
+		defer unlock()
+		if m, err = o.GetMigration(ctx, id); err != nil {
+			return Connection{}, err
+		}
+		if err := o.checkStartedConnChange(ctx, m, kind, old, oldPG, in); err != nil {
+			return Connection{}, err
+		}
+		if classifyConnChange(old, in) == changeNone {
+			return old, nil
+		}
+		before = &old
 	}
 	var secretID string
 	if in.Password != "" {
@@ -187,8 +207,32 @@ func (o *Orchestrator) SetConnection(ctx context.Context, a audit.Actor, id, kin
 		col = "target_conn_id"
 	}
 	o.st.DB.ExecContext(ctx, `UPDATE migrations SET `+col+`=?, updated_at=? WHERE id=?`, cid, store.Now(), m.ID)
-	o.updateFlags(ctx, m.ID, func(f *Flags) { f.PreflightOK = false })
-	o.audit.Append(ctx, a, "migration.connection."+kind, m.ID, nil, map[string]any{"host": in.Host, "port": in.Port, "user": in.User, "dbname": in.DBName, "sslmode": in.SSLMode, "password_changed": in.Password != ""})
+	if before != nil {
+		if err := o.retargetEngines(ctx, m); err != nil {
+			o.st.DB.ExecContext(ctx, `UPDATE migrations SET `+col+`=?, updated_at=? WHERE id=?`, existingID, store.Now(), m.ID)
+			if rerr := o.retargetEngines(ctx, m); rerr != nil {
+				o.logf("error", "orchestrator", m.ID, "", "", "putting the engines back on the old %s connection failed: %v", kind, rerr)
+			}
+			return Connection{}, uerr("conn_engine", "The "+kind+" connection was not changed: the engine's records could not be updated ("+err.Error()+").", "The old connection is still in use.")
+		}
+	}
+	after := map[string]any{"host": in.Host, "port": in.Port, "user": in.User, "dbname": in.DBName, "sslmode": in.SSLMode, "password_changed": in.Password != ""}
+	if before == nil {
+		o.updateFlags(ctx, m.ID, func(f *Flags) { f.PreflightOK = false })
+		o.audit.Append(ctx, a, "migration.connection."+kind, m.ID, nil, after)
+	} else {
+		was := map[string]any{"host": before.Host, "port": before.Port, "user": before.User, "dbname": before.DBName, "sslmode": before.SSLMode}
+		if _, err := o.audit.Append(ctx, a, "migration.connection."+kind, m.ID, was, after); err != nil {
+			o.logf("error", "orchestrator", m.ID, "", "", "audit of the %s connection change failed: %v", kind, err)
+		}
+		o.Event(ctx, m.ID, "", "connection_changed", "warning", fmt.Sprintf("%s changed the %s connection of a started migration (%s:%d as %s, was %s:%d as %s%s); the next launch or resume uses it.",
+			a.Username, kind, in.Host, in.Port, in.User, before.Host, before.Port, before.User, map[bool]string{true: ", new password", false: ""}[in.Password != ""]), nil)
+		go func(ctx context.Context) { // a new address must be allowed
+			if _, _, err := o.SyncFirewall(ctx); err != nil {
+				o.logf("warn", "orchestrator", m.ID, "", "", "firewall update after the %s connection change: %v", kind, err)
+			}
+		}(context.WithoutCancel(ctx))
+	}
 	o.refreshState(ctx, m.ID)
 	return o.GetConnection(ctx, cid)
 }

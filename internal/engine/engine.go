@@ -129,6 +129,13 @@ type Engine interface {
 	CopyRoles(ctx context.Context, src, dst pg.Conn, runDir string) (string, error)
 }
 
+// Retargeter is implemented by an engine that records its endpoints and
+// must be told when a stopped database moves to another address of the same
+// clusters (D100). It reports whether anything changed.
+type Retargeter interface {
+	Retarget(ctx context.Context, d DatabaseSpec) (bool, error)
+}
+
 // StopResult reports how a stop went.
 type StopResult struct {
 	Duration          time.Duration `json:"duration_ms"`

@@ -114,7 +114,11 @@ function StepPermission({ v, onDone }: { v?: MigrationView; onDone: (shortId: st
 
 function StepConnection({ v, kind, onDone }: { v: MigrationView; kind: "source" | "target"; onDone: () => void }) {
   const c: Connection | undefined = kind === "source" ? v.source : v.target;
-  const [f, setF] = useState({ host: c?.host || "", port: c?.port || 25060, user: c?.user || "doadmin", password: "", dbname: c?.dbname || "defaultdb", sslmode: c?.sslmode || "require", ca_cert: "", storage_gb: c?.storage_gb || 0 });
+  const [f, setF] = useState({ host: c?.host || "", port: c?.port || 25060, user: c?.user || "doadmin", password: "", dbname: c?.dbname || "defaultdb", sslmode: c?.sslmode || "require", ca_cert: c?.ca_cert || "", storage_gb: c?.storage_gb || 0 });
+  // Saved when anything differs from the stored connection, not only when a
+  // password was typed (a host change alone used to be dropped).
+  const changed = !c || !!f.password || f.host !== c.host || Number(f.port) !== c.port || f.user !== c.user || f.dbname !== c.dbname || f.sslmode !== c.sslmode ||
+    f.ca_cert.trim() !== (c.ca_cert || "").trim() || (Number(f.storage_gb) || 0) !== (c.storage_gb || 0);
   const [results, setResults] = useState<{ name: string; ok: boolean; message: string }[]>();
   const [err, setErr] = useState<ApiError>();
   const [busy, setBusy] = useState<string>();
@@ -125,13 +129,13 @@ function StepConnection({ v, kind, onDone }: { v: MigrationView; kind: "source" 
   const test = async () => {
     setBusy("test"); setErr(undefined); setResults(undefined);
     try {
-      if (f.password || !c) await save();
+      if (changed) await save();
       setResults(await api.post(`/api/v1/migrations/${v.migration.id}/connections/${kind}/test`));
     } catch (e) { setErr(e as ApiError); } finally { setBusy(undefined); }
   };
   const next = async () => {
     setBusy("save"); setErr(undefined);
-    try { if (f.password || !c) await save(); onDone(); } catch (e) { setErr(e as ApiError); } finally { setBusy(undefined); }
+    try { if (changed) await save(); onDone(); } catch (e) { setErr(e as ApiError); } finally { setBusy(undefined); }
   };
   const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => setF({ ...f, [k]: e.target.value });
   return (

@@ -13,6 +13,8 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | Every log download was named `upwell-logs.jsonl` | done (D97) | names carry the scope and time; `TestDownloadName` |
 | The first incident report: the droplet's own 120 s TCP_USER_TIMEOUT ended a stalled COPY connection on a lossy path (12% retransmits); the target never closed it | fixed (D98) | `engine_tcp_user_timeout_seconds` (600 s default); verdict reads stalls, retransmission rate and droplet-side drops; `TestStallVerdictFromDroplet` |
 | Four base copies failed after a 2-minute freeze with "database is locked" on the constraint summary (pgcopydb created constraints inside its catalog iteration) | fixed in Upwell's build (D99) | patch 0003, build `0.18+upwell.3`; `TestSlowConstraintDoesNotStallCopy`: upwell.2 failed with the droplet's error, upwell.3 reached In sync |
+| Edit the source or target connection, but never under a live migration | done (D100) | a password anytime (tested first); another address of the same cluster only with no engine running and no cutover; never another cluster or after abort, clean up or verdict; pgcopydb's recorded URIs follow the change; Connections dialog; `TestConnectionChangeRules`, `TestRetarget`, browser test |
+| One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios
 

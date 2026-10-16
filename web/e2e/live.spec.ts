@@ -136,3 +136,27 @@ test("operator: sees actions but not user management", async ({ browser }) => {
   await expect(page.getByText("Only Admins manage users.")).toBeVisible();
   await ctx.close();
 });
+
+test("connections: only a password can change while engines run (D100)", async ({ page, guard }) => {
+  guard.allow(/connections\/source$/); // the refused password is the point
+  guard.allow(/status of 409/);
+  await page.goto(`/migrations/${IDS.mig}`);
+  await settle(page, "table[aria-label='Databases']");
+  await page.getByRole("button", { name: "Connections", exact: true }).click();
+  const dlg = page.getByRole("dialog", { name: "Change a connection" });
+  await expect(dlg.getByText("Running now:")).toBeVisible();
+  const save = dlg.getByRole("button", { name: "Save", exact: true });
+  await expect(save).toBeDisabled(); // nothing changed yet
+  // Another address: refused before it reaches the server.
+  await dlg.getByLabel("Host").fill("localhost");
+  await expect(dlg.getByText("Only a password change can be saved now.")).toBeVisible();
+  await expect(save).toBeDisabled();
+  // A password alone goes to the server, which tests it first.
+  await dlg.getByLabel("Host").fill("127.0.0.1");
+  await dlg.getByLabel("New password").fill("not-the-password");
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect(dlg.getByText("does not work, so it was not saved")).toBeVisible();
+  await dlg.getByRole("button", { name: "Cancel" }).click();
+  await expect(dlg).toHaveCount(0);
+});
