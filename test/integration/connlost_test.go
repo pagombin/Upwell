@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pagombin/upwell/internal/orch"
+	"github.com/pagombin/upwell/internal/pg"
 
 	_ "modernc.org/sqlite"
 )
@@ -181,4 +183,74 @@ func TestBaseCopyCatalogLockHeld(t *testing.T) {
 		t.Fatalf("with the catalog locked for 15 s the copy ended %s (automatic restarts %d): %s", d.State, d.AutoRestarts, d.LastError)
 	}
 	e.abortAndClean(id, "Catalog lock")
+}
+
+// TestSlowConstraintDoesNotStallCopy (D99): pgcopydb created a table's
+// constraints while iterating the catalog's index list, holding the catalog
+// semaphore and an open SQLite read for as long as the ALTER TABLE ran on the
+// target, and recording progress from inside that loop. A slow constraint
+// stalled every other pgcopydb process that needed the catalog, and on the
+// droplet the summary update then failed with "database is locked" after
+// its 2-minute wait (four base copies in a row). Here the target's orders
+// table is held with ACCESS SHARE (its COPY and CREATE INDEX proceed, its
+// ADD CONSTRAINT waits): the items table must still get its primary key
+// meanwhile, and the copy must reach In sync once the lock goes.
+func TestSlowConstraintDoesNotStallCopy(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_slowcon")
+	seedDB(t, db, 600000)
+	name := "Slow constraint"
+	id := e.defineMigration(name, []string{db}, nil)
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	e.waitFor(3*time.Minute, "the target database", func() bool {
+		return q(t, dstConn, "defaultdb", `SELECT count(*)::text FROM pg_database WHERE datname = '`+db+`'`) == "1"
+	})
+	// The lock must come after orders' COPY (pgcopydb truncates before it)
+	// and before its ADD CONSTRAINT: while one of its indexes is built.
+	ctx := context.Background()
+	lk, err := pg.Connect(ctx, dstConn.WithDB(db), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lk.Close(ctx)
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		var n int
+		if err := lk.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query ILIKE 'CREATE%INDEX%ON%orders%'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never saw an index build on orders")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := lk.Exec(ctx, `BEGIN; LOCK TABLE public.orders IN ACCESS SHARE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			lk.Exec(ctx, "ROLLBACK")
+		}
+	}()
+	e.waitFor(5*time.Minute, "orders' ADD CONSTRAINT waiting on the lock", func() bool {
+		return q(t, dstConn, db, `SELECT count(*)::text FROM pg_stat_activity WHERE query ILIKE 'ALTER TABLE%orders%ADD CONSTRAINT%' AND wait_event_type = 'Lock'`) != "0"
+	})
+	t.Log("orders' constraint is blocked; items must still get its primary key")
+	e.waitFor(90*time.Second, "items' primary key while orders' constraint is blocked", func() bool {
+		return q(t, dstConn, db, `SELECT count(*)::text FROM pg_constraint WHERE conrelid = 'public.items'::regclass AND contype = 'p'`) == "1"
+	})
+	// Longer than pgcopydb's 2-minute wait for the catalog (upwell-2): on
+	// the droplet a constraint that took that long failed the copy.
+	time.Sleep(150 * time.Second)
+	lk.Exec(ctx, "ROLLBACK")
+	released = true
+	if d := e.waitDBState(id, db, 10*time.Minute, orch.DInSync, orch.DRestartRequired, orch.DFailed); d.State != orch.DInSync {
+		t.Fatalf("after the slow constraint: %s: %s", d.State, d.LastError)
+	}
+	e.abortAndClean(id, name)
 }

@@ -2,13 +2,14 @@
 
 `deploy/install.sh` builds pgcopydb from the `PGCOPYDB_TAG` tag with every
 `*.patch` here applied, as version `PGCOPYDB_BUILD` (for example
-`0.18+upwell.2`). Upwell refuses online migrations with any other build
+`0.18+upwell.3`). Upwell refuses online migrations with any other build
 (preflight check `engine_commit_order`, and again at each launch).
 
 | Patch | Why |
 | --- | --- |
 | `0001-take-transactions-in-commit-order.patch` | pgcopydb 0.18 (and its main branch as of 2026-10-14) took the next transaction by BEGIN LSN, so a transaction that committed while another was open was never applied (D84). |
 | `0002-wait-longer-for-the-catalog-lock.patch` | Workers gave up after 5 s waiting for pgcopydb's SQLite catalog and failed the whole base copy ("database is locked", D87); they now wait up to 2 minutes. |
+| `0003-create-constraints-after-the-index-iteration.patch` | A table's constraints were created inside the catalog iteration over its indexes, holding the catalog for as long as each ALTER TABLE ran on the target; a constraint that took longer than the 2-minute wait failed the base copy with "database is locked" (D99). The index OIDs are collected first and the constraints created after the iteration. |
 
 ## Reproducing the loss
 

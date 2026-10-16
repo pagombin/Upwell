@@ -1,0 +1,158 @@
+Subject: [PATCH upwell-3] indexes: create a table's constraints after iterating its indexes
+
+copydb_create_constraints created each constraint from inside the catalog
+iteration over the table's indexes, holding the catalog semaphore and an
+open SQLite read for as long as ALTER TABLE ... ADD CONSTRAINT ran on the
+target, and recording the summary from inside that loop. A constraint that
+took longer than the catalog's busy wait (2 minutes since upwell-2) failed
+the whole base copy with "database is locked" on "update summary set
+done_time_epoch ... where pid = $3 and conoid = $4". On the droplet
+(2026-10-15) four base copies of a 300 GB database failed this way, each
+after a 2-minute freeze, while a primary key was built through a slow path.
+The index OIDs are now collected first and the constraints created once the
+iteration is over, as copydb_queue_table_indexes already does.
+
+diff --git a/src/bin/pgcopydb/indexes.c b/src/bin/pgcopydb/indexes.c
+index 604a04d..cf348cc 100644
+--- a/src/bin/pgcopydb/indexes.c
++++ b/src/bin/pgcopydb/indexes.c
+@@ -619,6 +619,14 @@ typedef struct IndexOIDArray
+ 	uint32_t *array;            /* malloc'ed area */
+ } IndexOIDArray;
+ 
++typedef struct CollectIndexesContext
++{
++	IndexOIDArray *indexArray;
++	int capacity;
++} CollectIndexesContext;
++
++static bool copydb_collect_table_indexes_hook(void *ctx, SourceIndex *index);
++
+ typedef struct QueueTableIndexesContext
+ {
+ 	CopyDataSpec *specs;
+@@ -1244,20 +1252,122 @@ copydb_create_constraints(CopyDataSpec *specs, PGSQL *dst, SourceTable *table)
+ 		.dst = dst
+ 	};
+ 
++	/*
++	 * Upwell patch (upwell-3): collect the index OIDs first, and create the
++	 * constraints once the iteration is over.
++	 *
++	 * The iteration holds the catalog semaphore and an open SQLite read
++	 * statement. Creating a constraint on the target can take minutes, and
++	 * the hook records its progress in the catalog from inside the loop: other
++	 * processes needing the catalog were stuck for that long, and the
++	 * summary update failed with "database is locked" after the busy timeout
++	 * (2026-10-15, four base copies in a row, each after a 2-minute freeze of
++	 * every pgcopydb process). This is the pattern copydb_queue_table_indexes
++	 * already follows ("no longer holding the catalog lock").
++	 */
++	IndexOIDArray indexArray = { 0 };
++	int capacity = table->indexCount > 0 ? table->indexCount : 8;
++
++	indexArray.array = (uint32_t *) calloc(capacity, sizeof(uint32_t));
++
++	if (indexArray.array == NULL)
++	{
++		log_error(ALLOCATION_FAILED_ERROR);
++		return false;
++	}
++
++	CollectIndexesContext collect = {
++		.indexArray = &indexArray,
++		.capacity = capacity
++	};
++
+ 	if (!catalog_iter_s_index_table(sourceDB,
+ 									table->nspname,
+ 									table->relname,
+-									&context,
+-									&copydb_create_constraints_hook))
++									&collect,
++									&copydb_collect_table_indexes_hook))
+ 	{
+ 		/* errors have already been logged */
++		free(indexArray.array);
+ 		return false;
+ 	}
+ 
++	for (int i = 0; i < indexArray.count; i++)
++	{
++		SourceIndex *index = (SourceIndex *) calloc(1, sizeof(SourceIndex));
++
++		if (index == NULL)
++		{
++			log_error(ALLOCATION_FAILED_ERROR);
++			free(indexArray.array);
++			return false;
++		}
++
++		if (!catalog_lookup_s_index(sourceDB, indexArray.array[i], index))
++		{
++			log_error("Failed to lookup index %u in our catalogs",
++					  indexArray.array[i]);
++			free(index);
++			free(indexArray.array);
++			return false;
++		}
++
++		bool ok = copydb_create_constraints_hook(&context, index);
++
++		free(index->indexColumns);
++		free(index->indexDef);
++		free(index->constraintDef);
++		free(index);
++
++		if (!ok)
++		{
++			log_error("Failed to create the constraints of table %s, "
++					  "see above for details",
++					  table->qname);
++			free(indexArray.array);
++			return false;
++		}
++	}
++
++	free(indexArray.array);
++
+ 	return errors == 0;
+ }
+ 
+ 
++/*
++ * copydb_collect_table_indexes_hook is an iterator callback function that
++ * only records the index OIDs (upwell-3), growing the array when the table's
++ * index count was not known.
++ */
++static bool
++copydb_collect_table_indexes_hook(void *ctx, SourceIndex *index)
++{
++	CollectIndexesContext *context = (CollectIndexesContext *) ctx;
++	IndexOIDArray *indexArray = context->indexArray;
++
++	if (indexArray->count >= context->capacity)
++	{
++		int capacity = context->capacity * 2;
++		uint32_t *array =
++			(uint32_t *) realloc(indexArray->array, capacity * sizeof(uint32_t));
++
++		if (array == NULL)
++		{
++			log_error(ALLOCATION_FAILED_ERROR);
++			return false;
++		}
++
++		indexArray->array = array;
++		context->capacity = capacity;
++	}
++
++	indexArray->array[(indexArray->count)++] = index->indexOid;
++
++	return true;
++}
++
++
+ /*
+  * copydb_create_constraints_hook is an iterator callback function.
+  */

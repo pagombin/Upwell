@@ -40,7 +40,7 @@ git clone https://github.com/pagombin/Upwell.git && cd Upwell
 sudo bash deploy/install.sh
 ```
 
-The first run takes 5 to 15 minutes: it adds the PostgreSQL apt repository, installs the newest PostgreSQL client, builds pgcopydb from the v0.18 tag with Upwell's fixes in `deploy/pgcopydb` (version `0.18+upwell.2`; the packages lose transactions that overlap another one, D84, and fail a base copy when their own catalog stays locked for 5 seconds, D87), downloads Go to build Upwell (the UI is committed prebuilt, so Node is not needed), creates the `upwell` user, writes `/etc/upwell/config.yaml`, creates the master key and a self-signed certificate, opens SSH and HTTPS in `ufw`, and starts `upwell.service`. It ends by printing:
+The first run takes 5 to 15 minutes: it adds the PostgreSQL apt repository, installs the newest PostgreSQL client, builds pgcopydb from the v0.18 tag with Upwell's fixes in `deploy/pgcopydb` (version `0.18+upwell.3`; the packages lose transactions that overlap another one, D84, fail a base copy when their own catalog stays locked for 5 seconds, D87, and fail it when a table's constraint takes longer than the catalog's wait, D99), downloads Go to build Upwell (the UI is committed prebuilt, so Node is not needed), creates the `upwell` user, writes `/etc/upwell/config.yaml`, creates the master key and a self-signed certificate, opens SSH and HTTPS in `ufw`, and starts `upwell.service`. It ends by printing:
 
 ```
 Upwell:       https://203.0.113.10/

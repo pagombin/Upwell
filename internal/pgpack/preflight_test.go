@@ -48,7 +48,7 @@ func TestToolMajorRegexp(t *testing.T) {
 func TestEngineCommitOrderFixed(t *testing.T) {
 	for v, want := range map[string]bool{
 		"0.18": false, "0.18-1.pgdg24.04+1": false, "0.19": false, "0.18.dirty": false,
-		"0.18+upwell.0": false, "0.18+upwell.1": true, "0.18+upwell.2": true, "0.19+upwell.1": true,
+		"0.18+upwell.0": false, "0.18+upwell.1": true, "0.18+upwell.2": true, "0.18+upwell.3": true, "0.19+upwell.1": true,
 	} {
 		if got := EngineCommitOrderFixed(v); got != want {
 			t.Errorf("EngineCommitOrderFixed(%q) = %v, want %v", v, got, want)

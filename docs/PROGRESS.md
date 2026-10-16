@@ -12,6 +12,7 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | Base copies of `migration_poc` closed by the target 2.5 to 6 minutes in ("SSL error: unexpected eof"); diagnostics to capture what closes them | done (D97) | socket samples, kernel counters, root packet-header capture (`upwell-netcapture`), incident report with a verdict, all in the support bundle; `internal/netdiag` tests, `TestNetworkIncidentOnClosedConnection` |
 | Every log download was named `upwell-logs.jsonl` | done (D97) | names carry the scope and time; `TestDownloadName` |
 | The first incident report: the droplet's own 120 s TCP_USER_TIMEOUT ended a stalled COPY connection on a lossy path (12% retransmits); the target never closed it | fixed (D98) | `engine_tcp_user_timeout_seconds` (600 s default); verdict reads stalls, retransmission rate and droplet-side drops; `TestStallVerdictFromDroplet` |
+| Four base copies failed after a 2-minute freeze with "database is locked" on the constraint summary (pgcopydb created constraints inside its catalog iteration) | fixed in Upwell's build (D99) | patch 0003, build `0.18+upwell.3`; `TestSlowConstraintDoesNotStallCopy`: upwell.2 failed with the droplet's error, upwell.3 reached In sync |
 
 ### Part 1: scenarios
 
