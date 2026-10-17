@@ -525,6 +525,8 @@ Both indexes are created on open, so the droplet's existing CDC files get them a
 
 Result, pgbench 8 clients for 30 s (68,155 transactions): **372 transactions a second applied**, against 154 with the lookups alone and 5–7 with upwell.3. The apply now spends its time writing its own files and talking to the target, not scanning.
 
+With upwell.5 these pass: `TestOverlappingTransactionsReachTarget`, `TestP1LargeTransactions` and `TestP1WritersUnderBothPlugins` (both plugins), `TestResumeEndsStaleApplySession`, `TestRestartWithLeftoverEngineSession`, `TestHappyPath`, `TestRerunInPlace` and `TestEngineConnectionsKeepAlive`. The last failed once because it matched the engine's process name exactly and the test binary was named `pgcopydb-upwell5`; it now matches the prefix.
+
 Still ahead for a sustained TPC-C load (about 250 transactions and 7,500 row changes a second): one apply process sends one statement at a time and waits for each reply. On a VPC round trip of about 0.5 ms that alone allows only a few thousand statements a second. The next step would be libpq pipeline mode inside each transaction. It needs the droplet's numbers with upwell.5 first.
 
 ## D107. CDC progress in the logs; the Logs tab pages

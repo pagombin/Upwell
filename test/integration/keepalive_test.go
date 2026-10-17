@@ -38,7 +38,7 @@ func TestEngineConnectionsKeepAlive(t *testing.T) {
 	// ss prints the socket line (with the process) and the timer on it.
 	n := 0
 	for _, l := range strings.Split(string(out), "\n") {
-		if !strings.Contains(l, `"pgcopydb"`) || !(strings.Contains(l, ":"+strconv.Itoa(srcPort)+" ") || strings.Contains(l, ":"+strconv.Itoa(dstPort)+" ")) {
+		if !strings.Contains(l, `(("pgcopydb`) || !(strings.Contains(l, ":"+strconv.Itoa(srcPort)+" ") || strings.Contains(l, ":"+strconv.Itoa(dstPort)+" ")) {
 			continue
 		}
 		m := keepaliveTimer.FindStringSubmatch(l)
