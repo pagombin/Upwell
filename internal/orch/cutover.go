@@ -56,7 +56,10 @@ func (o *Orchestrator) Readiness(ctx context.Context, id string) ([]Condition, b
 	now := store.Now()
 	var out []Condition
 	all := true
-	out = append(out, Condition{Key: "started", Label: "Migration is streaming", OK: m.Flags.Started && !m.Flags.Aborted && !m.Flags.CleanedUp && m.Flags.Verdict == "", Detail: Label(m.State)})
+	// A NO-GO from a cutover that set no end position left streaming running:
+	// a new cutover may start (StartCutover clears that verdict).
+	retryable := m.Flags.Verdict == "NO-GO" && noEndPositions(o, ctx, m.ID)
+	out = append(out, Condition{Key: "started", Label: "Migration is streaming", OK: m.Flags.Started && !m.Flags.Aborted && !m.Flags.CleanedUp && (m.Flags.Verdict == "" || retryable), Detail: Label(m.State)})
 	for _, d := range included(dbs) {
 		c := Condition{Key: "in_sync", Label: d.SourceName + " in sync", Database: d.SourceName}
 		switch {
