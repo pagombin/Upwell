@@ -570,6 +570,10 @@ This repeats up to ten times. Event `origin_released` says what was done. The en
 
 **For m33hv5's migration_db:** the changes between 17C/5AEC10E8 and 17C/A755A5A0 exist nowhere any more: not on the target, not in the slot, not in a file. That database must restart from zero (Restart from zero, or Run again) after installing upwell.6. Nothing was applied out of order or skipped silently into a GO: it was held as Failed. migration_poc is unaffected, but runs the same engine. Its periodic stalls, recovered by the 10-minute restart (D90), fit the same pattern, so it should also be restarted on upwell.6 before a cutover is trusted.
 
+**5. The drain no longer waits for the engine's own sequence step.** After "Follow mode is now done, reached endpos", pgcopydb's main process still copies the sequences through its catalog, and in about one run in four of `TestP1CutoverRestartAtEveryStep` it waited there for its full two minutes (upwell.2's catalog wait) with all changes applied. The drain waited for the unit to exit and timed out: a NO-GO. A draining database whose engine has logged its end position is now stopped and counted drained. Upwell syncs the sequences itself in the next step, and the origin and data checks still confirm the end position. `TestDrainDoesNotWaitForEngineSequenceStep` holds the catalog the moment the engine reports its end position: NO-GO before, GO after.
+
+The readiness gate's "Migration is streaming" condition now also accepts a NO-GO from a cutover that set no end position (streaming continued). The cutover start already cleared such a verdict, but the gate waited for it to be empty, so neither the console nor `TestP1HeartbeatNeverThenLate` could start the second cutover.
+
 A cutover's NO-GO now carries its cause in the operation's error ("verdict NO-GO for db: the final heartbeat did not reach the target …"), not only in the step log; `TestP1HeartbeatNeverThenLate` checks that.
 
 Build `0.18+upwell.6` (`deploy/install.sh`, `pgpack.EngineBuildRequired`): Upwell refuses upwell.5 for new launches, so the installer rebuilds.

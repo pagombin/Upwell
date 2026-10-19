@@ -217,3 +217,58 @@ func TestEngineWaitsForCDCFileLock(t *testing.T) {
 	})
 	e.abortAndClean(id, "CDC file lock")
 }
+
+// D108: after "Follow mode is now done, reached endpos", pgcopydb's main
+// process still copies the sequences through its own catalog and can wait
+// there for minutes ("database is locked"). The drain waited for the unit to
+// exit and timed out: a NO-GO although every change had been applied. Here
+// the test holds the catalog the moment the engine reports its end
+// position; the cutover must take the engine's word, stop the unit and end
+// GO (Upwell syncs the sequences itself).
+func TestDrainDoesNotWaitForEngineSequenceStep(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	if _, _, err := e.Orch.SettingsService().Set(context.Background(), "cutover_drain_timeout_seconds", 60, "test"); err != nil {
+		t.Fatal(err)
+	}
+	db := uniq("it_drainseq")
+	id := streamingMigration(t, e, "Drain sequence step", db)
+	runs, _ := filepath.Glob(filepath.Join(e.Cfg.RunsDir(), "*"+db+"*"))
+	if len(runs) == 0 {
+		t.Fatal("no run directory")
+	}
+	logf := filepath.Join(runs[0], "engine.log")
+	start, _ := os.Stat(logf)
+	held := make(chan *sql.Conn, 1)
+	go func() {
+		defer close(held)
+		for i := 0; i < 6000; i++ {
+			b, _ := os.ReadFile(logf)
+			if int64(len(b)) > start.Size() && strings.Contains(string(b[start.Size():]), "Follow mode is now done") {
+				cat, err := sql.Open("sqlite", filepath.Join(runs[0], "clone", "schema", "source.db"))
+				if err != nil {
+					return
+				}
+				c, err := cat.Conn(context.Background())
+				if err != nil {
+					return
+				}
+				if _, err := c.ExecContext(context.Background(), `BEGIN EXCLUSIVE`); err == nil {
+					held <- c
+				}
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	op := e.startCutover(id)
+	c, ok := <-held
+	if !ok || c == nil {
+		t.Fatal("the test never held the engine's catalog")
+	}
+	c.ExecContext(context.Background(), `ROLLBACK`)
+	c.Close()
+	if v := e.migration(id).Migration.Flags.Verdict; v != "GO" {
+		t.Fatalf("verdict %s (%s) with the engine's sequence step held after it reached its end position", v, op.Error)
+	}
+	e.cleanup(id, "Drain sequence step")
+}

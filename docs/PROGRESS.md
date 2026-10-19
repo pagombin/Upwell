@@ -24,7 +24,7 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | Start from anywhere once preflight passed | done (D104) | Start migration button and dialog; Continue setup resumes at the right step |
 | Run history with headline numbers; nicer report | done (D105) | Run history screen, stored reports, delete; report headline grid and Performance section; `TestReportHeadline` |
 | Logs tab like Events; more verbose CDC logging | done (D107) | Pages view with totals; per-minute CDC progress lines; `TestLogsPaged` |
-| m33hv5: apply confirmation, pooled origin, SQLite busy, changes lost | done (D108) | engine upwell.6 (patches 0006, 0007); `TestApplyErrorStopsProgress`, `TestApplyQueueBoundedMemory`, `TestEngineWaitsForCDCFileLock`, `TestResumeFreesOriginHeldThroughPooler`, `TestClassify` |
+| m33hv5: apply confirmation, pooled origin, SQLite busy, changes lost | done (D108) | engine upwell.6 (patches 0006, 0007); `TestApplyErrorStopsProgress`, `TestApplyQueueBoundedMemory`, `TestEngineWaitsForCDCFileLock`, `TestResumeFreesOriginHeldThroughPooler`, `TestDrainDoesNotWaitForEngineSequenceStep`, `TestClassify` |
 | One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios

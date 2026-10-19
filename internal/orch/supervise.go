@@ -209,6 +209,18 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 			o.afterExit(ctx, m, d, engine.FailTransient, "the engine's main process died")
 			return
 		}
+		// D108: once the engine reports its end position reached, its main
+		// process still copies the sequences through its own catalog and
+		// can wait there for minutes. Upwell syncs the sequences itself, and
+		// the origin and data checks that follow confirm the end position:
+		// take the engine's word and stop it.
+		if d.State == DDraining && d.EndPos != "" && classes.endposReached {
+			o.logf("info", "orchestrator", m.ID, d.SourceName, "", "the engine reached its end position; stopping it without waiting for its own sequence step")
+			o.mustStop(ctx, m, d, "end position reached")
+			o.endAttempt(ctx, d, nil, "reached its end position")
+			o.afterExit(ctx, m, d, engine.FailEndposReached, "reached its end position")
+			return
+		}
 		// D90: an apply that has applied nothing for a long time while the
 		// source changed is usually waiting on a connection that died on the
 		// way to the target (the droplet: 33 minutes until the engine saw
