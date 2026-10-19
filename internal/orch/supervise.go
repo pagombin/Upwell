@@ -302,7 +302,7 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 			if thr == 0 {
 				thr = 16 << 20
 			}
-			if backlog >= 0 && backlog < thr {
+			if (backlog >= 0 && backlog < thr) || o.heartbeatCurrent(ctx, m, d) {
 				if d.State != DInSync {
 					cols["state"] = DInSync
 					cols["in_sync_since"] = store.Now()
@@ -603,6 +603,20 @@ func (o *Orchestrator) backlog(ctx context.Context, spec engine.DatabaseSpec, re
 		return -1
 	}
 	return pg.LSNDiff(cur, replay)
+}
+
+// heartbeatCurrent reports whether the latest heartbeat measurement, taken
+// in the last minute, shows the target at most 30 s behind (three heartbeat
+// intervals). WAL is the whole cluster's: a database without writes of its
+// own streams its neighbours' changes too, and its byte backlog swings by
+// hundreds of megabytes between the engine's position reports although
+// nothing of its own is waiting (D109).
+func (o *Orchestrator) heartbeatCurrent(ctx context.Context, m Migration, d Database) bool {
+	if !o.Settings(ctx, m).Bool("heartbeat") {
+		return false
+	}
+	lag, at, ok := o.metrics.LastAt(m.ID, d.SourceName, "heartbeat_latency_s")
+	return ok && time.Since(at) <= time.Minute && lag <= 30
 }
 
 // maybeHeartbeat writes a periodic heartbeat every 10 s while streaming.

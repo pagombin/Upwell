@@ -272,3 +272,69 @@ func TestDrainDoesNotWaitForEngineSequenceStep(t *testing.T) {
 	}
 	e.cleanup(id, "Drain sequence step")
 }
+
+// D109, the droplet (2026-10-19): WAL is the whole cluster's, so a database
+// with no writes of its own streams every other database's changes too and
+// reads as megabytes behind between the engine's position reports. Its
+// state flipped between In sync and Catching up every few seconds while
+// TPC-C ran on its neighbour. A database the heartbeat shows current stays
+// In sync.
+func TestIdleDatabaseStaysInSyncBesideBusyOne(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	busy, idle := uniq("it_busy"), uniq("it_idle")
+	seedDB(t, busy, 3000)
+	seedDB(t, idle, 3000)
+	id := e.defineMigration("Busy and idle", []string{busy, idle}, nil)
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	e.waitDBState(id, busy, 3*time.Minute, orch.DInSync)
+	e.waitDBState(id, idle, 3*time.Minute, orch.DInSync)
+	e.waitFor(time.Minute, "a heartbeat lag for the idle database", func() bool {
+		c := e.condition(id, "lag", idle)
+		return c != nil && c.OK
+	})
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { // a few MB of WAL a second on the busy database (the local slots keep 1 GB)
+		defer close(done)
+		ctx := context.Background()
+		c, err := pg.Connect(ctx, srcConn.WithDB(busy), time.Minute)
+		if err != nil {
+			return
+		}
+		defer c.Close(ctx)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c.Exec(ctx, `INSERT INTO orders(customer, amount, note) SELECT g, g, repeat(md5(g::text), 8) FROM generate_series(1, 5000) g`)
+			time.Sleep(time.Second)
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	flips, maxBacklog := 0, int64(0)
+	for i := 0; i < 60; i++ {
+		d := e.db(id, idle)
+		if d.BacklogBytes != nil && *d.BacklogBytes > maxBacklog {
+			maxBacklog = *d.BacklogBytes
+		}
+		if d.State != orch.DInSync {
+			flips++
+		}
+		if i%5 == 0 {
+			lag := e.condition(id, "lag", idle)
+			t.Logf("t=%2ds idle %s, backlog %d MiB, %s", i, d.State, maxBacklog>>20, lag.Detail)
+		}
+		time.Sleep(time.Second)
+	}
+	t.Logf("idle database: %d of 60 samples not in sync; largest byte backlog %d MiB", flips, maxBacklog>>20)
+	if maxBacklog < 16<<20 {
+		t.Fatalf("the busy database wrote too little WAL (largest backlog %d MiB) for the test to show anything", maxBacklog>>20)
+	}
+	if flips > 0 {
+		t.Fatalf("the idle database left In sync in %d of 60 samples although nothing changed in it", flips)
+	}
+}

@@ -577,3 +577,10 @@ The readiness gate's "Migration is streaming" condition now also accepts a NO-GO
 A cutover's NO-GO now carries its cause in the operation's error ("verdict NO-GO for db: the final heartbeat did not reach the target …"), not only in the step log; `TestP1HeartbeatNeverThenLate` checks that.
 
 Build `0.18+upwell.6` (`deploy/install.sh`, `pgpack.EngineBuildRequired`): Upwell refuses upwell.5 for new launches, so the installer rebuilds.
+
+## D109. A database the heartbeat shows current is In sync, whatever its byte backlog
+The droplet, m33hv5, 2026-10-19: TPC-C on migration_db while migration_poc had no writes. migration_poc flipped between In sync and Catching up every few seconds. WAL is the whole cluster's: migration_poc's slot reads every change migration_db makes (about 30 MiB/s), and its position moves only when the engine reports it, about every 10 s. So its byte backlog swung between a few MB and 300 MB with nothing of its own waiting, around the 16 MB `cutover_lag_threshold_mb`.
+
+A database is now In sync when its byte backlog is under the threshold, **or** when the latest heartbeat measurement (taken in the last minute) shows the target at most 30 s behind (three heartbeat intervals). The heartbeat is a write in that database, so it measures that database's own lag. The readiness gate's own lag condition (`cutover_max_lag_seconds`) is unchanged.
+
+`TestIdleDatabaseStaysInSyncBesideBusyOne` writes a few MB of WAL a second into one database and samples the other for 60 s: out of sync in 10 of 60 samples before, none after.
