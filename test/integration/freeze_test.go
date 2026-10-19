@@ -261,7 +261,11 @@ func TestWriteFreezeAbortAndRestart(t *testing.T) {
 		t.Fatal("the freeze went away with the process; the restart test proves nothing")
 	}
 	e2 := newEnv(t, dir, orch.TestHooks{})
-	e2.waitFor(time.Minute, "the restart to undo the freeze", func() bool { return frozenSetting(t, db) == "" })
+	// The setting goes first and the migration's record right after it.
+	e2.waitFor(time.Minute, "the restart to undo the freeze", func() bool {
+		f := e2.migration(id).Migration.Flags.Freeze
+		return frozenSetting(t, db) == "" && f != nil && f.State == "undone"
+	})
 	f := e2.migration(id).Migration.Flags.Freeze
 	t.Logf("after restart: %+v", f)
 	if f == nil || f.State != "undone" || !strings.Contains(f.UndoReason, "restarted") {
