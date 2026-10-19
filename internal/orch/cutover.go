@@ -1064,7 +1064,11 @@ func (o *Orchestrator) finishCutover(ctx context.Context, m Migration, op *Opera
 	if verdict == "GO" {
 		op.Finish(nil, res)
 	} else {
-		op.Finish(fmt.Errorf("verdict NO-GO for %s", strings.Join(failed, ", ")), res)
+		err := fmt.Errorf("verdict NO-GO for %s", strings.Join(failed, ", "))
+		if ferr != nil {
+			err = fmt.Errorf("verdict NO-GO for %s: %w", strings.Join(failed, ", "), ferr)
+		}
+		op.Finish(err, res)
 	}
 }
 

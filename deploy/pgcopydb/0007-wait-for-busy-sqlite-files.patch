@@ -1,20 +1,24 @@
 diff --git a/src/bin/pgcopydb/catalog.c b/src/bin/pgcopydb/catalog.c
-index 2d28495..3b3ebb1 100644
+index 2d28495..97fb105 100644
 --- a/src/bin/pgcopydb/catalog.c
 +++ b/src/bin/pgcopydb/catalog.c
-@@ -1519,6 +1519,24 @@ catalog_init(DatabaseCatalog *catalog)
+@@ -1519,6 +1519,28 @@ catalog_init(DatabaseCatalog *catalog)
  		return false;
  	}
  
 +	/*
-+	 * Upwell patch (upwell-6): several processes open these files (receive
-+	 * and apply share the CDC files). Without a busy timeout, a statement
-+	 * that finds another process writing fails at once with "database is
-+	 * locked", and the whole engine with it, for example when opening a CDC
-+	 * file the receive process is writing. Wait up to two minutes, as for
-+	 * the catalog lock (upwell-2).
++	 * Upwell patch (upwell-6): the receive and apply processes share the CDC
++	 * files (output, replay). Without a busy timeout, a statement that finds
++	 * the other one writing fails at once with "database is locked", and the
++	 * whole engine with it, for example the index created when an existing
++	 * CDC file is opened. Wait up to two minutes, as for the catalog lock
++	 * (upwell-2). The source catalog keeps its own semaphore and retries: a
++	 * busy timeout there let the sequence step wait out a reader that holds
++	 * its read lock for as long.
 +	 */
-+	if (sqlite3_busy_timeout(catalog->db, 120 * 1000) != SQLITE_OK)
++	if ((catalog->type == DATABASE_CATALOG_TYPE_OUTPUT ||
++		 catalog->type == DATABASE_CATALOG_TYPE_REPLAY) &&
++		sqlite3_busy_timeout(catalog->db, 120 * 1000) != SQLITE_OK)
 +	{
 +		log_error("Failed to set a busy timeout on \"%s\": %s",
 +				  catalog->dbfile,

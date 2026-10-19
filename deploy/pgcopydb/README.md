@@ -14,7 +14,7 @@
 | `0005-indexed-next-transaction-lookups.patch` | Each transaction cost three lookups that scanned the rest of its change file: the next COMMIT in `output.db` (sorting every one left), the next BEGIN in `replay.db` (no index on `endlsn`), and the transaction's own messages (no usable index on `xid`). Draining a backlog cost N squared. Each lookup now takes the first row through an index; `replay(action, endlsn)` and `output(xid)` are created on open, so existing files get them (D106). |
 
 | `0006-confirm-the-apply-pipeline-and-publish-only-durable-progress.patch` | The apply pipelined statements to the target and never read the answers: a refused change went unnoticed, the send buffer grew until libpq failed ("cannot allocate memory for output buffer"), and the sentinel's replay_lsn, which the source slot is confirmed to, advanced with what was only queued. It now syncs every 1,000 statements, 64 MB or 500 ms, stops on an error, and publishes only positions the target's replication origin has durably reached (D108). |
-| `0007-wait-for-busy-sqlite-files.patch` | No SQLite file had a busy timeout, so a statement meeting another process's write failed the engine at once ("database is locked"); it now waits up to two minutes (D108). |
+| `0007-wait-for-busy-sqlite-files.patch` | The CDC files (shared by receive and apply) had no busy timeout, so a statement meeting the other process's write failed the engine at once ("database is locked"); they now wait up to two minutes. The source catalog keeps its semaphore and retries (D108). |
 
 ## Reproducing the loss
 
