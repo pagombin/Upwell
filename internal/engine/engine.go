@@ -105,6 +105,7 @@ const (
 	FailTransient     = "transient"
 	FailPermanent     = "permanent"
 	FailSlotLost      = "slot_lost"
+	FailChangesLost   = "changes_lost" // the changes the target still needs are gone (D108)
 	FailBaseCopy      = "base_copy_failed"
 	FailEndposReached = "endpos_reached" // not a failure: a clean end
 )

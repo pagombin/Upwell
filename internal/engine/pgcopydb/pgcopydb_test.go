@@ -76,6 +76,17 @@ func TestClassify(t *testing.T) {
 			t.Errorf("%q: %s, want %s", c.line, got, c.want)
 		}
 	}
+	// D108, the droplet: the target's replication origin pointed into a CDC
+	// file pgcopydb had already removed; a file still there is not that.
+	dir := t.TempDir()
+	kept := filepath.Join(dir, "00000002-0000017C-B43067B8-output.db")
+	os.WriteFile(kept, nil, 0o600)
+	for path, want := range map[string]string{filepath.Join(dir, "00000002-0000017A-2F728908-output.db"): engine.FailChangesLost, kept: engine.FailTransient} {
+		line := `2026-10-17 10:41:39.211 1859955 ERROR  ld_store.c:415            Failed to open "` + path + `": unable to open database file`
+		if got := e.Classify(e.ParseLog(line)); got != want {
+			t.Errorf("%q: %s, want %s", line, got, want)
+		}
+	}
 	r := e.ParseLog(`2026-10-07 10:00:00.123 4242 INFO   copy.c:1  COPY "public"."orders" done`)
 	if r.Table != "public.orders" || r.Level != "info" || r.PID != 4242 {
 		t.Fatalf("parse: %+v", r)

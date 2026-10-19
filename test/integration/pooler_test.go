@@ -186,3 +186,68 @@ func TestMigrationThroughSessionPooler(t *testing.T) {
 	}
 	e.cleanup(id, "Through PgBouncer")
 }
+
+// D108, the droplet (2026-10-17): the target sat behind a pooler in session
+// mode. When the apply died, the pooler kept its server session, and with it
+// the replication origin (DISCARD ALL does not release one): every resume
+// then failed, with "replication origin with ID 1 is already active for PID
+// p" when the pooler handed the engine another server session, and "cannot
+// setup replication origin when one is already setup" when it handed back
+// that one. Resuming must release the origin first.
+func TestResumeFreesOriginHeldThroughPooler(t *testing.T) {
+	c := startPgBouncer(t, "session", 56536)
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_poolorigin")
+	seedDB(t, db, 3000)
+	id := e.defineMigration("Origin through PgBouncer", []string{db}, map[string]any{"_target_port": c.Port})
+	e.preflight(id)
+	e.do("POST", "/api/v1/migrations/"+id+"/start", map[string]any{"warnings_reviewed": true}, nil, 200)
+	e.waitDBState(id, db, 3*time.Minute, orch.DInSync)
+	origin := e.db(id, db).OriginName
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/stop", nil, nil, 200)
+	e.waitDBState(id, db, 2*time.Minute, orch.DStopped)
+
+	// The engine's own apply session stays in the pool with the origin (a
+	// client handed that session back sees "already setup"); otherwise a
+	// client of the pooler takes the origin and goes away.
+	ctx := context.Background()
+	held, err := pg.Connect(ctx, c.WithDB(db), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "SELECT pg_replication_origin_session_setup($1)", origin); err != nil && !strings.Contains(err.Error(), "already") {
+		t.Fatalf("taking origin %s: %v", origin, err)
+	} else if err != nil {
+		t.Logf("after a clean stop: %v", err)
+	}
+	held.Close(ctx)
+	direct, err := pg.Connect(ctx, dstConn.WithDB(db), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = direct.Exec(ctx, "SELECT pg_replication_origin_session_setup($1)", origin)
+	direct.Close(ctx)
+	if err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("the pooled session does not hold the origin (%v): the test cannot show the failure", err)
+	}
+
+	exec1(t, srcConn, db, `INSERT INTO orders(customer, amount, note) VALUES (7, 7, 'after pooled origin')`)
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/resume", nil, nil, 200)
+	if d := e.waitDBState(id, db, 3*time.Minute, orch.DInSync, orch.DFailed, orch.DRestartRequired, orch.DStopped); d.State != orch.DInSync {
+		t.Fatalf("resume with the origin held by a pooled session ended %s: %s", d.State, d.LastError)
+	}
+	e.waitFor(2*time.Minute, "the row written while stopped to reach the target", func() bool {
+		return q(t, dstConn, db, `SELECT count(*) FROM orders WHERE note = 'after pooled origin'`) == "1"
+	})
+	found := false
+	for _, ev := range eventsOf(t, e, id) {
+		if ev["type"] == "origin_released" {
+			t.Logf("event: %v", ev["message"])
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no origin_released event")
+	}
+	e.abortAndClean(id, "Origin through PgBouncer")
+}

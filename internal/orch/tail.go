@@ -21,6 +21,7 @@ type classes struct {
 	warnings       int
 	lastError      string
 	slotLost       bool
+	changesLost    bool // D108: the CDC file the target's origin points into is gone
 	baseCopyFailed bool
 	permanent      bool
 	endposReached  bool
@@ -239,6 +240,9 @@ func (t *tailers) read(tl *tailer) {
 		switch cls {
 		case engine.FailSlotLost:
 			tl.cls.slotLost = true
+			tl.cls.lastError = rec.Msg
+		case engine.FailChangesLost:
+			tl.cls.changesLost = true
 			tl.cls.lastError = rec.Msg
 		case engine.FailBaseCopy:
 			tl.cls.baseCopyFailed = true

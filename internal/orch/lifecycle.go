@@ -860,6 +860,17 @@ func (o *Orchestrator) startAttempt(ctx context.Context, m Migration, d Database
 			o.Event(ctx, m.ID, d.SourceName, "stale_sessions", "warning", fmt.Sprintf("%s: ended %d session(s) a previous engine left open on the target, which would keep its replication origin busy: %s", d.SourceName, len(ended), strings.Join(ended, "; ")), map[string]any{"sessions": ended})
 		}
 	}
+	// D108: behind a pooler the apply's server session outlives the engine
+	// and keeps the replication origin without its application name.
+	if d.OriginName != "" {
+		did, err := pg.ReleaseOrigin(ctx, spec.TargetConn.WithDB(d.TargetName), d.OriginName)
+		if err != nil {
+			o.logf("warn", "orchestrator", m.ID, d.SourceName, "", "releasing replication origin %s on the target: %v", d.OriginName, err)
+		}
+		if len(did) > 0 {
+			o.Event(ctx, m.ID, d.SourceName, "origin_released", "warning", fmt.Sprintf("%s: the replication origin %s was still held on the target, probably by a server session a connection pooler kept from the previous engine; Upwell %s", d.SourceName, d.OriginName, strings.Join(did, "; ")), map[string]any{"steps": did})
+		}
+	}
 	if err := os.MkdirAll(plan.RunDir, 0o750); err != nil {
 		return err
 	}

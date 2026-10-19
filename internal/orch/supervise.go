@@ -234,6 +234,12 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 			o.afterExit(ctx, m, d, engine.FailSlotLost, classes.lastError)
 			return
 		}
+		if classes.changesLost && d.BaseCopyDone {
+			o.mustStop(ctx, m, d, "changes lost")
+			o.endAttempt(ctx, d, nil, "the changes the target still needs are gone")
+			o.afterExit(ctx, m, d, engine.FailChangesLost, classes.lastError)
+			return
+		}
 		// During streaming: if pgcopydb gave up or its apply process exited
 		// outside a cutover's end position, the unit can still look alive
 		// (receive ignores SIGTERM) while nothing is applied. Stop it and let
@@ -329,6 +335,8 @@ func (o *Orchestrator) superviseDB(ctx context.Context, m Migration, d Database)
 		reason = "reached its end position"
 	case classes.slotLost:
 		cls, reason = engine.FailSlotLost, classes.lastError
+	case classes.changesLost && d.BaseCopyDone:
+		cls, reason = engine.FailChangesLost, classes.lastError
 	case !d.BaseCopyDone:
 		cls, reason = engine.FailBaseCopy, firstNonEmpty(o.failureReason(ctx, m, d, classes), "the engine exited during the base copy")
 		if classes.engineLock {
@@ -381,6 +389,13 @@ func (o *Orchestrator) afterExit(ctx context.Context, m Migration, d Database, c
 	case engine.FailSlotLost:
 		o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "last_error": "The replication slot was invalidated (wal_status lost): " + reason})
 		o.Event(ctx, m.ID, d.SourceName, "slot_lost", "critical", d.SourceName+": the replication slot was invalidated, so this database must restart from zero. Upwell never does this automatically.", map[string]any{"reason": reason})
+	case engine.FailChangesLost:
+		// D108: the target's replication origin points before what the
+		// source slot still sends, into a CDC file that is gone: those
+		// changes exist nowhere any more, and resuming would skip them.
+		o.setDB(ctx, d.ID, map[string]any{"state": DRestartRequired, "error_class": cls, "next_retry_at": nil,
+			"last_error": "The changes the target still needs (from its replication origin onward) are gone: the engine removed the file holding them and the source slot has moved past them (" + reason + "). Restart this database from zero; resuming would skip those changes."})
+		o.Event(ctx, m.ID, d.SourceName, "changes_lost", "critical", d.SourceName+": the changes the target still needs are no longer available, so this database must restart from zero. Upwell never does this automatically.", map[string]any{"reason": reason})
 	case engine.FailBaseCopy:
 		v := o.globalSettings(ctx)
 		underLimit := d.SizeBytes <= int64(v.Int("auto_restart_base_copy_max_gb"))<<30

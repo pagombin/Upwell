@@ -534,3 +534,38 @@ Still ahead for a sustained TPC-C load (about 250 transactions and 7,500 row cha
 - The migration's Logs tab offers **Live tail** (as before) and **Pages**: newest first, page sizes of 50 to 500, newest/newer/older/oldest, a total count, and the same filters. Long lines fold to two lines. The logs API takes `paged=1` and `offset` and returns `X-Total-Count`.
 - Events are already kept for a migration's whole life (deleted only with it). Logs older than `log_retention_days` (30) are pruned only for cleaned-up migrations. Run again keeps both.
 Tests: `TestLogsPaged`.
+
+## D108. The apply confirms what the target committed (build 0.18+upwell.6); a pooler's kept session no longer holds the origin
+The droplet, m33hv5, 2026-10-17. Two days into CDC, migration_db's apply failed with `cannot allocate memory for output buffer`. The next five resumes failed: first "replication origin with ID 1 is already active for PID 257476", then "cannot setup replication origin when one is already setup". Upwell then stopped retrying. Three faults, two of them in pgcopydb 0.18 itself.
+
+**1. The apply never read the target's answers (data safety).** The apply connection runs in libpq pipeline mode, non-blocking, and the SQLite-based apply of 0.18 never sends a Sync or reads a result. Three consequences:
+- A statement the target refuses is never seen. After an error the server ignores everything until a Sync, so the target silently stops applying.
+- The send buffer holds everything the target has not read yet. On the droplet the target fell behind and the buffer reached libpq's 2 GB limit.
+- `sentinel.replay_lsn` advanced with what had only been queued. The receive process reports it to the source as flushed. When the apply died, the source slot had been confirmed to 17C/A755A5A0 and the sentinel said 17C/E0106828, but the target's replication origin, which is the truth, was at 17C/5AEC10E8. The changes in between were only in the CDC file 0000017A. The engine's own cleanup deleted that file at the next start, because the sentinel said it was applied.
+
+`TestApplyErrorStopsProgress` shows it on upwell.5: a duplicate key on the target, and the slot is confirmed past it with none of the 50 later rows on the target. That is silent loss. Upwell's verification at cutover would catch it as a count difference, and it held migration_db as Failed, but the engine must not report progress it has not made.
+
+Patch `0006-confirm-the-apply-pipeline-and-publish-only-durable-progress.patch`:
+- The pipeline is synced every 1,000 statements, 64 MB or 500 ms, inside large transactions too, and always before a keepalive, at endpos, and when the replay is drained. Any error stops the apply with the target's message. Upwell shows it, for example `[23505] ERROR: duplicate key value violates unique constraint "orders_pkey"`.
+- replay_lsn is published only after the target has answered everything queued, and only once `pg_replication_origin_progress(origin, true)` has durably reached the last COMMIT. That is at most one query per sync. Until then the last confirmed position stays.
+- Once the conflict was resolved, the resumed engine applied every row.
+- `TestApplyQueueBoundedMemory` holds the target with a lock while 380 MB arrives in 30 transactions. upwell.5 grew by 384 MiB; upwell.6 grows by 21 MiB.
+- One large transaction is still held in memory once by the transform: 380 MB in a single transaction cost about 400 MiB. That is bounded by the largest transaction, not the backlog.
+- D106 was wrong to say the apply waits for each statement's reply. It never waited, and that was the bug.
+
+**2. Every SQLite file opened with no busy timeout.** A statement that met another process's write failed at once with "database is locked", and the engine with it. Examples: the `create index if not exists` on a CDC file the receive process writes (D106), the droplet's "Failed to delete cdc_files row 2: database is locked", and one run of `TestResumeEndsStaleApplySession`. Patch `0007-wait-for-busy-sqlite-files.patch` sets a two-minute busy timeout on every catalog. `TestEngineWaitsForCDCFileLock` holds a write lock on the replay file for 8 s during a resume. It failed with one automatic retry before the patch and needs none after.
+
+**3. A pooler kept the origin.** The droplet's target connects through a proxy, with session pooling (preflight warned that `client_addr` was not the droplet). When an engine stops, the pooler keeps its server session for the next client. `DISCARD ALL` does not release a replication origin, and the session has lost its application name, so D89's clean-up of `pgcopydb[…]` sessions cannot see it. The next apply then gets either another server session ("already active for PID p") or that same one ("already setup"). `TestResumeFreesOriginHeldThroughPooler` (PgBouncer in session mode) shows a clean stop is enough to cause it.
+
+Before each engine start, `pg.ReleaseOrigin` connects as the engine does and tries to set up the origin:
+- "already setup": it resets the origin in that pooled session;
+- "already active for PID p": it ends p, only if p is this user's session in this database;
+- otherwise it resets the origin it took.
+
+This repeats up to ten times. Event `origin_released` says what was done. The engine's cleanup does the same before dropping the origin.
+
+**4. Changes gone means restart.** When the apply cannot open the CDC file its origin points into, and that file no longer exists, the class is `changes_lost`. The database goes to Restart required with an explanation and the event `changes_lost`. It no longer retries five times. Test: `TestClassify`.
+
+**For m33hv5's migration_db:** the changes between 17C/5AEC10E8 and 17C/A755A5A0 exist nowhere any more: not on the target, not in the slot, not in a file. That database must restart from zero (Restart from zero, or Run again) after installing upwell.6. Nothing was applied out of order or skipped silently into a GO: it was held as Failed. migration_poc is unaffected, but runs the same engine. Its periodic stalls, recovered by the 10-minute restart (D90), fit the same pattern, so it should also be restarted on upwell.6 before a cutover is trusted.
+
+Build `0.18+upwell.6` (`deploy/install.sh`, `pgpack.EngineBuildRequired`): Upwell refuses upwell.5 for new launches, so the installer rebuilds.

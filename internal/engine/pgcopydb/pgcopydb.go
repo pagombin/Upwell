@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -450,6 +452,11 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		return done, fmt.Errorf("checking for origin %s: %w", d.OriginName, err)
 	}
 	if n > 0 {
+		// D108: behind a pooler a server session kept from the engine may
+		// still hold the origin, and the drop would fail on it.
+		if did, err := pg.ReleaseOrigin(ctx, d.TargetConn.WithDB(d.Target), d.OriginName); err == nil && len(did) > 0 {
+			done = append(done, "released origin "+d.OriginName+": "+strings.Join(did, "; "))
+		}
 		if _, err := dst.Exec(ctx, `SELECT pg_replication_origin_drop($1)`, d.OriginName); err != nil {
 			dst.Close(ctx)
 			return done, fmt.Errorf("dropping origin %s: %w", d.OriginName, err)
@@ -517,6 +524,9 @@ var (
 	permanent = regexp.MustCompile(`password authentication failed|permission denied|no pg_hba\.conf entry|No space left on device|out of memory|must be owner of|syntax error|does not exist`)
 	transient = regexp.MustCompile(`could not connect|Connection refused|server closed the connection|terminating connection|connection to server .* failed|timeout|too many connections|the database system is (starting up|shutting down)|could not receive data|SSL SYSCALL|broken pipe|Connection reset`)
 	cleanEnd  = regexp.MustCompile(`Follow mode is now done, reached endpos|Current endpos .* was previously reached`)
+	// D108: the apply starts from the target's replication origin and opens
+	// the CDC file holding that position; pgcopydb had already removed it.
+	cdcFileGone = regexp.MustCompile(`Failed to open "([^"]+-(?:output|replay)\.db)": unable to open database file`)
 )
 
 // Classify returns the failure class implied by one record. Slot loss is
@@ -529,6 +539,8 @@ func (e *Engine) Classify(r engine.LogRecord) string {
 		return engine.FailSlotLost
 	case r.Level != "error" && r.Level != "fatal":
 		return engine.FailNone
+	case cdcFileGone.MatchString(r.Msg) && cdcFileMissing(cdcFileGone.FindStringSubmatch(r.Msg)[1]):
+		return engine.FailChangesLost
 	case baseFail.MatchString(r.Msg):
 		return engine.FailBaseCopy
 	case permanent.MatchString(r.Msg):
@@ -537,6 +549,11 @@ func (e *Engine) Classify(r engine.LogRecord) string {
 		return engine.FailTransient
 	}
 	return engine.FailTransient
+}
+
+func cdcFileMissing(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // CopyRoles copies cluster roles once (best effort) without passwords, as a

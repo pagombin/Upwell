@@ -1,0 +1,286 @@
+diff --git a/src/bin/pgcopydb/ld_apply.c b/src/bin/pgcopydb/ld_apply.c
+index b097b58..b5d5d05 100644
+--- a/src/bin/pgcopydb/ld_apply.c
++++ b/src/bin/pgcopydb/ld_apply.c
+@@ -8,6 +8,7 @@
+ #include <inttypes.h>
+ #include <sys/select.h>
+ #include <sys/wait.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include "postgres.h"
+@@ -67,6 +68,93 @@ static bool stream_apply_transaction(StreamApplyContext *context,
+ 
+ bool stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context);
+ 
++/*
++ * Upwell patch (upwell-6): the apply connection runs in libpq pipeline mode,
++ * and pgcopydb 0.18 never read the target's answers on it. An error on the
++ * target (after which the server ignores everything until a Sync) went
++ * unnoticed; the send buffer grew with the backlog until libpq gave up
++ * ("cannot allocate memory for output buffer"); and sentinel.replay_lsn,
++ * which the receive process reports to the source as flushed, advanced with
++ * what had only been queued. The pipeline is now synced every
++ * APPLY_SYNC_STATEMENTS statements, APPLY_SYNC_BYTES bytes or
++ * APPLY_SYNC_INTERVAL_MS, and before anything is published. A refused
++ * statement stops the apply, and replay_lsn only moves to positions the
++ * target has durably committed.
++ */
++#define APPLY_SYNC_STATEMENTS 1000
++#define APPLY_SYNC_BYTES (64 * 1024 * 1024)
++#define APPLY_SYNC_INTERVAL_MS 500
++
++static uint64_t applyPendingStmts = 0;
++static uint64_t applyPendingBytes = 0;
++static uint64_t applyLastSyncMs = 0;
++static bool applyFailed = false;
++
++/* the last COMMIT queued, and the last replay_lsn published */
++static uint64_t applyQueuedCommitLSN = InvalidXLogRecPtr;
++static uint64_t applyPublishedLSN = InvalidXLogRecPtr;
++
++static uint64_t
++stream_apply_now_ms(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++
++	return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
++}
++
++
++static void
++stream_apply_queued(uint64_t bytes)
++{
++	applyPendingStmts++;
++	applyPendingBytes += bytes;
++}
++
++
++/*
++ * stream_apply_confirm reads the target's answers to everything queued on the
++ * apply connection: always when force is true, otherwise once a threshold is
++ * reached. It returns false when the target refused a statement.
++ */
++static bool
++stream_apply_confirm(StreamApplyContext *context, bool force)
++{
++	if (applyFailed)
++	{
++		return false;
++	}
++
++	if (applyPendingStmts == 0)
++	{
++		return true;
++	}
++
++	if (!force &&
++		applyPendingStmts < APPLY_SYNC_STATEMENTS &&
++		applyPendingBytes < APPLY_SYNC_BYTES &&
++		stream_apply_now_ms() - applyLastSyncMs < APPLY_SYNC_INTERVAL_MS)
++	{
++		return true;
++	}
++
++	if (!pgsql_sync_pipeline(&(context->applyPgConn)))
++	{
++		log_error("The target did not apply a change, see above for details; "
++				  "progress stays at %X/%X",
++				  LSN_FORMAT_ARGS(applyPublishedLSN));
++		applyFailed = true;
++		return false;
++	}
++
++	applyPendingStmts = 0;
++	applyPendingBytes = 0;
++	applyLastSyncMs = stream_apply_now_ms();
++
++	return true;
++}
++
+ /*
+  * stream_apply_catchup applies CDC changes stored in the SQLite replayDB to
+  * the target database, catching up from the last-known replay LSN position.
+@@ -256,6 +344,13 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 			break;
+ 		}
+ 
++		/* Upwell patch (upwell-6) */
++		if (applyFailed)
++		{
++			success = false;
++			break;
++		}
++
+ 		/* ── check for upstream-done signal ──────────────────────────── */
+ 		if (!specs->upstream_done && pipe_rd >= 0)
+ 		{
+@@ -359,6 +454,13 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 				break;
+ 			}
+ 
++			/* Upwell patch (upwell-6): confirm what is queued first */
++			if (!stream_apply_confirm(context, true))
++			{
++				success = false;
++				break;
++			}
++
+ 			if (!stream_apply_sync_sentinel(context, false))
+ 			{
+ 				log_warn("Failed to sync sentinel when caught up with replayDB");
+@@ -630,6 +732,15 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 			{
+ 				bool findDurableLSN = false;
+ 
++				/* Upwell patch (upwell-6) */
++				stream_apply_queued(0);
++
++				if (!stream_apply_confirm(context, true))
++				{
++					success = false;
++					break;
++				}
++
+ 				if (!stream_apply_sync_sentinel(context, findDurableLSN))
+ 				{
+ 					log_warn("Failed to sync sentinel at LSN %X/%X, "
+@@ -662,6 +773,12 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 		(void) semaphore_unlock(&(replayDB->sema));
+ 	}
+ 
++	/* Upwell patch (upwell-6): a refused change fails the apply */
++	if (applyFailed)
++	{
++		success = false;
++	}
++
+ 	/* enforce a final durable checkpoint of the in-memory apply state */
+ 	(void) pipeline_state_sync(specs->sourceDB, &current);
+ 	specs->private.applyState = NULL;
+@@ -711,6 +828,9 @@ stream_apply_transaction(StreamApplyContext *context,
+ 	context->reachedStartPos = true;
+ 	context->continuedTxn = false;
+ 
++	/* Upwell patch (upwell-6): BEGIN and the settings */
++	stream_apply_queued(0);
++
+ 	ReplayDBReplayTxnIterator iter = { 0 };
+ 
+ 	iter.catalog = replayDB;
+@@ -885,6 +1005,19 @@ stream_apply_transaction(StreamApplyContext *context,
+ 			success = false;
+ 			break;
+ 		}
++
++		/*
++		 * Upwell patch (upwell-6): read the target's answers before the
++		 * queue grows too big, even in the middle of a large transaction.
++		 */
++		stream_apply_queued((s->stmt != NULL ? strlen(s->stmt) : 0) +
++							(s->data != NULL ? strlen(s->data) : 0));
++
++		if (!stream_apply_confirm(context, false))
++		{
++			success = false;
++			break;
++		}
+ 	}
+ 
+ 	(void) ld_store_iter_replay_txn_finish(&iter);
+@@ -942,6 +1075,15 @@ stream_apply_transaction(StreamApplyContext *context,
+ 	context->transactionInProgress = false;
+ 	context->previousLSN = commitLSN;
+ 
++	/* Upwell patch (upwell-6): origin setup and COMMIT */
++	applyQueuedCommitLSN = commitLSN;
++	stream_apply_queued(0);
++
++	if (!stream_apply_confirm(context, sync))
++	{
++		return false;
++	}
++
+ 	bool findDurableLSN = false;
+ 
+ 	if (!stream_apply_sync_sentinel(context, findDurableLSN))
+@@ -1410,25 +1552,58 @@ stream_apply_sync_sentinel(StreamApplyContext *context, bool findDurableLSN)
+ 	uint64_t durableLSN = InvalidXLogRecPtr;
+ 
+ 	/*
+-	 * If we know we reached endpos, then publish that as the replay_lsn.
++	 * Upwell patch (upwell-6): publish context->previousLSN only once the
++	 * target has answered everything queued and its replication origin has
++	 * durably reached the last COMMIT queued; otherwise keep the last
++	 * published position. At endpos, confirm first.
+ 	 */
+-	if (context->reachedEndPos || !findDurableLSN)
++	(void) findDurableLSN;
++
++	if (context->reachedEndPos && !stream_apply_confirm(context, true))
++	{
++		return false;
++	}
++
++	if (applyPendingStmts > 0 || context->transactionInProgress ||
++		context->previousLSN == applyPublishedLSN)
+ 	{
+-		durableLSN = context->previousLSN;
++		durableLSN = applyPublishedLSN;
+ 	}
+ 	else
+ 	{
+-		if (!stream_apply_find_durable_lsn(context, &durableLSN))
++		uint64_t originLSN = InvalidXLogRecPtr;
++
++		if (!stream_apply_find_durable_lsn(context, &originLSN))
+ 		{
+ 			log_warn("Skipping sentinel replay_lsn update: "
+-					 "failed to find a durable LSN matching current flushLSN");
+-			return true;
++					 "failed to read the target's durable position");
++			durableLSN = applyPublishedLSN;
++		}
++		else if (originLSN >= applyQueuedCommitLSN)
++		{
++			durableLSN = context->previousLSN;
++		}
++		else
++		{
++			log_warn("The target's replication origin is at %X/%X, "
++					 "before the last COMMIT applied %X/%X",
++					 LSN_FORMAT_ARGS(originLSN),
++					 LSN_FORMAT_ARGS(applyQueuedCommitLSN));
++			durableLSN = originLSN > applyPublishedLSN ?
++						 originLSN : applyPublishedLSN;
+ 		}
+ 	}
+ 
++	applyPublishedLSN = durableLSN;
++
+ 	CopyDBSentinel sentinel = { 0 };
+ 
+-	if (!sentinel_sync_apply(context->sourceDB, durableLSN, &sentinel))
++	/* nothing confirmed yet: read the sentinel without publishing */
++	bool synced = durableLSN == InvalidXLogRecPtr ?
++				  sentinel_get(context->sourceDB, &sentinel) :
++				  sentinel_sync_apply(context->sourceDB, durableLSN, &sentinel);
++
++	if (!synced)
+ 	{
+ 		log_warn("Failed to sync progress with the pgcopydb sentinel");
+ 		return true;
+@@ -2516,6 +2691,10 @@ setupReplicationOrigin(StreamApplyContext *context)
+ 		context->previousLSN = originLSN;
+ 	}
+ 
++	/* Upwell patch (upwell-6): what the target has is what is published */
++	applyQueuedCommitLSN = context->previousLSN;
++	applyPublishedLSN = context->previousLSN;
++
+ 	log_debug("setupReplicationOrigin: replication origin \"%s\" "
+ 			  "found at %X/%X",
+ 			  nodeName,
