@@ -584,3 +584,24 @@ The droplet, m33hv5, 2026-10-19: TPC-C on migration_db while migration_poc had n
 A database is now In sync when its byte backlog is under the threshold, **or** when the latest heartbeat measurement (taken in the last minute) shows the target at most 30 s behind (three heartbeat intervals). The heartbeat is a write in that database, so it measures that database's own lag. The readiness gate's own lag condition (`cutover_max_lag_seconds`) is unchanged.
 
 `TestIdleDatabaseStaysInSyncBesideBusyOne` writes a few MB of WAL a second into one database and samples the other for 60 s: out of sync in 10 of 60 samples before, none after.
+
+## D110. upwell.6 cut the apply rate by five sixths; upwell.7 syncs on the interval only
+The droplet, m33hv5, 2026-10-19, TPC-C again on upwell.6: migration_db received 8–10 MiB/s of source WAL and applied 3.6 MiB/s, while the source wrote about 30 MiB/s.
+
+Measured locally with pgbench (8 clients, 30 s; counted when every row is on the target, not when the slot is confirmed, which upwell.5 did too early, D108):
+
+| Build | Applied transactions/s |
+| --- | --- |
+| upwell.5 | 462 |
+| upwell.6 | 75 |
+| upwell.7 | 510 |
+
+D106's 372 was measured by the slot, so it overstated upwell.5 at the time it was taken; the method is now the target row count.
+
+**Cause.** Besides its periodic syncs, patch 0006 forced a sync, and a durable-position query on the target, each time the apply found the replay drained and at every keepalive. Under load the receive process is slower than the apply, so the apply drains between almost every transaction. It synced per transaction and waited for the target each time.
+
+**Fix.** The drain and keepalive paths now sync only once the interval (500 ms) has passed. The drain branch runs every 100 ms while idle, so nothing waits longer than that. The end position still forces a sync. Nothing is published before it is confirmed, so safety is unchanged: `TestApplyErrorStopsProgress`, `TestApplyQueueBoundedMemory` and the cutover tests pass on the new build.
+
+The patch changed, so the build is `0.18+upwell.7`, and the installer rebuilds it.
+
+**What is left on the droplet.** The receive process (decode, then one SQLite row per change) takes 8–10 MiB/s of WAL, and one apply session takes perhaps two or three times what upwell.6 showed. A sustained TPC-C load writing 30 MiB/s of WAL is beyond both. The overview's catch-up estimate says so, and pausing the load before the cutover drains the backlog.

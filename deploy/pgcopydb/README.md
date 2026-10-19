@@ -2,7 +2,7 @@
 
 `deploy/install.sh` builds pgcopydb from the `PGCOPYDB_TAG` tag with every
 `*.patch` here applied, as version `PGCOPYDB_BUILD` (for example
-`0.18+upwell.6`). Upwell refuses online migrations with any other build
+`0.18+upwell.7`). Upwell refuses online migrations with any other build
 (preflight check `engine_commit_order`, and again at each launch).
 
 | Patch | Why |
