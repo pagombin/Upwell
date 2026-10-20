@@ -11,8 +11,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/pagombin/upwell/internal/orch"
 	"github.com/pagombin/upwell/internal/pg"
@@ -337,4 +340,59 @@ func TestIdleDatabaseStaysInSyncBesideBusyOne(t *testing.T) {
 	if flips > 0 {
 		t.Fatalf("the idle database left In sync in %d of 60 samples although nothing changed in it", flips)
 	}
+}
+
+// D111: the receive process writes the change files in batches, the
+// transform writes replay.db in one transaction per pass, and the files
+// checkpoint less often. None of these files is the durable record, so an
+// engine killed with a batch open must lose nothing. Here three writers mix
+// inserts, updates and deletes in small transactions, plus transactions
+// larger than one batch, while the change files rotate every 4 MB and the
+// whole engine is killed four times. The cutover must end GO with every row
+// identical, under both plugins.
+func TestEngineKilledUnderLoadLosesNothing(t *testing.T) {
+	t.Setenv("PGCOPYDB_MAX_REPLAYDB_SIZE", "4MB")
+	forPlugins(t, scenario{name: "killload", wantGO: true,
+		schema: `CREATE TABLE w(id bigint PRIMARY KEY, v int NOT NULL, note text);
+			INSERT INTO w SELECT g, 0, md5(g::text) FROM generate_series(1, 20000) g;`,
+		streaming: func(t *testing.T, e *Env, id, db string) func() {
+			var stops []func()
+			for k := 0; k < 3; k++ {
+				k := k
+				stops = append(stops, background(t, db, 20*time.Millisecond, func(ctx context.Context, c *pgx.Conn, i int) error {
+					base := int64(1000000*(k+1) + i*10)
+					if i%50 == 49 { // larger than one batch of the change files
+						_, err := c.Exec(ctx, `INSERT INTO w SELECT g, 1, repeat('x', 200) FROM generate_series($1::bigint, $1::bigint + 2999) g`, base*10)
+						return err
+					}
+					_, err := c.Exec(ctx, `BEGIN;
+						INSERT INTO w VALUES ($1, 1, 'new'), ($1 + 1, 1, 'new'), ($1 + 2, 1, 'new');
+						UPDATE w SET v = v + 1, note = md5(random()::text) WHERE id = (1 + ($1 % 20000));
+						DELETE FROM w WHERE id = (1 + (($1 * 7) % 20000));
+						COMMIT`, base)
+					return err
+				}))
+			}
+			for kill := 1; kill <= 4; kill++ {
+				time.Sleep(8 * time.Second)
+				pid := e.mainPID(id, db)
+				before := e.db(id, db).RetryCount
+				if pgid, _ := syscall.Getpgid(pid); pgid > 0 {
+					syscall.Kill(-pgid, syscall.SIGKILL)
+				} else {
+					syscall.Kill(pid, syscall.SIGKILL)
+				}
+				t.Logf("kill %d: engine pid %d", kill, pid)
+				e.waitFor(3*time.Minute, "an automatic resume", func() bool { return e.db(id, db).RetryCount > before })
+				e.waitDBState(id, db, 5*time.Minute, orch.DInSync, orch.DCatchUp)
+			}
+			files, _ := filepath.Glob(filepath.Join(e.Cfg.RunsDir(), "*"+db+"*", "clone", "cdc", "*-output.db"))
+			t.Logf("%d change file(s) after the kills", len(files))
+			return func() {
+				for _, s := range stops {
+					s()
+				}
+				e.waitDBState(id, db, 10*time.Minute, orch.DInSync)
+			}
+		}})
 }

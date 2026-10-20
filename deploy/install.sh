@@ -18,7 +18,7 @@ PGCOPYDB_TAG="v0.18"
 # The v0.18 tag plus deploy/pgcopydb/*.patch (D84: without them pgcopydb
 # loses transactions that overlap another one). Upwell refuses online
 # migrations with an engine that does not report this build.
-PGCOPYDB_BUILD="0.18+upwell.7"
+PGCOPYDB_BUILD="0.18+upwell.8"
 GO_VERSION="1.24.4"
 PORT_DEFAULT=443
 

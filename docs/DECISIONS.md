@@ -605,3 +605,38 @@ D106's 372 was measured by the slot, so it overstated upwell.5 at the time it wa
 The patch changed, so the build is `0.18+upwell.7`, and the installer rebuilds it.
 
 **What is left on the droplet.** The receive process (decode, then one SQLite row per change) takes 8–10 MiB/s of WAL, and one apply session takes perhaps two or three times what upwell.6 showed. A sustained TPC-C load writing 30 MiB/s of WAL is beyond both. The overview's catch-up estimate says so, and pausing the load before the cutover drains the backlog.
+
+## D111. The change files are written in batches (build 0.18+upwell.8)
+The request: keep looking for CDC speed while absolutely ensuring no data loss. The method was profiling, not guessing. While a pgbench load (8 clients, 60 s) drained, 150 gdb stack samples were taken of each engine process. Neither process was CPU-bound (receive 17%, apply 21% of a core); both were mostly waiting:
+- **receive**: 58 of 150 samples waiting for the `output.db` semaphore, 41 in fsync, 23 in write.
+- **apply**: 101 of 150 waiting for the same semaphore, held by receive.
+
+**Cause.** receive wrote each message as one `output` row plus one `pgoutput_col` row per column. Each was its own auto-committed SQLite transaction, under the semaphore: about a dozen commits for one changed row, each writing whole pages, with fsyncs at every WAL checkpoint. The transform did the same per statement in `replay.db`.
+
+Patch `0008-write-the-change-files-in-batches.patch`:
+- **receive** writes in one SQLite transaction until a boundary: COMMIT, ROLLBACK, keepalive, switch or end position. Inside a transaction it commits every 1,000 messages. A message and its columns are committed or rolled back together; before, a crash could leave a row without some of its columns. The open batch is committed before receive tells the transform it is done, and when a file is closed or rotated.
+- **transform** writes `replay.db` in one transaction per pass, every 1,000 statements, and rolls back a failed pass.
+- **checkpoints**: `output.db` and `replay.db` checkpoint every 16,000 pages (64 MB) instead of 1,000.
+- **for tests**: `PGCOPYDB_MAX_REPLAYDB_SIZE` overrides the 1 GB rotation size, because `clone --follow` has no option for it.
+
+**Why this cannot lose data.** Neither file is the durable record. The source slot is confirmed only to positions the target has durably committed (D108). What was not yet committed into `output.db` when the engine stops lies after that position, so the slot sends it again on restart, as after any crash. The transform reads only committed rows, and applies only transactions whose COMMIT it can see. The apply begins from the target's replication origin.
+
+Measured locally (pgbench 8 clients, 60 s, counted when every row is on the target):
+
+| Build | Applied transactions/s |
+| --- | --- |
+| upwell.7 | 385 |
+| + batched `output.db` | 496 |
+| + batched `replay.db` | 583 |
+| + 64 MB checkpoints (upwell.8) | 620 (+61%) |
+
+After the change, receive often waits on the network: under this load it keeps up with the source at times.
+
+`TestEngineKilledUnderLoadLosesNothing`, under both plugins:
+- three writers mix inserts, updates and deletes in small transactions, plus 3,000-row transactions larger than a batch;
+- the change files rotate every 4 MB;
+- the whole engine is killed with SIGKILL four times.
+
+The cutover ended GO with every row identical: 533,000 and 551,000 rows, three change files. The earlier safety tests (refused change, bounded queue, busy file, cutover restart at every step, heartbeat, overlap, large transactions, kill during apply) are being run again on this build (result below).
+
+**What is left.** Receive and the transform still share the `output.db` semaphore, and the transform holds it for a whole pass. In WAL mode SQLite lets one writer and readers work at once, so the semaphore is probably unnecessary for reading. But it is pgcopydb's own locking, so it is the next candidate, not part of this build.

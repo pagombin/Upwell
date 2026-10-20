@@ -1,0 +1,434 @@
+diff --git a/src/bin/pgcopydb/catalog.c b/src/bin/pgcopydb/catalog.c
+index 97fb105..cc2034b 100644
+--- a/src/bin/pgcopydb/catalog.c
++++ b/src/bin/pgcopydb/catalog.c
+@@ -1573,6 +1573,20 @@ catalog_init(DatabaseCatalog *catalog)
+ 			catalog->db = NULL;
+ 			return false;
+ 		}
++
++		/*
++		 * Upwell patch (upwell-8): in WAL mode with NORMAL, the fsyncs left
++		 * are the checkpoints', every 1000 pages by default: a third of the
++		 * receive process's time under load. Checkpoint every 16000 pages
++		 * (64 MB) instead. As above, the slot is the durable record.
++		 */
++		if (!catalog_execute(catalog, "PRAGMA wal_autocheckpoint = 16000"))
++		{
++			/* errors have already been logged */
++			sqlite3_close(catalog->db);
++			catalog->db = NULL;
++			return false;
++		}
+ 	}
+ 
+ 	/*
+@@ -1754,6 +1768,22 @@ catalog_close(DatabaseCatalog *catalog)
+ 		return true;
+ 	}
+ 
++	/*
++	 * Upwell patch (upwell-8): commit receive's open transaction. It holds
++	 * only whole messages: a failed one was rolled back.
++	 */
++	if (catalog->batchOpen)
++	{
++		catalog->batchOpen = false;
++		catalog->batchCount = 0;
++
++		if (!catalog_execute(catalog, "COMMIT"))
++		{
++			/* errors have already been logged */
++			return false;
++		}
++	}
++
+ 	if (!catalog_close_stmts(catalog))
+ 	{
+ 		/* logged inside */
+diff --git a/src/bin/pgcopydb/cli_common.c b/src/bin/pgcopydb/cli_common.c
+index cbd6e65..eb6c506 100644
+--- a/src/bin/pgcopydb/cli_common.c
++++ b/src/bin/pgcopydb/cli_common.c
+@@ -323,6 +323,22 @@ cli_copydb_getenv(CopyDBOptions *options)
+ 		++errors;
+ 	}
+ 
++	/*
++	 * Upwell patch (upwell-8): clone --follow has no option for the CDC file
++	 * size. Upwell's tests set this to rotate the files after a few MB.
++	 */
++	if (env_exists("PGCOPYDB_MAX_REPLAYDB_SIZE"))
++	{
++		char size[BUFSIZE] = { 0 };
++
++		if (!get_env_copy("PGCOPYDB_MAX_REPLAYDB_SIZE", size, sizeof(size)) ||
++			!parse_pretty_printed_bytes(size, &(options->maxReplayDBSize)))
++		{
++			log_fatal("Failed to parse PGCOPYDB_MAX_REPLAYDB_SIZE \"%s\"", size);
++			++errors;
++		}
++	}
++
+ 	/* check --plugin environment variable */
+ 	if (env_exists(PGCOPYDB_OUTPUT_PLUGIN))
+ 	{
+diff --git a/src/bin/pgcopydb/ld_store.c b/src/bin/pgcopydb/ld_store.c
+index 70dc7fc..87ecc82 100644
+--- a/src/bin/pgcopydb/ld_store.c
++++ b/src/bin/pgcopydb/ld_store.c
+@@ -1642,12 +1642,176 @@ ld_store_insert_timeline_history(DatabaseCatalog *catalog,
+ 
+ 
+ /*
+- * ld_store_insert_message inserts a logical decoding output plugin message
+- * into our SQLite file format.
++ * Upwell patch (upwell-8): the receive process inserted every message as one
++ * row in output, plus one row in pgoutput_col per column, each statement
++ * committing on its own: about a dozen SQLite commits for one changed row,
++ * each writing whole pages, with fsyncs at every WAL checkpoint and the
++ * output semaphore taken each time. Sampled under load, the apply spent two
++ * thirds of its time waiting for that semaphore and the receive process a
++ * third in fsync.
++ *
++ * Messages are now written in one SQLite transaction until a boundary: a
++ * COMMIT, ROLLBACK, keepalive, switch or end position, or every
++ * OUTPUT_BATCH_MESSAGES messages inside a large transaction. A message and
++ * its columns are committed or rolled back together.
++ *
++ * Nothing durable depends on this file: the source slot is confirmed only to
++ * what the target has durably committed (upwell-6), so changes that were not
++ * yet committed here when the engine stops are streamed again from the slot.
++ * Readers see committed rows only, and only transactions whose COMMIT they
++ * can see are applied.
+  */
++#define OUTPUT_BATCH_MESSAGES 1000
++
++static bool ld_store_insert_message_one(DatabaseCatalog *catalog,
++										LogicalMessageMetadata *metadata);
++static bool ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
++												 LogicalMessageMetadata *metadata,
++												 PgoutputMessage *pgmsg);
++static bool ld_store_insert_internal_message_one(DatabaseCatalog *catalog,
++												 InternalMessage *message);
++
++static bool
++ld_store_output_batch_begin(DatabaseCatalog *catalog)
++{
++	if (catalog->batchOpen)
++	{
++		return true;
++	}
++
++	if (!catalog_execute(catalog, "BEGIN IMMEDIATE"))
++	{
++		/* errors have already been logged */
++		return false;
++	}
++
++	catalog->batchOpen = true;
++	catalog->batchCount = 0;
++
++	return true;
++}
++
++
++/*
++ * ld_store_output_batch_commit commits receive's open transaction, if any.
++ */
++bool
++ld_store_output_batch_commit(DatabaseCatalog *catalog)
++{
++	if (catalog == NULL || catalog->db == NULL || !catalog->batchOpen)
++	{
++		return true;
++	}
++
++	catalog->batchOpen = false;
++	catalog->batchCount = 0;
++
++	return catalog_execute(catalog, "COMMIT");
++}
++
++
++/*
++ * ld_store_output_batch_rollback drops what the open transaction holds: the
++ * message that failed half-written, and the messages before it, which the
++ * slot sends again.
++ */
++static void
++ld_store_output_batch_rollback(DatabaseCatalog *catalog)
++{
++	if (catalog->batchOpen)
++	{
++		catalog->batchOpen = false;
++		catalog->batchCount = 0;
++		(void) catalog_execute(catalog, "ROLLBACK");
++	}
++}
++
++
++static bool
++ld_store_output_batch_end(DatabaseCatalog *catalog, StreamAction action)
++{
++	bool inTransaction =
++		action == STREAM_ACTION_BEGIN ||
++		action == STREAM_ACTION_INSERT ||
++		action == STREAM_ACTION_UPDATE ||
++		action == STREAM_ACTION_DELETE ||
++		action == STREAM_ACTION_TRUNCATE ||
++		action == STREAM_ACTION_MESSAGE;
++
++	if (inTransaction && ++catalog->batchCount < OUTPUT_BATCH_MESSAGES)
++	{
++		return true;
++	}
++
++	return ld_store_output_batch_commit(catalog);
++}
++
++
+ bool
+ ld_store_insert_message(DatabaseCatalog *catalog,
+ 						LogicalMessageMetadata *metadata)
++{
++	if (!ld_store_output_batch_begin(catalog))
++	{
++		return false;
++	}
++
++	if (!ld_store_insert_message_one(catalog, metadata))
++	{
++		ld_store_output_batch_rollback(catalog);
++		return false;
++	}
++
++	return ld_store_output_batch_end(catalog, metadata->action);
++}
++
++
++bool
++ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
++								 LogicalMessageMetadata *metadata,
++								 PgoutputMessage *pgmsg)
++{
++	if (!ld_store_output_batch_begin(catalog))
++	{
++		return false;
++	}
++
++	if (!ld_store_insert_pgoutput_message_one(catalog, metadata, pgmsg))
++	{
++		ld_store_output_batch_rollback(catalog);
++		return false;
++	}
++
++	return ld_store_output_batch_end(catalog, metadata->action);
++}
++
++
++bool
++ld_store_insert_internal_message(DatabaseCatalog *catalog,
++								 InternalMessage *message)
++{
++	if (!ld_store_output_batch_begin(catalog))
++	{
++		return false;
++	}
++
++	if (!ld_store_insert_internal_message_one(catalog, message))
++	{
++		ld_store_output_batch_rollback(catalog);
++		return false;
++	}
++
++	return ld_store_output_batch_end(catalog, message->action);
++}
++
++
++/*
++ * ld_store_insert_message inserts a logical decoding output plugin message
++ * into our SQLite file format.
++ */
++static bool
++ld_store_insert_message_one(DatabaseCatalog *catalog,
++						LogicalMessageMetadata *metadata)
+ {
+ 	sqlite3 *db = catalog->db;
+ 
+@@ -1727,8 +1891,8 @@ ld_store_insert_message(DatabaseCatalog *catalog,
+  * and one row per column per section into `pgoutput_col`, all inside a single
+  * SQLite transaction so the two tables are always consistent.
+  */
+-bool
+-ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
++static bool
++ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
+ 								 LogicalMessageMetadata *metadata,
+ 								 PgoutputMessage *pgmsg)
+ {
+@@ -1866,8 +2030,8 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
+  * ld_store_insert_message inserts a logical decoding output plugin message
+  * into our SQLite file format.
+  */
+-bool
+-ld_store_insert_internal_message(DatabaseCatalog *catalog,
++static bool
++ld_store_insert_internal_message_one(DatabaseCatalog *catalog,
+ 								 InternalMessage *message)
+ {
+ 	sqlite3 *db = catalog->db;
+@@ -2020,12 +2184,73 @@ ld_store_delete_output_xid(DatabaseCatalog *catalog, uint32_t xid)
+ 
+ 
+ /*
+- * ld_store_insert_replay_stmt inserts a replay statement in the stmt and
+- * replay tables of the replayDB.
++ * Upwell patch (upwell-8): the transform wrote each replay statement in its
++ * own SQLite transaction, as the receive process did (see above), and the
++ * apply spent most of its own time in those commits' writes, locks and
++ * fsyncs. A transform pass now writes in one transaction, committed every
++ * REPLAY_BATCH_STATEMENTS statements and at the end of the pass, and rolled
++ * back if the pass fails. The apply reads replay.db only after the pass, on
++ * the same connection; nothing durable depends on this file (a restart
++ * begins from the target's replication origin).
+  */
++#define REPLAY_BATCH_STATEMENTS 1000
++
++static bool ld_store_insert_replay_stmt_one(DatabaseCatalog *catalog,
++											ReplayDBStmt *replayStmt);
++
+ bool
+ ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
+ 							ReplayDBStmt *replayStmt)
++{
++	if (!ld_store_output_batch_begin(catalog))
++	{
++		return false;
++	}
++
++	if (!ld_store_insert_replay_stmt_one(catalog, replayStmt))
++	{
++		ld_store_output_batch_rollback(catalog);
++		return false;
++	}
++
++	if (++catalog->batchCount >= REPLAY_BATCH_STATEMENTS)
++	{
++		return ld_store_output_batch_commit(catalog);
++	}
++
++	return true;
++}
++
++
++/*
++ * ld_store_replay_batch_end ends a transform pass: commits what it wrote, or
++ * rolls it back when the pass failed.
++ */
++bool
++ld_store_replay_batch_end(DatabaseCatalog *catalog, bool success)
++{
++	if (catalog == NULL || catalog->db == NULL)
++	{
++		return true;
++	}
++
++	if (!success)
++	{
++		ld_store_output_batch_rollback(catalog);
++		return true;
++	}
++
++	return ld_store_output_batch_commit(catalog);
++}
++
++
++/*
++ * ld_store_insert_replay_stmt inserts a replay statement in the stmt and
++ * replay tables of the replayDB.
++ */
++static bool
++ld_store_insert_replay_stmt_one(DatabaseCatalog *catalog,
++								ReplayDBStmt *replayStmt)
+ {
+ 	sqlite3 *db = catalog->db;
+ 
+diff --git a/src/bin/pgcopydb/ld_store.h b/src/bin/pgcopydb/ld_store.h
+index c807005..4cf82b8 100644
+--- a/src/bin/pgcopydb/ld_store.h
++++ b/src/bin/pgcopydb/ld_store.h
+@@ -101,6 +101,8 @@ bool ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
+ 									  LogicalMessageMetadata *metadata,
+ 									  PgoutputMessage *pgmsg);
+ 
++bool ld_store_output_batch_commit(DatabaseCatalog *catalog);
++
+ bool ld_store_insert_internal_message(DatabaseCatalog *catalog,
+ 									  InternalMessage *message);
+ 
+@@ -108,6 +110,7 @@ bool ld_store_delete_output_xid(DatabaseCatalog *catalog, uint32_t xid);
+ 
+ bool ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
+ 								 ReplayDBStmt *replayStmt);
++bool ld_store_replay_batch_end(DatabaseCatalog *catalog, bool success);
+ 
+ typedef bool (ReplayDBOutputIterFun)(StreamSpecs *specs,
+ 									 ReplayDBOutputMessage *output,
+diff --git a/src/bin/pgcopydb/ld_stream.c b/src/bin/pgcopydb/ld_stream.c
+index be90dee..352d097 100644
+--- a/src/bin/pgcopydb/ld_stream.c
++++ b/src/bin/pgcopydb/ld_stream.c
+@@ -1242,6 +1242,16 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
+ 			   LSN_FORMAT_ARGS(privateContext->endpos),
+ 			   replayDB);
+ 
++	/*
++	 * Upwell patch (upwell-8): what was received is visible to the
++	 * transform before it is told that receive is done.
++	 */
++	if (!ld_store_output_batch_commit(replayDB))
++	{
++		/* errors have already been logged */
++		return false;
++	}
++
+ 	if (time_to_abort &&
+ 		privateContext->endpos != InvalidXLogRecPtr &&
+ 		privateContext->endpos <= context->cur_record_lsn)
+diff --git a/src/bin/pgcopydb/ld_transform.c b/src/bin/pgcopydb/ld_transform.c
+index 5b2a662..f09290b 100644
+--- a/src/bin/pgcopydb/ld_transform.c
++++ b/src/bin/pgcopydb/ld_transform.c
+@@ -188,9 +188,16 @@ stream_transform_from_outputdb(StreamSpecs *specs, uint64_t previousLSN)
+ 	if (!ld_store_iter_output(specs, &stream_transform_cdc_file_hook))
+ 	{
+ 		/* errors have already been logged */
++		(void) ld_store_replay_batch_end(specs->replayDB, false);
+ 		return false;
+ 	}
+ 
++	/* Upwell patch (upwell-8): commit what this pass wrote to replay.db */
++	if (!ld_store_replay_batch_end(specs->replayDB, true))
++	{
++		/* errors have already been logged */
++		return false;
++	}
+ 
+ 	return true;
+ }
+diff --git a/src/bin/pgcopydb/schema.h b/src/bin/pgcopydb/schema.h
+index bfad231..4c7bd24 100644
+--- a/src/bin/pgcopydb/schema.h
++++ b/src/bin/pgcopydb/schema.h
+@@ -406,6 +406,10 @@ typedef struct DatabaseCatalog
+ 
+ 	Semaphore sema;
+ 	CachedStmt *stmtCache;      /* prepared-statement cache, keyed by SQL ptr */
++
++	/* Upwell patch (upwell-8): receive's open write transaction (output.db) */
++	bool batchOpen;
++	uint32_t batchCount;
+ } DatabaseCatalog;
+ 
+ 
