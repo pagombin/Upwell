@@ -637,6 +637,6 @@ After the change, receive often waits on the network: under this load it keeps u
 - the change files rotate every 4 MB;
 - the whole engine is killed with SIGKILL four times.
 
-The cutover ended GO with every row identical: 533,000 and 551,000 rows, three change files. The earlier safety tests (refused change, bounded queue, busy file, cutover restart at every step, heartbeat, overlap, large transactions, kill during apply) are being run again on this build (result below).
+The cutover ended GO with every row identical: 533,000 and 551,000 rows, three change files. The earlier safety tests (refused change, bounded queue, busy file, cutover restart at every step, heartbeat, overlap, large transactions, kill during apply) pass on this build, along with TOAST, data shapes, sequences, writers under both plugins, the pooler origin release, the idle-database test and Run again: 17 tests, 53 with subtests.
 
 **What is left.** Receive and the transform still share the `output.db` semaphore, and the transform holds it for a whole pass. In WAL mode SQLite lets one writer and readers work at once, so the semaphore is probably unnecessary for reading. But it is pgcopydb's own locking, so it is the next candidate, not part of this build.
