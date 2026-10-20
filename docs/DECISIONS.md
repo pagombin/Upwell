@@ -664,7 +664,7 @@ Fixes:
 - **Clean up** also drops the publication on the target.
 - **Verification**: `schema_objects` now compares non-default replica identities, so a difference is a NO-GO.
 
-`TestWorkloadReplicaIdentities` looped on the error under upwell.8. It ends GO under upwell.9, and the engine log shows "Skipping the engine's own publication". Results for the other shapes: wide, huge, keys and names passed on upwell.8 unchanged; many, twophase and types2 are still running (results below).
+`TestWorkloadReplicaIdentities` looped on the error under upwell.8. It ends GO under upwell.9, and the engine log shows "Skipping the engine's own publication". The other seven shapes passed on upwell.8 unchanged, both plugins: wide, huge, keys, names, many, twophase and types2.
 
 ## D113. An alert before the slot's WAL headroom runs out
 `alert_slot_headroom_hours_warn` (4 h) and `alert_slot_headroom_hours_crit` (1 h) were defined, but nothing read them. Upwell recorded the slot's `safe_wal_size` every tick, yet gave no warning before PostgreSQL invalidated the slot at `max_slot_wal_keep_size`. An invalidated slot means restarting that database from zero.
