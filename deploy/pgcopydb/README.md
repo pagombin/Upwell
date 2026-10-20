@@ -2,7 +2,7 @@
 
 `deploy/install.sh` builds pgcopydb from the `PGCOPYDB_TAG` tag with every
 `*.patch` here applied, as version `PGCOPYDB_BUILD` (for example
-`0.18+upwell.8`). Upwell refuses online migrations with any other build
+`0.18+upwell.9`). Upwell refuses online migrations with any other build
 (preflight check `engine_commit_order`, and again at each launch).
 
 | Patch | Why |
@@ -15,6 +15,7 @@
 | `0006-confirm-the-apply-pipeline-and-publish-only-durable-progress.patch` | The apply pipelined statements to the target and never read the answers: a refused change went unnoticed, the send buffer grew until libpq failed ("cannot allocate memory for output buffer"), and the sentinel's replay_lsn, which the source slot is confirmed to, advanced with what was only queued. It now syncs every 1,000 statements, 64 MB or 500 ms, stops on an error, and publishes only positions the target's replication origin has durably reached (D108). |
 | `0007-wait-for-busy-sqlite-files.patch` | The CDC files (shared by receive and apply) had no busy timeout, so a statement meeting the other process's write failed the engine at once ("database is locked"); they now wait up to two minutes. The source catalog keeps its semaphore and retries (D108). |
 | `0008-write-the-change-files-in-batches.patch` | The receive process committed every row of `output.db` on its own (about a dozen SQLite commits per changed row, under the shared semaphore), and the transform did the same in `replay.db`. Receive now commits at each transaction boundary or every 1,000 messages, the transform once per pass, and both files checkpoint every 64 MB. Nothing durable depends on these files: the slot is confirmed only to what the target committed durably (0006). It also reads `PGCOPYDB_MAX_REPLAYDB_SIZE`, used by the tests to rotate the files early (D111). |
+| `0009-leave-the-engine-publication-out-of-the-restore.patch` | pgcopydb creates its publication on the source before the schema dump, so the restore created it on the target, where it outlived the migration and made the target refuse UPDATE and DELETE on listed tables without a replica identity. The publication named in `PGCOPYDB_SKIP_PUBLICATION` (Upwell sets the slot name) is left out of the restore (D112). |
 
 ## Reproducing the loss
 

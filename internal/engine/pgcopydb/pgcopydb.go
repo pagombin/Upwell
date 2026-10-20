@@ -173,6 +173,10 @@ func (e *Engine) Plan(d engine.DatabaseSpec, resume bool) (engine.RunPlan, error
 	}
 	pass := filepath.Join(d.RunDir, "pgpass")
 	env := map[string]string{"PGPASSFILE": pass, "PGAPPNAME": "upwell-engine"}
+	if d.SlotName != "" {
+		// Patch 0009: the engine's own publication is not restored on the target.
+		env["PGCOPYDB_SKIP_PUBLICATION"] = d.SlotName
+	}
 	// No PGOPTIONS: a pooler such as PgBouncer refuses startup options, and
 	// pgcopydb already sets synchronous_commit, maintenance_work_mem and the
 	// timeouts with SET in its own sessions (copydb.c dstSettings).
@@ -464,13 +468,20 @@ func (e *Engine) Cleanup(ctx context.Context, d engine.DatabaseSpec, opts engine
 		done = append(done, "dropped origin "+d.OriginName)
 	}
 	dst.Close(ctx)
-	if opts.DropHeartbeat {
-		if t, err := pg.Connect(ctx, d.TargetConn.WithDB(d.Target), 30*time.Second); err == nil {
+	if t, err := pg.Connect(ctx, d.TargetConn.WithDB(d.Target), 30*time.Second); err == nil {
+		// D112: older builds restored the engine's publication on the target.
+		var had bool
+		if pg.QueryRow(ctx, t, `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, d.SlotName).Scan(&had) == nil && had {
+			if _, err := t.Exec(ctx, `DROP PUBLICATION IF EXISTS `+pg.QuoteIdent(d.SlotName)); err == nil {
+				done = append(done, "dropped publication "+d.SlotName+" on target")
+			}
+		}
+		if opts.DropHeartbeat {
 			if _, err := t.Exec(ctx, `DROP SCHEMA IF EXISTS upwell CASCADE`); err == nil {
 				done = append(done, "dropped heartbeat schema on target")
 			}
-			t.Close(ctx)
 		}
+		t.Close(ctx)
 	}
 	if opts.RemoveWorkDir {
 		os.RemoveAll(p.WorkDir)

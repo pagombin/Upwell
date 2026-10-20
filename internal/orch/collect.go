@@ -17,6 +17,7 @@ import (
 	"github.com/pagombin/upwell/internal/engine"
 	"github.com/pagombin/upwell/internal/pg"
 	"github.com/pagombin/upwell/internal/pgpack"
+	"github.com/pagombin/upwell/internal/settings"
 	"github.com/pagombin/upwell/internal/store"
 )
 
@@ -602,12 +603,48 @@ func (o *Orchestrator) StaleSamples(mig, side string) int {
 // ---------- alerts
 
 type alerter struct {
-	o       *Orchestrator
-	mu      sync.Mutex
-	backlog map[string][]int64
+	o        *Orchestrator
+	mu       sync.Mutex
+	backlog  map[string][]int64
+	headroom map[string][]headroomSample // D113: the slot's safe_wal_size over the last 15 minutes
 }
 
-func newAlerter(o *Orchestrator) *alerter { return &alerter{o: o, backlog: map[string][]int64{}} }
+func newAlerter(o *Orchestrator) *alerter {
+	return &alerter{o: o, backlog: map[string][]int64{}, headroom: map[string][]headroomSample{}}
+}
+
+// slotHeadroom raises an alert when the slot's WAL headroom shrinks fast
+// enough to run out within alert_slot_headroom_hours_warn (or _crit): the
+// source then invalidates the slot, and the database must restart from zero.
+func (a *alerter) slotHeadroom(ctx context.Context, m Migration, d Database, g settings.Values) {
+	hours, known := 0.0, false
+	// Whatever the database's state: a stopped or failed database's slot
+	// holds WAL too, and does not advance at all. A reading older than a
+	// minute (the slot is gone, or the source cannot be read) ends it.
+	v, at, ok := a.o.metrics.LastAt(m.ID, d.SourceName, "slot_headroom_bytes")
+	if ok && time.Since(at) <= time.Minute {
+		a.mu.Lock()
+		h := a.headroom[d.ID]
+		if len(h) == 0 || at.After(h[len(h)-1].at) {
+			h = append(h, headroomSample{at: at, bytes: v})
+		}
+		for len(h) > 1 && at.Sub(h[0].at) > 15*time.Minute {
+			h = h[1:]
+		}
+		a.headroom[d.ID] = h
+		a.mu.Unlock()
+		hours, known = headroomRunsOut(h)
+	} else {
+		a.mu.Lock()
+		delete(a.headroom, d.ID)
+		a.mu.Unlock()
+	}
+	crit, warn := g.Float("alert_slot_headroom_hours_crit"), g.Float("alert_slot_headroom_hours_warn")
+	msg := fmt.Sprintf("%s: the replication slot can hold %s more WAL, which at the current rate runs out in about %s. The source then invalidates the slot and this database must restart from zero. Pause or slow the writes, let the apply catch up, or raise max_slot_wal_keep_size on the source.",
+		d.SourceName, humanBytes(v), humanDuration(hours*3600))
+	a.cond(ctx, known && hours <= crit, m.ID, "slot_headroom_critical", d.SourceName, "critical", msg)
+	a.cond(ctx, known && hours > crit && hours <= warn, m.ID, "slot_headroom_warning", d.SourceName, "warning", msg)
+}
 
 // Alert is one alert.
 type Alert struct {
@@ -666,6 +703,7 @@ func (a *alerter) evaluate(ctx context.Context, m Migration, dbs []Database) {
 		ws, ok := a.o.metrics.Last(m.ID, d.SourceName, "slot_wal_status")
 		a.cond(ctx, d.ErrorClass == "slot_lost" || (ok && ws == 3), m.ID, "slot_invalidated", d.SourceName, "critical", d.SourceName+": the replication slot was invalidated")
 		a.cond(ctx, ok && ws == 2 && activeDB[d.State], m.ID, "slot_at_risk", d.SourceName, "critical", d.SourceName+": the slot's WAL is no longer reserved and may be removed")
+		a.slotHeadroom(ctx, m, d, g)
 		if d.BacklogBytes != nil && activeDB[d.State] && d.BaseCopyDone {
 			a.mu.Lock()
 			h := append(a.backlog[d.ID], *d.BacklogBytes)

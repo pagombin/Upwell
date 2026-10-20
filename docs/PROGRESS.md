@@ -28,6 +28,8 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | Idle database flapping out of sync beside a busy one | done (D109) | heartbeat lag counts; `TestIdleDatabaseStaysInSyncBesideBusyOne` |
 | upwell.6 apply regression | done (D110) | engine upwell.7: 510 applied transactions/s locally (upwell.5 462, upwell.6 75) |
 | CDC batching | done (D111) | engine upwell.8: 620 applied transactions/s against 385 (60 s load); `TestEngineKilledUnderLoadLosesNothing` |
+| Workload-shape bug bash | done (D112) | engine upwell.9: the engine publication is kept off the target and replica identities are copied; `TestWorkload*` (8 shapes, both plugins) |
+| Slot WAL headroom alert | done (D113) | `TestHeadroomRunsOut`, `TestSlotHeadroomAlert` |
 | One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios

@@ -871,6 +871,11 @@ func (o *Orchestrator) startAttempt(ctx context.Context, m Migration, d Database
 			o.Event(ctx, m.ID, d.SourceName, "origin_released", "warning", fmt.Sprintf("%s: the replication origin %s was still held on the target, probably by a server session a connection pooler kept from the previous engine; Upwell %s", d.SourceName, d.OriginName, strings.Join(did, "; ")), map[string]any{"steps": did})
 		}
 	}
+	// D112: a copy that finished under an older engine left its publication,
+	// and the default replica identity, on the target.
+	if d.BaseCopyDone {
+		o.tidyTarget(ctx, m, d, spec)
+	}
 	if err := os.MkdirAll(plan.RunDir, 0o750); err != nil {
 		return err
 	}

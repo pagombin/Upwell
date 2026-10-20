@@ -1369,7 +1369,7 @@ var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
 
 // EngineBuildRequired is the pgcopydb build deploy/install.sh makes: the
 // v0.18 tag with the patches in deploy/pgcopydb.
-const EngineBuildRequired = "0.18+upwell.8"
+const EngineBuildRequired = "0.18+upwell.9"
 
 var enginePatchRe = regexp.MustCompile(`\+upwell\.(\d+)`)
 

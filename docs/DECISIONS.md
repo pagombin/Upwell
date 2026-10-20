@@ -640,3 +640,37 @@ After the change, receive often waits on the network: under this load it keeps u
 The cutover ended GO with every row identical: 533,000 and 551,000 rows, three change files. The earlier safety tests (refused change, bounded queue, busy file, cutover restart at every step, heartbeat, overlap, large transactions, kill during apply) pass on this build, along with TOAST, data shapes, sequences, writers under both plugins, the pooler origin release, the idle-database test and Run again: 17 tests, 53 with subtests.
 
 **What is left.** Receive and the transform still share the `output.db` semaphore, and the transform holds it for a whole pass. In WAL mode SQLite lets one writer and readers work at once, so the semaphore is probably unnecessary for reading. But it is pgcopydb's own locking, so it is the next candidate, not part of this build.
+
+## D112. Workload shapes beyond TPC-C; the engine's publication stays off the target, and replica identities are copied (build 0.18+upwell.9)
+A bug bash over workload shapes unlike TPC-C, in `test/integration/workloads_test.go`. Each scenario changes the source while the database streams, under both plugins, and must end GO with every table identical. The comparison now covers every user schema, not only `public`. The shapes:
+- **wide**: 250 columns; merged INSERTs of 262 rows, the 65,535-parameter limit.
+- **huge**: values of 38 MB of text, 10 MB of bytea and a 100,000-element jsonb array.
+- **keys**: primary keys changing, simple and composite; a table made only of its key; a deferred unique constraint swapped in one transaction; one key deleted and inserted again; a row updated 1,000 times in one transaction; savepoints rolled back.
+- **names**: spaces, capitals, a double quote, reserved words, non-Latin names, a second schema.
+- **identity**: REPLICA IDENTITY FULL over rows with NULLs; USING INDEX, with its key updated.
+- **many**: 200 tables written in interleaved transactions, plus ON DELETE and ON UPDATE CASCADE.
+- **twophase**: PREPARE TRANSACTION, then COMMIT PREPARED and ROLLBACK PREPARED.
+- **types2**: interval, money, bit varying, uuid, inet and cidr, macaddr, ranges and multiranges, composite types and arrays of them, domains, tsvector, point, xml, json, numeric(40,10), char and varchar.
+
+**Found: REPLICA IDENTITY USING INDEX was lost, and the engine's own publication was restored on the target.** pgcopydb creates its publication on the source before it takes the schema dump, so the restore created it on the target too. pgcopydb also builds the indexes itself and leaves out pg_dump's index entries, which carry `ALTER TABLE … REPLICA IDENTITY USING INDEX`. On the target, `by_index` therefore had the default identity, and no primary key, while being listed in a publication. PostgreSQL refuses an UPDATE there: "cannot update table "by_index" because it does not have a replica identity and publishes updates".
+
+Since upwell.6 the apply stops on that error (D108) and retries, so nothing was skipped. Before upwell.6 the change would have been dropped silently. The same would happen with any publication of the customer's own on such a table, and the leftover publication outlived the migration on the customer's new primary.
+
+Fixes:
+- **Patch `0009-leave-the-engine-publication-out-of-the-restore.patch`**: the engine skips the publication named in `PGCOPYDB_SKIP_PUBLICATION`, both the PUBLICATION entry and its PUBLICATION TABLE entries. Upwell sets that variable to the slot name. The source's other publications are restored as before.
+- **Upwell (`tidyTarget`)**, when the base copy finishes and again before every launch:
+  - drops that publication from the target, which fixes copies made by older builds;
+  - gives every target table the source's replica identity where it is not the default (`pgpack.CopyReplicaIdentities`), with event `target_tidied`.
+- **Clean up** also drops the publication on the target.
+- **Verification**: `schema_objects` now compares non-default replica identities, so a difference is a NO-GO.
+
+`TestWorkloadReplicaIdentities` looped on the error under upwell.8. It ends GO under upwell.9, and the engine log shows "Skipping the engine's own publication". Results for the other shapes: wide, huge, keys and names passed on upwell.8 unchanged; many, twophase and types2 are still running (results below).
+
+## D113. An alert before the slot's WAL headroom runs out
+`alert_slot_headroom_hours_warn` (4 h) and `alert_slot_headroom_hours_crit` (1 h) were defined, but nothing read them. Upwell recorded the slot's `safe_wal_size` every tick, yet gave no warning before PostgreSQL invalidated the slot at `max_slot_wal_keep_size`. An invalidated slot means restarting that database from zero.
+
+The alerter now keeps 15 minutes of headroom readings per database, whatever the database's state: a stopped database's slot does not advance at all. From readings at least two minutes apart it estimates when the headroom reaches zero, and only while it shrinks (`headroomRunsOut`). It raises `slot_headroom_warning` within 4 hours and `slot_headroom_critical` within 1 hour. The message gives the headroom left, the estimate and the remedies (pause the writes, let the apply catch up, raise `max_slot_wal_keep_size`).
+
+Tests:
+- `TestHeadroomRunsOut` (unit): shrinking, steady, growing, too short a window, one sample.
+- `TestSlotHeadroomAlert` stops a database and writes a few MB of WAL a second against the local 1 GB cap. The critical alert fired with 575 MiB left, about 2½ minutes before the slot would have been lost, and cleared once the database streamed again.

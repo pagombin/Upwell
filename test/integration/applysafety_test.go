@@ -396,3 +396,35 @@ func TestEngineKilledUnderLoadLosesNothing(t *testing.T) {
 			}
 		}})
 }
+
+// D113: Upwell recorded the slot's WAL headroom (safe_wal_size) but never
+// warned before it ran out, although an invalidated slot means restarting the
+// database from zero. Here the database is stopped, so its slot does not
+// advance, while the source writes a few MB of WAL a second against the local
+// 1 GB max_slot_wal_keep_size. The critical headroom alert must fire well
+// before the slot is lost, and clear once the database streams again.
+func TestSlotHeadroomAlert(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_headroom")
+	id := streamingMigration(t, e, "Slot headroom", db)
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/stop", nil, nil, 200)
+	e.waitDBState(id, db, 2*time.Minute, orch.DStopped)
+	stop := background(t, db, 200*time.Millisecond, func(ctx context.Context, c *pgx.Conn, i int) error {
+		_, err := c.Exec(ctx, `INSERT INTO orders(customer, amount, note) SELECT g, g, repeat(md5(g::text), 8) FROM generate_series(1, 2000) g`)
+		return err
+	})
+	var a *orch.Alert
+	e.waitFor(6*time.Minute, "the slot headroom alert", func() bool {
+		a = e.firing("slot_headroom_critical", db)
+		return a != nil
+	})
+	stop()
+	t.Logf("%s: %s", a.Severity, a.Message)
+	if st := q(t, srcConn, db, `SELECT wal_status FROM pg_replication_slots WHERE slot_name = '`+e.db(id, db).SlotName+`'`); st == "lost" {
+		t.Fatal("the slot was lost before the alert fired")
+	}
+	e.do("POST", "/api/v1/migrations/"+id+"/databases/"+db+"/resume", nil, nil, 200)
+	e.waitDBState(id, db, 5*time.Minute, orch.DInSync)
+	e.waitFor(5*time.Minute, "the alert to resolve", func() bool { return e.firing("slot_headroom_critical", db) == nil })
+	e.abortAndClean(id, "Slot headroom")
+}

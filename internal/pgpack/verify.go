@@ -108,6 +108,9 @@ func schemaObjects(ctx context.Context, c *pgx.Conn) (map[string]map[string]bool
 			FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid JOIN pg_namespace n ON n.oid=t.typnamespace WHERE ` + userNS + ` GROUP BY n.nspname, t.typname`,
 		"function": `SELECT format('%I.%I', n.nspname, p.proname)||'('||pg_get_function_identity_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
 			WHERE ` + userNS + ` AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=p.oid AND d.deptype='e')`,
+		// D112: a replica identity other than the default (USING INDEX was
+		// lost on the way, because pgcopydb builds indexes itself).
+		"replica_identity": replicaIdentitySQL,
 	}
 	out := map[string]map[string]bool{}
 	for kind, q := range queries {
@@ -122,6 +125,78 @@ func schemaObjects(ctx context.Context, c *pgx.Conn) (map[string]map[string]bool
 		out[kind] = m
 	}
 	return out, nil
+}
+
+// replicaIdentitySQL lists the tables whose replica identity is not the
+// default: "schema.table f", "schema.table n" or "schema.table i index".
+const replicaIdentitySQL = `SELECT format('%I.%I', n.nspname, c.relname)||' '||c.relreplident::text||
+		COALESCE(' '||(SELECT format('%I', ic.relname) FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid WHERE i.indrelid=c.oid AND i.indisreplident), '')
+	FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+	WHERE n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
+		AND c.relkind IN ('r','p') AND c.relreplident <> 'd'`
+
+// CopyReplicaIdentities gives each target table the source's replica
+// identity where it is not the default (D112). pgcopydb builds the indexes
+// itself and leaves out pg_dump's "REPLICA IDENTITY USING INDEX", so those
+// tables kept the default on the target. It returns what it changed.
+func CopyReplicaIdentities(ctx context.Context, src, dst *pgx.Conn) ([]string, error) {
+	const q = `SELECT format('%I.%I', n.nspname, c.relname), c.relreplident::text,
+			COALESCE((SELECT format('%I', ic.relname) FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid WHERE i.indrelid=c.oid AND i.indisreplident), '')
+		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		WHERE n.nspname NOT IN ('pg_catalog','information_schema','upwell') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
+			AND c.relkind IN ('r','p') AND c.relreplident <> 'd'`
+	type ident struct{ table, kind, index string }
+	read := func(c *pgx.Conn) ([]ident, error) {
+		rows, err := pg.Query(ctx, c, q)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []ident
+		for rows.Next() {
+			var x ident
+			if err := rows.Scan(&x.table, &x.kind, &x.index); err != nil {
+				return nil, err
+			}
+			out = append(out, x)
+		}
+		return out, rows.Err()
+	}
+	want, err := read(src)
+	if err != nil {
+		return nil, fmt.Errorf("listing the source's replica identities: %w", err)
+	}
+	have, err := read(dst)
+	if err != nil {
+		return nil, fmt.Errorf("listing the target's replica identities: %w", err)
+	}
+	got := map[ident]bool{}
+	for _, h := range have {
+		got[h] = true
+	}
+	var done []string
+	for _, w := range want {
+		if got[w] {
+			continue
+		}
+		var clause string
+		switch {
+		case w.kind == "f":
+			clause = "FULL"
+		case w.kind == "n":
+			clause = "NOTHING"
+		case w.kind == "i" && w.index != "":
+			clause = "USING INDEX " + w.index
+		default:
+			continue
+		}
+		// The names come from format('%I'), quoted as needed.
+		if _, err := dst.Exec(ctx, "ALTER TABLE "+w.table+" REPLICA IDENTITY "+clause); err != nil {
+			return done, fmt.Errorf("setting the replica identity of %s on the target: %w", w.table, err)
+		}
+		done = append(done, w.table+" "+clause)
+	}
+	return done, nil
 }
 
 // prepareVerifySession fixes everything that changes a row's text form or
@@ -281,7 +356,7 @@ func Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) {
 	} else {
 		var objMissing []string
 		counts := map[string]int{}
-		for _, kind := range []string{"index", "constraint", "trigger", "view", "function", "partition", "enum"} {
+		for _, kind := range []string{"index", "constraint", "trigger", "view", "function", "partition", "enum", "replica_identity"} {
 			counts[kind] = len(so[kind])
 			for v := range so[kind] {
 				if !do[kind][v] {

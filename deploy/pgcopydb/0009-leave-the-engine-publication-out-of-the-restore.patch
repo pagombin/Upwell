@@ -1,0 +1,64 @@
+diff --git a/src/bin/pgcopydb/dump_restore.c b/src/bin/pgcopydb/dump_restore.c
+index aedb3d5..a711a2d 100644
+--- a/src/bin/pgcopydb/dump_restore.c
++++ b/src/bin/pgcopydb/dump_restore.c
+@@ -797,6 +797,45 @@ copydb_write_schemas_restore_list(CopyDataSpec *specs)
+ }
+ 
+ 
++/*
++ * Upwell patch (upwell-9): pgcopydb creates its own publication on the source
++ * before taking the schema dump, so the dump carried it to the target. There
++ * it is useless, outlives the migration, and makes the target refuse UPDATE
++ * and DELETE on any listed table without a usable replica identity ("cannot
++ * update table ... because it does not have a replica identity and publishes
++ * updates"). PGCOPYDB_SKIP_PUBLICATION names that publication; its entries
++ * are left out of the restore. The source's other publications are restored
++ * as before.
++ */
++static bool
++upwell_is_engine_publication(ArchiveContentItem *item)
++{
++	if (item->desc != ARCHIVE_TAG_PUBLICATION &&
++		item->desc != ARCHIVE_TAG_PUBLICATION_TABLE &&
++		item->desc != ARCHIVE_TAG_PUBLICATION_TABLES_IN_SCHEMA)
++	{
++		return false;
++	}
++
++	char *pub = getenv("PGCOPYDB_SKIP_PUBLICATION");
++
++	if (pub == NULL || *pub == '\0' || item->restoreListName == NULL)
++	{
++		return false;
++	}
++
++	/* "- <name> <owner>", or "<schema> <name> <table> <owner>" */
++	char list[BUFSIZE] = { 0 };
++	strlcpy(list, item->restoreListName, sizeof(list));
++
++	char *save = NULL;
++	char *first = strtok_r(list, " ", &save);
++	char *second = first != NULL ? strtok_r(NULL, " ", &save) : NULL;
++
++	return second != NULL && strcmp(second, pub) == 0;
++}
++
++
+ /*
+  * copydb_write_restore_list_hook is an iterator callback function.
+  */
+@@ -822,6 +861,13 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
+ 		log_debug("Skipping DATABASE \"%s\"", name);
+ 	}
+ 
++	/* Upwell patch (upwell-9) */
++	if (!skip && upwell_is_engine_publication(item))
++	{
++		skip = true;
++		log_info("Skipping the engine's own publication: %s", name);
++	}
++
+ 	/*
+ 	 * In schemas-only mode (first pass when --requirements is used), skip all
+ 	 * non-SCHEMA archive entries so that only CREATE SCHEMA statements reach
