@@ -347,7 +347,8 @@ func TestIdleDatabaseStaysInSyncBesideBusyOne(t *testing.T) {
 // checkpoint less often. None of these files is the durable record, so an
 // engine killed with a batch open must lose nothing. Here three writers mix
 // inserts, updates and deletes in small transactions, plus transactions
-// larger than one batch, while the change files rotate every 4 MB and the
+// larger than one batch (half of them COPYs, D114), while the change files
+// rotate every 4 MB and the
 // whole engine is killed four times. The cutover must end GO with every row
 // identical, under both plugins.
 func TestEngineKilledUnderLoadLosesNothing(t *testing.T) {
@@ -361,8 +362,16 @@ func TestEngineKilledUnderLoadLosesNothing(t *testing.T) {
 				k := k
 				stops = append(stops, background(t, db, 20*time.Millisecond, func(ctx context.Context, c *pgx.Conn, i int) error {
 					base := int64(1000000*(k+1) + i*10)
-					if i%50 == 49 { // larger than one batch of the change files
+					if i%100 == 49 { // larger than one batch of the change files
 						_, err := c.Exec(ctx, `INSERT INTO w SELECT g, 1, repeat('x', 200) FROM generate_series($1::bigint, $1::bigint + 2999) g`, base*10)
+						return err
+					}
+					if i%100 == 99 { // the same as a COPY: rows that share an LSN, sent again after a kill
+						rows := make([][]any, 3000)
+						for j := range rows {
+							rows[j] = []any{base*10 + int64(j), 2, "copied"}
+						}
+						_, err := c.CopyFrom(ctx, pgx.Identifier{"w"}, []string{"id", "v", "note"}, pgx.CopyFromRows(rows))
 						return err
 					}
 					_, err := c.Exec(ctx, `BEGIN;
@@ -388,6 +397,49 @@ func TestEngineKilledUnderLoadLosesNothing(t *testing.T) {
 			}
 			files, _ := filepath.Glob(filepath.Join(e.Cfg.RunsDir(), "*"+db+"*", "clone", "cdc", "*-output.db"))
 			t.Logf("%d change file(s) after the kills", len(files))
+			return func() {
+				for _, s := range stops {
+					s()
+				}
+				e.waitDBState(id, db, 10*time.Minute, orch.DInSync)
+			}
+		}})
+}
+
+// D114: when the receive rotates the change file, the transaction whose
+// COMMIT ended the file was skipped if the apply's last pass over the file
+// ran just before that COMMIT was stored: the apply saw the file closed,
+// moved to the next one, and the next file's positions passed the commit.
+// The receive stores up to 1,000 messages at a time, so the window is a
+// whole batch wide. Here the files rotate every megabyte (the default is
+// 1 GB) under three writers, with no failures at all, and every row must
+// arrive. PGCOPYDB_TEST_ADVANCE_DELAY_MS widens the window so the race is
+// not left to chance: with it, upwell.10 lost whole transactions here.
+func TestRotationKeepsEveryTransaction(t *testing.T) {
+	t.Setenv("PGCOPYDB_MAX_REPLAYDB_SIZE", "1MB")
+	t.Setenv("PGCOPYDB_TEST_ADVANCE_DELAY_MS", "50")
+	forPlugins(t, scenario{name: "rotate", wantGO: true,
+		schema: `CREATE TABLE w(id bigint PRIMARY KEY, v int NOT NULL, note text);
+			INSERT INTO w SELECT g, 0, md5(g::text) FROM generate_series(1, 20000) g;`,
+		streaming: func(t *testing.T, e *Env, id, db string) func() {
+			var stops []func()
+			for k := 0; k < 3; k++ {
+				k := k
+				stops = append(stops, background(t, db, 10*time.Millisecond, func(ctx context.Context, c *pgx.Conn, i int) error {
+					base := int64(1000000*(k+1) + i*10)
+					if i%5 == 4 {
+						_, err := c.Exec(ctx, `INSERT INTO w SELECT g, 1, repeat('x', 200) FROM generate_series($1::bigint, $1::bigint + 1499) g`, base*10)
+						return err
+					}
+					_, err := c.Exec(ctx, `BEGIN;
+						INSERT INTO w VALUES ($1, 1, 'new'), ($1 + 1, 1, 'new'), ($1 + 2, 1, 'new');
+						UPDATE w SET v = v + 1, note = md5(random()::text) WHERE id = (1 + ($1 % 20000));
+						DELETE FROM w WHERE id = (1 + (($1 * 7) % 20000));
+						COMMIT`, base)
+					return err
+				}))
+			}
+			time.Sleep(40 * time.Second)
 			return func() {
 				for _, s := range stops {
 					s()

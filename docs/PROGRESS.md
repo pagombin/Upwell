@@ -30,6 +30,7 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | CDC batching | done (D111) | engine upwell.8: 620 applied transactions/s against 385 (60 s load); `TestEngineKilledUnderLoadLosesNothing` |
 | Workload-shape bug bash | done (D112) | engine upwell.9: the engine publication is kept off the target and replica identities are copied; `TestWorkload*` (8 shapes, both plugins) |
 | Slot WAL headroom alert | done (D113) | `TestHeadroomRunsOut`, `TestSlotHeadroomAlert` |
+| COPY rows and rotation losses | done (D114) | engine upwell.11; `TestWorkloadBulkCopy`, `TestRotationKeepsEveryTransaction`, kill test with COPYs |
 | One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios

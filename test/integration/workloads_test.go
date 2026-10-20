@@ -3,9 +3,15 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/pagombin/upwell/internal/pg"
 )
 
 // D112, workload shapes far from TPC-C. Each scenario changes the source
@@ -39,7 +45,7 @@ func TestWorkloadHugeValues(t *testing.T) {
 		schema: `CREATE TABLE blobs(id int PRIMARY KEY, t text, b bytea, j jsonb);
 			INSERT INTO blobs VALUES (1, 'small', '\x00', '{}');`,
 		streaming: func(t *testing.T, e *Env, id, db string) func() {
-			exec1(t, srcConn, db, `INSERT INTO blobs SELECT 2, string_agg(md5(g::text), '') , NULL, NULL FROM generate_series(1, 1200000) g`) // about 38 MB of text
+			exec1(t, srcConn, db, `INSERT INTO blobs SELECT 2, string_agg(md5(g::text), '') , NULL, NULL FROM generate_series(1, 1200000) g`)              // about 38 MB of text
 			exec1(t, srcConn, db, `INSERT INTO blobs SELECT 3, NULL, decode(string_agg(md5(g::text), ''), 'hex'), NULL FROM generate_series(1, 600000) g`) // about 10 MB of bytea
 			exec1(t, srcConn, db, `INSERT INTO blobs SELECT 4, NULL, NULL, jsonb_agg(jsonb_build_object('k', g, 'v', md5(g::text))) FROM generate_series(1, 100000) g`)
 			exec1(t, srcConn, db, `UPDATE blobs SET t = t || 'tail' WHERE id = 2; UPDATE blobs SET b = NULL WHERE id = 3; DELETE FROM blobs WHERE id = 1`)
@@ -178,6 +184,73 @@ func TestWorkloadMoreTypes(t *testing.T) {
 				(3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 				UPDATE t2 SET iv = iv * 2, m = m + '1', bv = bv || B'1', r = '[5,6]', mr = mr + '{[20,30)}', p = ROW(9, 'z'), ts = 'rat sat', js = '[]' WHERE id = 1;
 				DELETE FROM t2 WHERE id = 3;`)
+			return nil
+		}})
+}
+
+// Bulk loads with COPY while streaming. PostgreSQL writes the rows of one
+// COPY into a single WAL record per page of rows, so every row decoded
+// from it carries the same LSN: rows that share an LSN must all arrive.
+// A table with a key, one without (replica identity FULL), and a
+// partitioned one; then the loaded rows change.
+func TestWorkloadBulkCopy(t *testing.T) {
+	forPlugins(t, scenario{name: "copy", wantGO: true,
+		schema: `CREATE TABLE loaded(id int PRIMARY KEY, v text, n bigint);
+			CREATE TABLE nokey(a int, b text); ALTER TABLE nokey REPLICA IDENTITY FULL;
+			CREATE TABLE parts(id int, d date, v text, PRIMARY KEY (id, d)) PARTITION BY RANGE (d);
+			CREATE TABLE parts_a PARTITION OF parts FOR VALUES FROM ('2026-01-01') TO ('2026-07-01');
+			CREATE TABLE parts_b PARTITION OF parts FOR VALUES FROM ('2026-07-01') TO ('2027-01-01');
+			INSERT INTO loaded VALUES (0, 'seed', 0);`,
+		streaming: func(t *testing.T, e *Env, id, db string) func() {
+			ctx := context.Background()
+			c, err := pg.Connect(ctx, srcConn.WithDB(db), time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close(ctx)
+			copyRows := func(table string, cols []string, n int, row func(i int) []any) {
+				rows := make([][]any, n)
+				for i := range rows {
+					rows[i] = row(i)
+				}
+				if got, err := c.CopyFrom(ctx, pgx.Identifier{table}, cols, pgx.CopyFromRows(rows)); err != nil || got != int64(n) {
+					t.Fatalf("COPY %s: %d rows, %v", table, got, err)
+				}
+			}
+			copyRows("loaded", []string{"id", "v", "n"}, 20000, func(i int) []any { return []any{i + 1, fmt.Sprintf("row %d", i+1), int64(i) * 7} })
+			copyRows("nokey", []string{"a", "b"}, 5000, func(i int) []any { return []any{i % 50, fmt.Sprintf("dup %d", i%50)} })
+			day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			copyRows("parts", []string{"id", "d", "v"}, 8000, func(i int) []any { return []any{i, day.AddDate(0, 0, i%365), "p"} })
+			// Several COPYs in one transaction, and one that is rolled back.
+			tx, err := c.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for k := 0; k < 3; k++ {
+				rows := make([][]any, 3000)
+				for i := range rows {
+					rows[i] = []any{100000 + k*3000 + i, "tx", int64(k)}
+				}
+				if _, err := tx.CopyFrom(ctx, pgx.Identifier{"loaded"}, []string{"id", "v", "n"}, pgx.CopyFromRows(rows)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			tx, err = c.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.CopyFrom(ctx, pgx.Identifier{"loaded"}, []string{"id", "v", "n"}, pgx.CopyFromRows([][]any{{900001, "gone", int64(1)}, {900002, "gone", int64(2)}})); err != nil {
+				t.Fatal(err)
+			}
+			_ = tx.Rollback(ctx)
+			exec1(t, srcConn, db, `UPDATE loaded SET n = -n WHERE id % 3 = 0;
+				DELETE FROM loaded WHERE id % 10 = 0;
+				UPDATE nokey SET b = b || '!' WHERE a = 7;
+				DELETE FROM nokey WHERE a = 8;
+				UPDATE parts SET d = d + 200 WHERE id % 13 = 0 AND d < '2026-06-01';`)
 			return nil
 		}})
 }

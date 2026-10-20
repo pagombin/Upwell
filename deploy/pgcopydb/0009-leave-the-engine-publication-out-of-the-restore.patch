@@ -1,8 +1,8 @@
 diff --git a/src/bin/pgcopydb/dump_restore.c b/src/bin/pgcopydb/dump_restore.c
-index aedb3d5..a711a2d 100644
+index aedb3d5..876262f 100644
 --- a/src/bin/pgcopydb/dump_restore.c
 +++ b/src/bin/pgcopydb/dump_restore.c
-@@ -797,6 +797,45 @@ copydb_write_schemas_restore_list(CopyDataSpec *specs)
+@@ -797,6 +797,48 @@ copydb_write_schemas_restore_list(CopyDataSpec *specs)
  }
  
  
@@ -33,22 +33,25 @@ index aedb3d5..a711a2d 100644
 +		return false;
 +	}
 +
-+	/* "- <name> <owner>", or "<schema> <name> <table> <owner>" */
++	/*
++	 * "- <name> <owner>", or "<schema> <name> <table> <owner>". Schema and
++	 * table names are not quoted there and may contain spaces, so look for
++	 * the publication name as a whole word anywhere in the entry.
++	 */
 +	char list[BUFSIZE] = { 0 };
-+	strlcpy(list, item->restoreListName, sizeof(list));
++	char word[BUFSIZE] = { 0 };
 +
-+	char *save = NULL;
-+	char *first = strtok_r(list, " ", &save);
-+	char *second = first != NULL ? strtok_r(NULL, " ", &save) : NULL;
++	sformat(list, sizeof(list), " %s ", item->restoreListName);
++	sformat(word, sizeof(word), " %s ", pub);
 +
-+	return second != NULL && strcmp(second, pub) == 0;
++	return strstr(list, word) != NULL;
 +}
 +
 +
  /*
   * copydb_write_restore_list_hook is an iterator callback function.
   */
-@@ -822,6 +861,13 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
+@@ -822,6 +864,13 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
  		log_debug("Skipping DATABASE \"%s\"", name);
  	}
  

@@ -1,0 +1,164 @@
+diff --git a/src/bin/pgcopydb/catalog.c b/src/bin/pgcopydb/catalog.c
+index cc2034b..7aeec67 100644
+--- a/src/bin/pgcopydb/catalog.c
++++ b/src/bin/pgcopydb/catalog.c
+@@ -615,9 +615,11 @@ static char *outputDBcreateDDLs[] = {
+ 	"  id integer primary key, "
+ 	"  action text, xid integer, lsn integer, timestamp text, "
+ 	"  message text, "
+-	"  nspname text, relname text, old_type text)",
++	"  nspname text, relname text, old_type text, "
++	"  seq integer not null default 0)",
+ 
+-	"create unique index o_a_lsn on output(action, lsn)",
++	/* Upwell patch (upwell-11): see ld_store_output_seq */
++	"create unique index o_a_lsn_seq on output(action, lsn, seq)",
+ 	"create index o_a_xid on output(action, xid)",
+ 	"create index o_xid on output(xid)",
+ 
+@@ -1615,6 +1617,51 @@ catalog_init(DatabaseCatalog *catalog)
+ 	 */
+ 	if (!createSchema && catalog->type == DATABASE_CATALOG_TYPE_OUTPUT)
+ 	{
++		/*
++		 * Upwell patch (upwell-11): a file made by an older build is keyed
++		 * on (action, lsn), which keeps one of the rows that share an LSN.
++		 * Give it the seq column and the (action, lsn, seq) key. The two
++		 * processes may open the file at once: the check and the change
++		 * are one write transaction.
++		 */
++		if (!catalog_execute(catalog, "BEGIN IMMEDIATE"))
++		{
++			/* errors have already been logged */
++			sqlite3_close(catalog->db);
++			catalog->db = NULL;
++			return false;
++		}
++
++		int hasSeq = 0;
++		sqlite3_stmt *seqStmt = NULL;
++
++		if (sqlite3_prepare_v2(catalog->db,
++							   "select count(*) from pragma_table_info('output') "
++							   " where name = 'seq'",
++							   -1, &seqStmt, NULL) == SQLITE_OK &&
++			sqlite3_step(seqStmt) == SQLITE_ROW)
++		{
++			hasSeq = sqlite3_column_int(seqStmt, 0);
++		}
++		(void) sqlite3_finalize(seqStmt);
++
++		if ((!hasSeq &&
++			 (!catalog_execute(catalog,
++							   "alter table output "
++							   "add column seq integer not null default 0") ||
++			  !catalog_execute(catalog, "drop index if exists o_a_lsn") ||
++			  !catalog_execute(catalog,
++							   "create unique index o_a_lsn_seq "
++							   "on output(action, lsn, seq)"))) ||
++			!catalog_execute(catalog, "COMMIT"))
++		{
++			/* errors have already been logged */
++			(void) catalog_execute(catalog, "ROLLBACK");
++			sqlite3_close(catalog->db);
++			catalog->db = NULL;
++			return false;
++		}
++
+ 		if (!catalog_execute(catalog,
+ 							 "create index if not exists o_xid on output(xid)"))
+ 		{
+diff --git a/src/bin/pgcopydb/ld_store.c b/src/bin/pgcopydb/ld_store.c
+index daeffd7..9b3772b 100644
+--- a/src/bin/pgcopydb/ld_store.c
++++ b/src/bin/pgcopydb/ld_store.c
+@@ -1689,6 +1689,29 @@ static bool ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
+ static bool ld_store_insert_internal_message_one(DatabaseCatalog *catalog,
+ 												 InternalMessage *message);
+ 
++/*
++ * Upwell patch (upwell-11): ld_store_output_seq numbers the messages of one
++ * action that share an LSN. A COPY writes the rows of a page in one WAL
++ * record, so every row decoded from it carries the record's LSN, and the
++ * output table, keyed on (action, lsn) with INSERT OR REPLACE, kept only
++ * the last of them: a COPY of 20,000 rows arrived as 172. The key is now
++ * (action, lsn, seq). After a restart the slot sends whole transactions
++ * again, in the same order, so a message sent again gets the same seq and
++ * still replaces its first copy.
++ */
++static int64_t
++ld_store_output_seq(DatabaseCatalog *catalog, LogicalMessageMetadata *metadata)
++{
++	if (metadata->lsn != catalog->seqLSN)
++	{
++		catalog->seqLSN = metadata->lsn;
++		memset(catalog->seqCount, 0, sizeof(catalog->seqCount));
++	}
++
++	return catalog->seqCount[metadata->action & 0x7f]++;
++}
++
++
+ static bool
+ ld_store_output_batch_begin(DatabaseCatalog *catalog)
+ {
+@@ -1840,8 +1863,8 @@ ld_store_insert_message_one(DatabaseCatalog *catalog,
+ 	}
+ 
+ 	char *sql =
+-		"insert or replace into output(action, xid, lsn, timestamp, message)"
+-		"values($1, $2, $3, $4, $5) ";
++		"insert or replace into output(action, xid, lsn, timestamp, message, seq)"
++		"values($1, $2, $3, $4, $5, $6) ";
+ 
+ 	if (!semaphore_lock(&(catalog->sema)))
+ 	{
+@@ -1876,7 +1899,8 @@ ld_store_insert_message_one(DatabaseCatalog *catalog,
+ 		{ xidParamType, "xid", metadata->xid, NULL },
+ 		{ BIND_PARAMETER_TYPE_INT64, "lsn", metadata->lsn, NULL },
+ 		{ BIND_PARAMETER_TYPE_TEXT, "timestamp", 0, metadata->timestamp },
+-		{ BIND_PARAMETER_TYPE_TEXT, "message", 0, metadata->jsonBuffer }
++		{ BIND_PARAMETER_TYPE_TEXT, "message", 0, metadata->jsonBuffer },
++		{ BIND_PARAMETER_TYPE_INT64, "seq", ld_store_output_seq(catalog, metadata), NULL }
+ 	};
+ 
+ 	int count = sizeof(params) / sizeof(params[0]);
+@@ -1930,8 +1954,8 @@ ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
+ 	/* --- INSERT into output --- */
+ 	char *output_sql =
+ 		"insert or replace into output"
+-		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type)"
+-		"  values($1, $2, $3, $4, NULL, $5, $6, $7)";
++		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type, seq)"
++		"  values($1, $2, $3, $4, NULL, $5, $6, $7, $8)";
+ 
+ 	SQLiteQuery oq = { 0 };
+ 	if (!catalog_sql_prepare(db, output_sql, &oq))
+@@ -1956,7 +1980,8 @@ ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
+ 		{
+ 			pgmsg->oldType != 0 ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
+ 			"old_type", 0, pgmsg->oldType != 0 ? old_type_str : NULL
+-		}
++		},
++		{ BIND_PARAMETER_TYPE_INT64, "seq", ld_store_output_seq(catalog, metadata), NULL }
+ 	};
+ 
+ 	if (!catalog_sql_bind(&oq, oparams, lengthof(oparams)))
+diff --git a/src/bin/pgcopydb/schema.h b/src/bin/pgcopydb/schema.h
+index 4c7bd24..71fb6da 100644
+--- a/src/bin/pgcopydb/schema.h
++++ b/src/bin/pgcopydb/schema.h
+@@ -410,6 +410,13 @@ typedef struct DatabaseCatalog
+ 	/* Upwell patch (upwell-8): receive's open write transaction (output.db) */
+ 	bool batchOpen;
+ 	uint32_t batchCount;
++
++	/*
++	 * Upwell patch (upwell-11): how many messages of each action receive
++	 * stored at seqLSN, the LSN of the last message it stored (output.db).
++	 */
++	uint64_t seqLSN;
++	uint32_t seqCount[128];
+ } DatabaseCatalog;
+ 
+ 

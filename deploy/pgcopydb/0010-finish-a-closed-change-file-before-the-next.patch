@@ -1,0 +1,130 @@
+diff --git a/src/bin/pgcopydb/ld_apply.c b/src/bin/pgcopydb/ld_apply.c
+index 4c9a21a..0f128e0 100644
+--- a/src/bin/pgcopydb/ld_apply.c
++++ b/src/bin/pgcopydb/ld_apply.c
+@@ -336,6 +336,14 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 	 */
+ 	bool idle = false;
+ 
++	/*
++	 * Upwell patch (upwell-11): set once the current output.db was seen
++	 * closed (or, in catchup mode, the receive done) before the transform
++	 * pass that followed; see ld_store_advance_cdc_files.
++	 */
++	bool closedSeen = false;
++	bool receiveDoneSeen = false;
++
+ 	for (;;)
+ 	{
+ 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+@@ -510,17 +518,39 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 			 * exists, advance to it immediately rather than spinning.
+ 			 */
+ 			{
++				bool closed = false;
+ 				bool advanced = false;
+ 
+-				if (!ld_store_advance_cdc_files(specs, &advanced))
++				/*
++				 * Upwell patch (upwell-11): PGCOPYDB_TEST_ADVANCE_DELAY_MS,
++				 * for tests only, widens the time between the pass above and
++				 * the check for a closed file, where a transaction was lost.
++				 */
++				char *advanceDelay = getenv("PGCOPYDB_TEST_ADVANCE_DELAY_MS");
++
++				if (advanceDelay != NULL)
++				{
++					pg_usleep(atol(advanceDelay) * 1000L);
++				}
++
++				if (!ld_store_advance_cdc_files(specs, closedSeen,
++												&closed, &advanced))
+ 				{
+ 					log_warn("Failed to check/advance CDC file rotation, "
+ 							 "will retry");
+ 
+ 					/* non-fatal — try again next iteration */
+ 				}
++				else if (closed && !closedSeen)
++				{
++					/* Upwell patch (upwell-11): read the file once more */
++					closedSeen = true;
++					continue;
++				}
+ 				else if (advanced)
+ 				{
++					closedSeen = false;
++
+ 					/*
+ 					 * Successfully switched to the next output.db/replay.db
+ 					 * pair.  Update local aliases so this loop iteration
+@@ -554,7 +584,13 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+ 						ts.process_name[0] != '\0' &&
+ 						strcmp(ts.run_state, "done") == 0)
+ 					{
+-						receive_done = true;
++						/*
++						 * Upwell patch (upwell-11): stop only after a pass
++						 * that started once the receive was done had
++						 * nothing left to transform.
++						 */
++						receive_done = receiveDoneSeen;
++						receiveDoneSeen = true;
+ 					}
+ 				}
+ 
+diff --git a/src/bin/pgcopydb/ld_store.c b/src/bin/pgcopydb/ld_store.c
+index 87ecc82..daeffd7 100644
+--- a/src/bin/pgcopydb/ld_store.c
++++ b/src/bin/pgcopydb/ld_store.c
+@@ -1408,10 +1408,20 @@ ld_store_cleanup_cdc_files(StreamSpecs *specs,
+  *
+  * Sets *advanced to true when a new file pair was successfully opened;
+  * false when the current pair is still the latest (caller should wait).
++ *
++ * Upwell patch (upwell-11): *closed tells whether the current file is
++ * closed, and the next file is opened only when drained is true: the caller
++ * has run a transform pass that started after it saw the file closed and
++ * found nothing new. The receive commits a file's last messages, then
++ * closes it and rotates; a pass that ended just before that commit had not
++ * read them, and advancing then left the transaction that ended the file
++ * behind for good: the next file's positions moved past its commit.
+  */
+ bool
+-ld_store_advance_cdc_files(StreamSpecs *specs, bool *advanced)
++ld_store_advance_cdc_files(StreamSpecs *specs, bool drained,
++						   bool *closed, bool *advanced)
+ {
++	*closed = false;
+ 	*advanced = false;
+ 
+ 	sqlite3 *db = specs->sourceDB->db;
+@@ -1474,6 +1484,14 @@ ld_store_advance_cdc_files(StreamSpecs *specs, bool *advanced)
+ 		return true;
+ 	}
+ 
++	*closed = true;
++
++	if (!drained)
++	{
++		/* Upwell patch (upwell-11): one more pass first */
++		return true;
++	}
++
+ 	/*
+ 	 * Step 2: find the next file (id > current), open or closed.
+ 	 *
+diff --git a/src/bin/pgcopydb/ld_store.h b/src/bin/pgcopydb/ld_store.h
+index 4cf82b8..59b3bd6 100644
+--- a/src/bin/pgcopydb/ld_store.h
++++ b/src/bin/pgcopydb/ld_store.h
+@@ -83,7 +83,8 @@ bool ld_store_output_fetch(SQLiteQuery *query);
+ bool ld_store_insert_cdc_filename(StreamSpecs *specs);
+ bool ld_store_close_outputdb_cdc(StreamSpecs *specs, uint64_t endpos_lsn);
+ bool ld_store_rotate_outputdb(StreamSpecs *specs, uint64_t commit_lsn);
+-bool ld_store_advance_cdc_files(StreamSpecs *specs, bool *advanced);
++bool ld_store_advance_cdc_files(StreamSpecs *specs, bool drained,
++								bool *closed, bool *advanced);
+ bool ld_store_cleanup_cdc_files(StreamSpecs *specs,
+ 								bool dry_run,
+ 								uint64_t *filesDeleted,
