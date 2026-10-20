@@ -258,8 +258,11 @@ func tableFingerprints(t *testing.T, c pg.Conn, db string) map[string]string {
 			t.Fatal(err)
 		}
 	}
-	rows, err := conn.Query(ctx, `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY 1`)
+	// Every user schema, not only public; a table outside public is named
+	// schema.table (D112).
+	rows, err := conn.Query(ctx, `SELECT CASE WHEN n.nspname = 'public' THEN quote_ident(c.relname) ELSE quote_ident(n.nspname) || '.' || quote_ident(c.relname) END
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'upwell') AND n.nspname NOT LIKE 'pg\_%' AND c.relkind IN ('r', 'p') ORDER BY 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +277,7 @@ func tableFingerprints(t *testing.T, c pg.Conn, db string) map[string]string {
 	for _, n := range names {
 		var cnt int64
 		var h string
-		if err := conn.QueryRow(ctx, fmt.Sprintf(`SELECT count(*), coalesce(md5(string_agg(h, '' ORDER BY h)), '') FROM (SELECT md5(t::text) h FROM public.%s t) s`, pg.QuoteIdent(n))).Scan(&cnt, &h); err != nil {
+		if err := conn.QueryRow(ctx, fmt.Sprintf(`SELECT count(*), coalesce(md5(string_agg(h, '' ORDER BY h)), '') FROM (SELECT md5(t::text) h FROM %s t) s`, n)).Scan(&cnt, &h); err != nil {
 			t.Fatalf("%s.%s: %v", db, n, err)
 		}
 		out[n] = fmt.Sprintf("%d rows, %s", cnt, h)
