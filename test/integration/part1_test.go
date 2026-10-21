@@ -729,9 +729,11 @@ func TestSnapshotWaitShown(t *testing.T) {
 	if _, ok := view.Waits[db]; ok {
 		t.Fatal("the wait is still shown after the copy started")
 	}
-	if !hasEvent(t, e, id, "snapshot_wait", "the base copy can start") {
-		t.Fatal("no event saying the wait ended")
-	}
+	// The collector records the end on its next pass, which can come after a
+	// small database is already in sync.
+	e.waitFor(time.Minute, "an event saying the wait ended", func() bool {
+		return hasEvent(t, e, id, "snapshot_wait", "the base copy can start")
+	})
 	e.abortAndClean(id, "Snapshot wait")
 }
 

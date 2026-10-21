@@ -31,6 +31,7 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | Workload-shape bug bash | done (D112) | engine upwell.9: the engine publication is kept off the target and replica identities are copied; `TestWorkload*` (8 shapes, both plugins) |
 | Slot WAL headroom alert | done (D113) | `TestHeadroomRunsOut`, `TestSlotHeadroomAlert` |
 | COPY rows and rotation losses | done (D114) | engine upwell.11; `TestWorkloadBulkCopy`, `TestRotationKeepsEveryTransaction`, kill test with COPYs |
+| upwell.11 regression | done | all 124 integration tests pass against upwell.11 (run in four groups); two tests updated for timing: S02 mid-stream now also accepts the engine stopping on the target's error (D108), and the snapshot-wait test waits for the collector's "wait ended" event |
 | One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios
