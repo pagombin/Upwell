@@ -165,7 +165,19 @@ func TestS02PrivilegeLostMidStream(t *testing.T) {
 	w := startWriter(t, name)
 	time.Sleep(6 * time.Second)
 	w.Stop()
-	e.waitDBState(id, name, 2*time.Minute, orch.DInSync)
+	// Since D108 the apply reads the target's answers, so it usually stops on
+	// the refused SET and the database fails with the target's message. That
+	// ends the test: nothing was confirmed past what the target committed.
+	e.waitDBState(id, name, 2*time.Minute, orch.DInSync, orch.DFailed)
+	if d := e.db(id, name); d.State == orch.DFailed {
+		if !strings.Contains(d.LastError, "permission denied to set parameter") {
+			t.Fatalf("failed with %q, want the target's permission error", d.LastError)
+		}
+		t.Logf("the engine stopped on the target's error: %s", d.LastError)
+		superSQL(t, dstPort, "postgres", "GRANT SET ON PARAMETER session_replication_role TO doadmin")
+		e.abortAndClean(id, "S02 mid-stream")
+		return
+	}
 	// First line of defence: nothing reaches the target, so the heartbeat
 	// latency grows and the readiness gate refuses the cutover before anyone
 	// stops writers.
