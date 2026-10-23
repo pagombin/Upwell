@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -316,4 +317,42 @@ func TestReadOnlySourceBlocked(t *testing.T) {
 	}
 	superSQL(t, srcPort, "postgres", "ALTER DATABASE "+db+" RESET default_transaction_read_only")
 	e.abortAndClean(id, "Read-only source")
+}
+
+// D115: the target tracks a limited number of replication origins
+// (max_active_replication_origins from PostgreSQL 18, max_replication_slots
+// before), and origins left by earlier migrations count. Short of one per
+// database, every base copy failed only once it finished. Preflight must
+// block, naming the setting.
+func TestPreflightTargetOriginsFull(t *testing.T) {
+	e := newEnv(t, "", orch.TestHooks{})
+	db := uniq("it_origins")
+	seedDB(t, db, 100)
+	id := e.defineMigration("Target origins", []string{db}, nil)
+	limit, _ := strconv.Atoi(q(t, dstConn, "defaultdb", `SELECT COALESCE(current_setting('max_active_replication_origins', true), current_setting('max_replication_slots'))`))
+	used, _ := strconv.Atoi(q(t, dstConn, "defaultdb", `SELECT count(*) FROM pg_replication_origin`))
+	for i := used; i < limit; i++ {
+		exec1(t, dstConn, "defaultdb", fmt.Sprintf(`SELECT pg_replication_origin_create('it_filler_%d')`, i))
+	}
+	t.Cleanup(func() {
+		exec1(t, dstConn, "defaultdb", `SELECT pg_replication_origin_drop(roname) FROM pg_replication_origin WHERE roname LIKE 'it_filler_%'`)
+	})
+	check := func(wantBlocked bool) {
+		pv := e.preflight(id)
+		for _, r := range pv.Results {
+			if r.CheckID != "target_origins" {
+				continue
+			}
+			t.Logf("target_origins: %s: %s", r.Level, r.Message)
+			if blocked := r.Level == "blocker" && r.Hard; blocked != wantBlocked {
+				t.Fatalf("target_origins %s (hard %v), want blocked %v: %s", r.Level, r.Hard, wantBlocked, r.Message)
+			}
+			return
+		}
+		t.Fatal("no target_origins result")
+	}
+	check(true)
+	exec1(t, dstConn, "defaultdb", `SELECT pg_replication_origin_drop(roname) FROM pg_replication_origin WHERE roname LIKE 'it_filler_%'`)
+	check(false)
+	e.abortAndClean(id, "Target origins")
 }

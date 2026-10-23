@@ -605,12 +605,13 @@ func (o *Orchestrator) StaleSamples(mig, side string) int {
 type alerter struct {
 	o        *Orchestrator
 	mu       sync.Mutex
-	backlog  map[string][]int64
+	backlog  map[string][]backlogSample // D115: the last backlogWindow of readings
+	growing  map[string]bool            // D115: backlog_growing fires for these databases
 	headroom map[string][]headroomSample // D113: the slot's safe_wal_size over the last 15 minutes
 }
 
 func newAlerter(o *Orchestrator) *alerter {
-	return &alerter{o: o, backlog: map[string][]int64{}, headroom: map[string][]headroomSample{}}
+	return &alerter{o: o, backlog: map[string][]backlogSample{}, growing: map[string]bool{}, headroom: map[string][]headroomSample{}}
 }
 
 // slotHeadroom raises an alert when the slot's WAL headroom shrinks fast
@@ -705,20 +706,25 @@ func (a *alerter) evaluate(ctx context.Context, m Migration, dbs []Database) {
 		a.cond(ctx, ok && ws == 2 && activeDB[d.State], m.ID, "slot_at_risk", d.SourceName, "critical", d.SourceName+": the slot's WAL is no longer reserved and may be removed")
 		a.slotHeadroom(ctx, m, d, g)
 		if d.BacklogBytes != nil && activeDB[d.State] && d.BaseCopyDone {
+			now := time.Now()
 			a.mu.Lock()
-			h := append(a.backlog[d.ID], *d.BacklogBytes)
-			if len(h) > 6 {
-				h = h[len(h)-6:]
+			h := append(a.backlog[d.ID], backlogSample{at: now, bytes: float64(*d.BacklogBytes)})
+			for len(h) > 1 && now.Sub(h[0].at) > backlogWindow {
+				h = h[1:]
 			}
 			a.backlog[d.ID] = h
+			growing := backlogGrowing(h, a.growing[d.ID])
+			a.growing[d.ID] = growing
 			a.mu.Unlock()
-			growing := len(h) == 6
-			for i := 1; i < len(h) && growing; i++ {
-				if h[i] <= h[i-1] {
-					growing = false
-				}
-			}
-			a.cond(ctx, growing, m.ID, "backlog_growing", d.SourceName, "warning", d.SourceName+": the change backlog grew for 5 consecutive samples")
+			growth, span, _ := backlogGrowth(h)
+			a.cond(ctx, growing, m.ID, "backlog_growing", d.SourceName, "warning", fmt.Sprintf("%s: the change backlog grew by %s in the last %s, to %s: the apply is not keeping up with the source's writes",
+				d.SourceName, humanBytes(growth), humanDuration(span.Seconds()), humanBytes(h[len(h)-1].bytes)))
+		} else {
+			a.mu.Lock()
+			delete(a.backlog, d.ID)
+			delete(a.growing, d.ID)
+			a.mu.Unlock()
+			a.resolve(ctx, m.ID, "backlog_growing", d.SourceName)
 		}
 		drift := a.o.metrics.Drift(d.ID)
 		a.cond(ctx, len(drift) > 0 && activeDB[d.State], m.ID, "schema_drift", d.SourceName, "critical",

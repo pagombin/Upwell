@@ -104,6 +104,7 @@ var Catalog = []check.Definition{
 	cd("session_timeouts", check.ScopeSource, "Session timeouts", "acceptable"),
 	cd("slot_wal_cap", check.ScopeSource, "Slot WAL retention cap", "warning"),
 	cd("target_disk", check.ScopeTarget, "Target storage", "acceptable"),
+	cd("target_origins", check.ScopeTarget, "Replication origins free on the target", "hard"),
 	cd("repl_protocol", check.ScopeDatabase, "Replication connection", "hard"),
 	cd("read_privs", check.ScopeDatabase, "Read access to every table", "hard"),
 	cd("publication_privs", check.ScopeDatabase, "Decoding plugin", "hard"),
@@ -661,6 +662,34 @@ func (r *Runner) targetChecks(ctx context.Context) {
 		p.emit(check.Blocker, false, fmt.Sprintf("The target has %.0f GB; existing data plus %.1f × the databases being migrated needs %s.", e.TargetStorageGB, factor, humanBytes(need)), "Resize the target's storage before starting, or accept the risk.", ev)
 	default:
 		p.ok(fmt.Sprintf("Needs about %s of the target's %.0f GB.", humanBytes(need), e.TargetStorageGB), ev)
+	}
+	r.targetOrigins(ctx)
+}
+
+// targetOrigins checks that the target can track one more replication origin
+// per database (D115). The apply records its progress in one; the target
+// keeps max_active_replication_origins of them (PostgreSQL 18, default 10),
+// before 18 max_replication_slots, and origins left by earlier migrations
+// count too. Short of them, each base copy failed only when it finished,
+// with "could not find free replication state slot".
+func (r *Runner) targetOrigins(ctx context.Context) {
+	e := r.Env
+	n := len(e.Databases)
+	p := r.probe(ctx, "target_origins", "", "")
+	var limit, used int
+	var setting string
+	p.row(r.dst, `SELECT CASE WHEN current_setting('max_active_replication_origins', true) IS NOT NULL THEN 'max_active_replication_origins' ELSE 'max_replication_slots' END,
+		COALESCE(current_setting('max_active_replication_origins', true), current_setting('max_replication_slots'))::int,
+		(SELECT count(*) FROM pg_replication_origin)`).Scan(&setting, &limit, &used)
+	if e.Resuming {
+		used -= n
+	}
+	ev := map[string]any{"setting": setting, "limit": limit, "used": used, "needed": n}
+	if limit-used < n {
+		p.emit(check.Blocker, true, fmt.Sprintf("The target can track %d replication origins (%s) and %d exist; %d databases need one each.", limit, setting, used, n),
+			"Raise "+setting+" on the target (a restart), drop replication origins left by earlier migrations (Clean up on those migrations), or split the databases into several migrations.", ev)
+	} else {
+		p.ok(fmt.Sprintf("%d of %d replication origins free on the target (%s); %d needed.", limit-used, limit, setting, n), ev)
 	}
 }
 
@@ -1369,7 +1398,7 @@ var engineVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
 
 // EngineBuildRequired is the pgcopydb build deploy/install.sh makes: the
 // v0.18 tag with the patches in deploy/pgcopydb.
-const EngineBuildRequired = "0.18+upwell.11"
+const EngineBuildRequired = "0.18+upwell.12"
 
 var enginePatchRe = regexp.MustCompile(`\+upwell\.(\d+)`)
 

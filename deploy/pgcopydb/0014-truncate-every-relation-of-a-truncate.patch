@@ -1,0 +1,579 @@
+diff --git a/src/bin/pgcopydb/ld_apply.c b/src/bin/pgcopydb/ld_apply.c
+index 010d4fb..3bf4909 100644
+--- a/src/bin/pgcopydb/ld_apply.c
++++ b/src/bin/pgcopydb/ld_apply.c
+@@ -1144,6 +1144,31 @@ stream_apply_transaction(StreamApplyContext *context,
+ }
+ 
+ 
++/*
++ * Upwell patch (upwell-14): stream_apply_truncate_cascade appends CASCADE to
++ * a replicated TRUNCATE. The source truncates every table that references a
++ * truncated one in the same command (or the TRUNCATE fails there), and each
++ * of them now arrives as a statement of its own: on the target each one
++ * alone would be refused for the foreign keys of the others. CASCADE reaches
++ * only tables the source truncated too, since the schemas are the same.
++ */
++static void
++stream_apply_truncate_cascade(char *dst, size_t size, const char *sql)
++{
++	strlcpy(dst, sql, size);
++
++	size_t len = strlen(dst);
++
++	while (len > 0 && (dst[len - 1] == ';' || dst[len - 1] == '\n' ||
++					   dst[len - 1] == ' '))
++	{
++		dst[--len] = '\0';
++	}
++
++	strlcat(dst, " CASCADE", size);
++}
++
++
+ /*
+  * stream_apply_dml applies a single DML row (INSERT/UPDATE/DELETE/TRUNCATE)
+  * to the target database.  The transaction must already be open.
+@@ -1228,7 +1253,11 @@ stream_apply_dml(StreamApplyContext *context, ReplayDBStmt *s)
+ 			}
+ 		}
+ 
+-		if (!pgsql_execute(applyPgConn, execSQL))
++		char cascadeSQL[BUFSIZE] = { 0 };
++
++		stream_apply_truncate_cascade(cascadeSQL, sizeof(cascadeSQL), execSQL);
++
++		if (!pgsql_execute(applyPgConn, cascadeSQL))
+ 		{
+ 			/* errors have already been logged */
+ 			return false;
+@@ -2448,7 +2477,12 @@ stream_apply_sql(StreamApplyContext *context,
+ 				}
+ 			}
+ 
+-			if (!pgsql_execute(applyPgConn, truncateSQL))
++			char cascadeSQL[BUFSIZE] = { 0 };
++
++			stream_apply_truncate_cascade(cascadeSQL, sizeof(cascadeSQL),
++										  truncateSQL);
++
++			if (!pgsql_execute(applyPgConn, cascadeSQL))
+ 			{
+ 				/* errors have already been logged */
+ 				return false;
+diff --git a/src/bin/pgcopydb/ld_pgoutput.c b/src/bin/pgcopydb/ld_pgoutput.c
+index cd4e2ce..7682c57 100644
+--- a/src/bin/pgcopydb/ld_pgoutput.c
++++ b/src/bin/pgcopydb/ld_pgoutput.c
+@@ -36,6 +36,8 @@
+ #include "copydb.h"
+ #include "ld_pgoutput.h"
+ #include "ld_stream.h"
++#include "pqexpbuffer.h"
++#include "ld_stream.h"
+ #include "log.h"
+ #include "pgsql.h"
+ #include "string_utils.h"
+@@ -750,23 +752,53 @@ preparePgoutputMessage(LogicalStreamContext *context)
+ 			uint32_t nrelids = pgout_u32(buf, &pos, bufLen);
+ 			pgout_u8(buf, &pos, bufLen);    /* flags (cascade, restart_seqs) */
+ 
++			/*
++			 * Upwell patch (upwell-14): a TRUNCATE lists every relation it
++			 * emptied: all the partitions of a partitioned table, the tables
++			 * of "TRUNCATE a, b", those reached by CASCADE. Only the first
++			 * was kept, so the target kept the rows of the others. All of
++			 * them are now kept in truncateList, stored in the message
++			 * column, and the transform truncates each one.
++			 */
++			PQExpBuffer list = createPQExpBuffer();
++
+ 			for (uint32_t i = 0; i < nrelids; i++)
+ 			{
+ 				uint32_t relOid = pgout_u32(buf, &pos, bufLen);
++				PgoutputRelationCache *rel = NULL;
++				HASH_FIND_INT(privateContext->pgoutputRelationCache,
++							  &relOid, rel);
++
++				if (rel == NULL)
++				{
++					log_error("pgoutput: TRUNCATE of relation %u, which no "
++							  "Relation message described", relOid);
++					destroyPQExpBuffer(list);
++					return false;
++				}
++
+ 				if (i == 0)
+ 				{
+-					PgoutputRelationCache *rel = NULL;
+-					HASH_FIND_INT(privateContext->pgoutputRelationCache,
+-								  &relOid, rel);
+-					if (rel != NULL)
+-					{
+-						strlcpy(msg->nspname, rel->nspname,
+-								sizeof(msg->nspname));
+-						strlcpy(msg->relname, rel->relname,
+-								sizeof(msg->relname));
+-					}
++					strlcpy(msg->nspname, rel->nspname,
++							sizeof(msg->nspname));
++					strlcpy(msg->relname, rel->relname,
++							sizeof(msg->relname));
+ 				}
++
++				appendPQExpBuffer(list, "%zu:%s%zu:%s",
++								  strlen(rel->nspname), rel->nspname,
++								  strlen(rel->relname), rel->relname);
+ 			}
++
++			if (PQExpBufferBroken(list))
++			{
++				log_error(ALLOCATION_FAILED_ERROR);
++				destroyPQExpBuffer(list);
++				return false;
++			}
++
++			msg->truncateList = strdup(list->data);
++			destroyPQExpBuffer(list);
+ 			break;
+ 		}
+ 
+@@ -830,6 +862,69 @@ quote_and_dup(const char *name)
+ }
+ 
+ 
++/*
++ * Upwell patch (upwell-14): parsePgoutputTruncateList decodes the relations
++ * of a TRUNCATE kept by the receive ("<len>:<schema><len>:<table>" for each),
++ * as quoted identifiers.
++ */
++bool
++parsePgoutputTruncateList(const char *list,
++						  LogicalMessageRelation **tables, int *count)
++{
++	*tables = NULL;
++	*count = 0;
++
++	int cap = 0;
++	const char *p = list;
++
++	while (p != NULL && *p != '\0')
++	{
++		char *name[2] = { NULL, NULL };
++
++		for (int k = 0; k < 2; k++)
++		{
++			char *colon = NULL;
++			unsigned long len = strtoul(p, &colon, 10);
++
++			if (colon == p || *colon != ':' || strlen(colon + 1) < len)
++			{
++				log_error("pgoutput: malformed TRUNCATE relation list: %s", list);
++				return false;
++			}
++
++			char *raw = strndup(colon + 1, len);
++			name[k] = raw != NULL ? quote_and_dup(raw) : NULL;
++			free(raw);
++
++			if (name[k] == NULL)
++			{
++				log_error(ALLOCATION_FAILED_ERROR);
++				return false;
++			}
++			p = colon + 1 + len;
++		}
++
++		if (*count == cap)
++		{
++			cap = cap == 0 ? 4 : cap * 2;
++			*tables = realloc(*tables, cap * sizeof(LogicalMessageRelation));
++
++			if (*tables == NULL)
++			{
++				log_error(ALLOCATION_FAILED_ERROR);
++				return false;
++			}
++		}
++
++		(*tables)[*count].nspname = name[0];
++		(*tables)[*count].relname = name[1];
++		++(*count);
++	}
++
++	return true;
++}
++
++
+ /*
+  * Fetch-function context for iterating pgoutput_col rows.
+  */
+@@ -1090,7 +1185,7 @@ parsePgoutputMessage(StreamContext *privateContext,
+ 	 * For now, read them from the output row directly.
+ 	 */
+ 	const char *nspsql =
+-		"select nspname, relname, old_type from output where id = $1";
++		"select nspname, relname, old_type, message from output where id = $1";
+ 
+ 	SQLiteQuery nsq = { 0 };
+ 	nsq.errorOnZeroRows = true;
+@@ -1098,6 +1193,7 @@ parsePgoutputMessage(StreamContext *privateContext,
+ 	char nspname[PG_NAMEDATALEN] = { 0 };
+ 	char relname[PG_NAMEDATALEN] = { 0 };
+ 	char old_type = 0;
++	char *truncateList = NULL;  /* Upwell patch (upwell-14) */
+ 
+ 	if (catalog_sql_prepare(db, nspsql, &nsq))
+ 	{
+@@ -1124,6 +1220,12 @@ parsePgoutputMessage(StreamContext *privateContext,
+ 				{
+ 					old_type = ot[0];
+ 				}
++
++				const char *tl = (char *) sqlite3_column_text(nsq.ppStmt, 3);
++				if (tl)
++				{
++					truncateList = strdup(tl);
++				}
+ 			}
+ 		}
+ 		(void) catalog_sql_finalize(&nsq);
+@@ -1207,6 +1309,31 @@ parsePgoutputMessage(StreamContext *privateContext,
+ 
+ 		case STREAM_ACTION_TRUNCATE:
+ 		{
++			/*
++			 * Upwell patch (upwell-14): every relation the receive kept. A
++			 * file written by an older build has only the first.
++			 */
++			if (truncateList != NULL)
++			{
++				LogicalMessageRelation *tables = NULL;
++				int count = 0;
++
++				bool ok = parsePgoutputTruncateList(truncateList, &tables, &count);
++				free(truncateList);
++
++				if (!ok || count == 0)
++				{
++					log_error("Failed to read the relations of a TRUNCATE "
++							  "(output id %lld)", (long long) outputId);
++					return false;
++				}
++
++				stmt->stmt.truncate.table = tables[0];
++				stmt->stmt.truncate.more = count > 1 ? tables + 1 : NULL;
++				stmt->stmt.truncate.moreCount = count - 1;
++				break;
++			}
++
+ 			stmt->stmt.truncate.table.nspname = quote_and_dup(nspname);
+ 			stmt->stmt.truncate.table.relname = quote_and_dup(relname);
+ 			break;
+@@ -1247,6 +1374,9 @@ free_pgoutput_message(PgoutputMessage *msg)
+ 		return;
+ 	}
+ 
++	free(msg->truncateList);
++	msg->truncateList = NULL;
++
+ 	if (msg->old_cols != NULL)
+ 	{
+ 		for (int i = 0; i < msg->ncols_old; i++)
+diff --git a/src/bin/pgcopydb/ld_pgoutput.h b/src/bin/pgcopydb/ld_pgoutput.h
+index 8a763d4..1121a12 100644
+--- a/src/bin/pgcopydb/ld_pgoutput.h
++++ b/src/bin/pgcopydb/ld_pgoutput.h
+@@ -90,6 +90,12 @@ typedef struct PgoutputMessage
+ 
+ 	int ncols_new;
+ 	PgoutputColumn *new_cols;       /* malloc'd array; NULL for DELETE */
++
++	/*
++	 * Upwell patch (upwell-14): every relation of a TRUNCATE, encoded by
++	 * pgoutput_truncate_list_append; NULL for other messages.
++	 */
++	char *truncateList;
+ } PgoutputMessage;
+ 
+ 
+@@ -99,6 +105,10 @@ struct DatabaseCatalog;
+ 
+ 
+ bool parsePgoutputMessageActionAndXid(LogicalStreamContext *context);
++struct LogicalMessageRelation;
++bool parsePgoutputTruncateList(const char *list,
++							   struct LogicalMessageRelation **tables,
++							   int *count);
+ bool preparePgoutputMessage(LogicalStreamContext *context);
+ bool parsePgoutputMessage(struct StreamContext *context,
+ 						  struct DatabaseCatalog *outputDB,
+diff --git a/src/bin/pgcopydb/ld_store.c b/src/bin/pgcopydb/ld_store.c
+index 9b3772b..62e77f9 100644
+--- a/src/bin/pgcopydb/ld_store.c
++++ b/src/bin/pgcopydb/ld_store.c
+@@ -1954,8 +1954,8 @@ ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
+ 	/* --- INSERT into output --- */
+ 	char *output_sql =
+ 		"insert or replace into output"
+-		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type, seq)"
+-		"  values($1, $2, $3, $4, NULL, $5, $6, $7, $8)";
++		"  (action, xid, lsn, timestamp, nspname, relname, old_type, seq, message)"
++		"  values($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+ 
+ 	SQLiteQuery oq = { 0 };
+ 	if (!catalog_sql_prepare(db, output_sql, &oq))
+@@ -1981,7 +1981,13 @@ ld_store_insert_pgoutput_message_one(DatabaseCatalog *catalog,
+ 			pgmsg->oldType != 0 ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
+ 			"old_type", 0, pgmsg->oldType != 0 ? old_type_str : NULL
+ 		},
+-		{ BIND_PARAMETER_TYPE_INT64, "seq", ld_store_output_seq(catalog, metadata), NULL }
++		{ BIND_PARAMETER_TYPE_INT64, "seq", ld_store_output_seq(catalog, metadata), NULL },
++
++		/* Upwell patch (upwell-14): every relation of a TRUNCATE */
++		{
++			pgmsg->truncateList != NULL ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
++			"message", 0, pgmsg->truncateList
++		}
+ 	};
+ 
+ 	if (!catalog_sql_bind(&oq, oparams, lengthof(oparams)))
+diff --git a/src/bin/pgcopydb/ld_stream.h b/src/bin/pgcopydb/ld_stream.h
+index 7db61bf..d89b1f2 100644
+--- a/src/bin/pgcopydb/ld_stream.h
++++ b/src/bin/pgcopydb/ld_stream.h
+@@ -169,6 +169,13 @@ typedef struct LogicalMessageDelete
+ typedef struct LogicalMessageTruncate
+ {
+ 	LogicalMessageRelation table;
++
++	/*
++	 * Upwell patch (upwell-14): the other relations of the same TRUNCATE,
++	 * which the transform turns into statements of their own.
++	 */
++	LogicalMessageRelation *more;
++	int moreCount;
+ } LogicalMessageTruncate;
+ 
+ typedef struct LogicalMessageSwitchWAL
+@@ -812,6 +819,9 @@ bool AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count);
+ bool prepareTestDecodingMessage(LogicalStreamContext *context);
+ 
+ bool parseTestDecodingMessageActionAndXid(LogicalStreamContext *context);
++bool parseTestDecodingTruncateTables(const char *message,
++									 LogicalMessageRelation **tables,
++									 int *count);
+ 
+ bool parseTestDecodingMessage(StreamContext *privateContext,
+ 							  char *message,
+diff --git a/src/bin/pgcopydb/ld_test_decoding.c b/src/bin/pgcopydb/ld_test_decoding.c
+index 539fa7a..10bc3b1 100644
+--- a/src/bin/pgcopydb/ld_test_decoding.c
++++ b/src/bin/pgcopydb/ld_test_decoding.c
+@@ -298,7 +298,18 @@ parseTestDecodingMessage(StreamContext *privateContext,
+ 
+ 		case STREAM_ACTION_TRUNCATE:
+ 		{
+-			stmt->stmt.truncate.table = header.table;
++			/* Upwell patch (upwell-14) */
++			LogicalMessageRelation *tables = NULL;
++			int count = 0;
++
++			if (!parseTestDecodingTruncateTables(td_message, &tables, &count))
++			{
++				return false;
++			}
++
++			stmt->stmt.truncate.table = tables[0];
++			stmt->stmt.truncate.more = count > 1 ? tables + 1 : NULL;
++			stmt->stmt.truncate.moreCount = count - 1;
+ 
+ 			break;
+ 		}
+@@ -427,6 +438,97 @@ findIdentifierEndPos(const char *message, char separator, int *position)
+ }
+ 
+ 
++/*
++ * Upwell patch (upwell-14): parseTestDecodingTruncateTables reads every
++ * relation of a TRUNCATE message, which test_decoding lists in one header:
++ *
++ * table public.tp, public.tp_a, "we, ird".x: TRUNCATE: (no-flags)
++ *
++ * The header parser took everything up to the colon as one table name, so a
++ * TRUNCATE of several tables (a partitioned table and its partitions, "a, b",
++ * CASCADE) failed or truncated the wrong relation. Names keep test_decoding's
++ * quoting.
++ */
++bool
++parseTestDecodingTruncateTables(const char *message,
++								LogicalMessageRelation **tables, int *count)
++{
++	*tables = NULL;
++	*count = 0;
++
++	if (message == NULL || strncmp(message, "table ", 6) != 0)
++	{
++		log_error("Failed to parse test_decoding TRUNCATE message: %s", message);
++		return false;
++	}
++
++	const char *p = message + 6;
++	int cap = 0;
++
++	for (;;)
++	{
++		const char *start[2] = { p, NULL };
++		const char *stop[2] = { NULL, NULL };
++		bool inQuotes = false;
++		int part = 0;
++
++		for (; *p != '\0'; p++)
++		{
++			if (*p == '"')
++			{
++				inQuotes = !inQuotes;
++			}
++			else if (!inQuotes && part == 0 && *p == '.')
++			{
++				stop[0] = p;
++				start[1] = p + 1;
++				part = 1;
++			}
++			else if (!inQuotes && part == 1 && (*p == ',' || *p == ':'))
++			{
++				stop[1] = p;
++				break;
++			}
++		}
++
++		if (stop[0] == NULL || stop[1] == NULL)
++		{
++			log_error("Failed to parse test_decoding TRUNCATE message: %s",
++					  message);
++			return false;
++		}
++
++		if (*count == cap)
++		{
++			cap = cap == 0 ? 4 : cap * 2;
++			*tables = realloc(*tables, cap * sizeof(LogicalMessageRelation));
++
++			if (*tables == NULL)
++			{
++				log_error(ALLOCATION_FAILED_ERROR);
++				return false;
++			}
++		}
++
++		(*tables)[*count].nspname = strndup(start[0], stop[0] - start[0]);
++		(*tables)[*count].relname = strndup(start[1], stop[1] - start[1]);
++		++(*count);
++
++		if (*p == ':')
++		{
++			return true;
++		}
++
++		/* skip ", " */
++		p++;
++		while (*p == ' ')
++		{
++			p++;
++		}
++	}
++}
++
++
+ /*
+  * parseTestDecodingMessageHeader parses a raw test_decoding message to find
+  * the header information only. It stops after having parsed the target table
+diff --git a/src/bin/pgcopydb/ld_transform.c b/src/bin/pgcopydb/ld_transform.c
+index f09290b..3bf3d34 100644
+--- a/src/bin/pgcopydb/ld_transform.c
++++ b/src/bin/pgcopydb/ld_transform.c
+@@ -41,6 +41,8 @@
+ #include "summary.h"
+ 
+ 
++static bool streamLogicalTransactionAppendTruncateMore(LogicalTransaction *txn,
++													   LogicalTransactionStatement *stmt);
+ static bool canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
+ 												   LogicalTransactionStatement *new);
+ static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
+@@ -372,6 +374,12 @@ stream_transform_prepare_message(StreamSpecs *specs,
+ 			}
+ 			(void) streamLogicalTransactionAppendStatement(
+ 				&(mesg->command.tx), pgstmt);
++
++			if (!streamLogicalTransactionAppendTruncateMore(&(mesg->command.tx),
++															pgstmt))
++			{
++				return false;
++			}
+ 		}
+ 		else
+ 		{
+@@ -1426,6 +1434,11 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
+ 
+ 			(void) streamLogicalTransactionAppendStatement(txn, stmt);
+ 
++			if (!streamLogicalTransactionAppendTruncateMore(txn, stmt))
++			{
++				return false;
++			}
++
+ 			break;
+ 		}
+ 	}
+@@ -1434,6 +1447,50 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
+ }
+ 
+ 
++/*
++ * Upwell patch (upwell-14): streamLogicalTransactionAppendTruncateMore adds,
++ * after a TRUNCATE statement, one TRUNCATE statement for each other relation
++ * of the same source TRUNCATE (LogicalMessageTruncate.more).
++ */
++static bool
++streamLogicalTransactionAppendTruncateMore(LogicalTransaction *txn,
++										   LogicalTransactionStatement *stmt)
++{
++	if (stmt->action != STREAM_ACTION_TRUNCATE ||
++		stmt->stmt.truncate.moreCount <= 0)
++	{
++		return true;
++	}
++
++	for (int i = 0; i < stmt->stmt.truncate.moreCount; i++)
++	{
++		LogicalTransactionStatement *more = (LogicalTransactionStatement *)
++											calloc(1, sizeof(LogicalTransactionStatement));
++
++		if (more == NULL)
++		{
++			log_error(ALLOCATION_FAILED_ERROR);
++			return false;
++		}
++
++		more->action = STREAM_ACTION_TRUNCATE;
++		more->xid = stmt->xid;
++		more->lsn = stmt->lsn;
++		strlcpy(more->timestamp, stmt->timestamp, sizeof(more->timestamp));
++		more->stmt.truncate.table = stmt->stmt.truncate.more[i];
++
++		if (!streamLogicalTransactionAppendStatement(txn, more))
++		{
++			return false;
++		}
++	}
++
++	stmt->stmt.truncate.moreCount = 0;
++
++	return true;
++}
++
++
+ /*
+  * appendValuesArray appends the first entry of newValuesArray into
+  * lastValuesArray, resizing the backing array with doubling if needed.

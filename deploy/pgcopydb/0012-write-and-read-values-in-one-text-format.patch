@@ -1,0 +1,76 @@
+diff --git a/src/bin/pgcopydb/copydb.h b/src/bin/pgcopydb/copydb.h
+index b9cf0a1..3008575 100644
+--- a/src/bin/pgcopydb/copydb.h
++++ b/src/bin/pgcopydb/copydb.h
+@@ -23,7 +23,7 @@
+  */
+ #define COMMON_GUC_SETTINGS \
+ 	{ "client_encoding", "'UTF-8'" }, \
+-	{ "extra_float_digits", "3" }, \
++	TEXT_FORMAT_GUC_SETTINGS, \
+ 	{ "statement_timeout", "0" }, \
+ 	{ "default_transaction_read_only", "off" }
+ 
+diff --git a/src/bin/pgcopydb/pgsql.c b/src/bin/pgcopydb/pgsql.c
+index 10cc383..2b18137 100644
+--- a/src/bin/pgcopydb/pgsql.c
++++ b/src/bin/pgcopydb/pgsql.c
+@@ -3973,6 +3973,15 @@ OutputPluginToString(StreamOutputPlugin plugin)
+  * Only applied on PG10+: PG9.6's walsender does not accept SET commands at
+  * all, so we skip this step for older servers.
+  */
++/*
++ * Upwell patch (upwell-12): the change stream's values are formatted by the
++ * walsender, in a session that takes the source database's settings.
++ */
++static GUC replicationStreamSettings[] = {
++	TEXT_FORMAT_GUC_SETTINGS,
++	{ NULL, NULL }
++};
++
+ static GUC replicationSlotSettings[] = {
+ 	{ "statement_timeout", "0" },
+ 	{ "idle_in_transaction_session_timeout", "0" },
+@@ -4276,6 +4285,16 @@ pgsql_start_replication(LogicalStreamClient *client)
+ 		return false;
+ 	}
+ 
++	/* Upwell patch (upwell-12): SET is accepted from PostgreSQL 10 */
++	if (PQserverVersion(pgsql->connection) >= 100000 &&
++		!pgsql_set_gucs(pgsql, replicationStreamSettings))
++	{
++		log_error("Failed to set the change stream's text format, "
++				  "see above for details");
++		destroyPQExpBuffer(query);
++		return false;
++	}
++
+ 	log_sql("%s", query->data);
+ 
+ 	PGresult *res = PQexec(pgsql->connection, query->data);
+diff --git a/src/bin/pgcopydb/pgsql.h b/src/bin/pgcopydb/pgsql.h
+index 299c4a1..0b8958b 100644
+--- a/src/bin/pgcopydb/pgsql.h
++++ b/src/bin/pgcopydb/pgsql.h
+@@ -242,6 +242,21 @@ typedef struct GUC
+ 	char *value;
+ } GUC;
+ 
++/*
++ * Upwell patch (upwell-12): values cross between the clusters as text, the
++ * base copy's COPY and the change stream alike, written and read in sessions
++ * that take each database's and role's settings. A source database set to
++ * DateStyle 'SQL, DMY' had its dates read back month first on the target,
++ * and IntervalStyle, lc_monetary and extra_float_digits changed values the
++ * same way. Every engine session now writes and reads one format.
++ */
++#define TEXT_FORMAT_GUC_SETTINGS \
++	{ "extra_float_digits", "3" }, \
++	{ "datestyle", "'ISO, MDY'" }, \
++	{ "intervalstyle", "'postgres'" }, \
++	{ "bytea_output", "'hex'" }, \
++	{ "lc_monetary", "'C'" }
++
+ bool pgsql_init(PGSQL *pgsql, char *url, ConnectionType connectionType);
+ 
+ PGconn * pgsql_open_connection(PGSQL *pgsql);

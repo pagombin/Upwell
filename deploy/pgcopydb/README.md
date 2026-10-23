@@ -2,7 +2,7 @@
 
 `deploy/install.sh` builds pgcopydb from the `PGCOPYDB_TAG` tag with every
 `*.patch` here applied, as version `PGCOPYDB_BUILD` (for example
-`0.18+upwell.11`). Upwell refuses online migrations with any other build
+`0.18+upwell.12`). Upwell refuses online migrations with any other build
 (preflight check `engine_commit_order`, and again at each launch).
 
 | Patch | Why |
@@ -18,6 +18,9 @@
 | `0009-leave-the-engine-publication-out-of-the-restore.patch` | pgcopydb creates its publication on the source before the schema dump, so the restore created it on the target, where it outlived the migration and made the target refuse UPDATE and DELETE on listed tables without a replica identity. The publication named in `PGCOPYDB_SKIP_PUBLICATION` (Upwell sets the slot name) is left out of the restore (D112). |
 | `0010-finish-a-closed-change-file-before-the-next.patch` | When the receive rotated the change file, the apply could see the file closed right after a pass that had not yet read the file's last messages, and move to the next file: the transaction whose COMMIT ended the file was skipped for good. The apply now reads a closed file once more before it moves on, and in catchup mode stops only after a pass that began once the receive was done. `PGCOPYDB_TEST_ADVANCE_DELAY_MS` widens the window for tests (D114). |
 | `0011-keep-every-row-that-shares-an-lsn.patch` | A COPY writes a page of rows in one WAL record, so its rows share one LSN, and the change file, keyed on (action, LSN) with INSERT OR REPLACE, kept only the last of them: 26,100 copied rows reached the target as 172 (upstream v0.18 bug). Messages are now keyed on (action, LSN, ordinal); a transaction sent again after a restart gets the same ordinals and still replaces its first copy. Files from older builds are upgraded when opened (D114). |
+| `0012-write-and-read-values-in-one-text-format.patch` | Every value crosses as text, and the sessions took the source database's and role's settings: with DateStyle 'SQL, DMY' on the source, dates came back day and month swapped; IntervalStyle, lc_monetary and extra_float_digits changed values the same way. Every engine session, and the change stream's walsender, now uses ISO dates, postgres intervals, hex bytea, the C money format and full float precision (D115). |
+| `0013-log-a-flushing-target-at-debug-level.patch` | "The target's replication origin is at …, before the last COMMIT applied" is routine under load (the target flushes a moment after the COMMIT answers) and was three lines in four of a busy day's log; it is now a debug message (D115). |
+| `0014-truncate-every-relation-of-a-truncate.patch` | A TRUNCATE lists every relation it empties (the partitions of a partitioned table, "TRUNCATE a, b", the tables reached by CASCADE), and only the first was kept: the target kept the others' rows (upstream v0.18 bug, both plugins). Each relation is now truncated, with CASCADE on the target, which reaches only tables the source truncated in the same command (D115). |
 
 ## Reproducing the loss
 

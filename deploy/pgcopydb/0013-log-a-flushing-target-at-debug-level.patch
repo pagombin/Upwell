@@ -1,0 +1,26 @@
+diff --git a/src/bin/pgcopydb/ld_apply.c b/src/bin/pgcopydb/ld_apply.c
+index 0f128e0..010d4fb 100644
+--- a/src/bin/pgcopydb/ld_apply.c
++++ b/src/bin/pgcopydb/ld_apply.c
+@@ -1627,10 +1627,17 @@ stream_apply_sync_sentinel(StreamApplyContext *context, bool findDurableLSN)
+ 		}
+ 		else
+ 		{
+-			log_warn("The target's replication origin is at %X/%X, "
+-					 "before the last COMMIT applied %X/%X",
+-					 LSN_FORMAT_ARGS(originLSN),
+-					 LSN_FORMAT_ARGS(applyQueuedCommitLSN));
++			/*
++			 * Upwell patch (upwell-13): routine under load (the target
++			 * flushes its WAL a moment after the COMMIT answers), so not a
++			 * warning: on a busy day it was three lines in four of the log.
++			 * The position is published at the next check; Upwell's
++			 * apply_stalled alert covers a target that stops advancing.
++			 */
++			log_debug("The target's replication origin is at %X/%X, "
++					  "before the last COMMIT applied %X/%X",
++					  LSN_FORMAT_ARGS(originLSN),
++					  LSN_FORMAT_ARGS(applyQueuedCommitLSN));
+ 			durableLSN = originLSN > applyPublishedLSN ?
+ 						 originLSN : applyPublishedLSN;
+ 		}
