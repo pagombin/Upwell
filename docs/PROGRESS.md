@@ -33,6 +33,7 @@ The request names `overnight-build-2`; that branch already exists, holds the ear
 | COPY rows and rotation losses | done (D114) | engine upwell.11; `TestWorkloadBulkCopy`, `TestRotationKeepsEveryTransaction`, kill test with COPYs |
 | upwell.11 regression | done | all 124 integration tests pass against upwell.11 (run in four groups); two tests updated for timing: S02 mid-stream now also accepts the engine stopping on the target's error (D108), and the snapshot-wait test waits for the collector's "wait ended" event |
 | Multi-table TRUNCATE, source text settings, target origins, alert noise | done (D115) | engine upwell.12; `TestWorkloadLegacyShapesAndReloads`, `TestWorkloadSourceDatabaseSettings`, `TestPreflightTargetOriginsFull`, `TestBacklogGrowing` |
+| upwell.12 regression | done | all 127 integration tests pass against the patch-built upwell.12; `TestBaseCopyTargetRestarted` now accepts the cut landing on the index build after a small table's COPY (the reason names the step either way) |
 | One base copy failed once with "insert into setup … Failed to initialize pgcopydb internal catalogs"; the rerun passed | not explained | not reproduced locally; noted for the Part 4 bug bashes |
 
 ### Part 1: scenarios

@@ -46,10 +46,13 @@ func baseCopyWithLostTarget(t *testing.T, name string, cut func(t *testing.T, db
 	if strings.Contains(d.LastError, "Failed to close snapshot") && !strings.Contains(d.LastError, "connection to the target") {
 		t.Fatalf("the reason is pgcopydb's last error, not the lost connection: %s", d.LastError)
 	}
-	for _, want := range []string{"connection to the target was closed", "while copying public."} {
-		if !strings.Contains(d.LastError, want) {
-			t.Fatalf("the reason lacks %q: %s", want, d.LastError)
-		}
+	if !strings.Contains(d.LastError, "connection to the target was closed") {
+		t.Fatalf("the reason lacks the closed connection: %s", d.LastError)
+	}
+	// The cut can land on the COPY or on the index build that follows it on
+	// a small table; the reason must name the step either way.
+	if !strings.Contains(d.LastError, "while copying public.") && !strings.Contains(d.LastError, "while creating index ") {
+		t.Fatalf("the reason does not say what the engine was doing: %s", d.LastError)
 	}
 	// D81: the failed copy's slot is useless (a restart from zero creates a
 	// new one at a new snapshot) and would keep source WAL until then.
