@@ -605,8 +605,8 @@ func (o *Orchestrator) StaleSamples(mig, side string) int {
 type alerter struct {
 	o        *Orchestrator
 	mu       sync.Mutex
-	backlog  map[string][]backlogSample // D115: the last backlogWindow of readings
-	growing  map[string]bool            // D115: backlog_growing fires for these databases
+	backlog  map[string][]backlogSample  // D115: the last backlogWindow of readings
+	growing  map[string]bool             // D115: backlog_growing fires for these databases
 	headroom map[string][]headroomSample // D113: the slot's safe_wal_size over the last 15 minutes
 }
 
